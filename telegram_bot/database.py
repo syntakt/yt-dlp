@@ -1,7 +1,7 @@
 import sqlite3
 import json
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -12,7 +12,8 @@ logger = logging.getLogger(__name__)
 
 def get_connection() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH))
+    # MEDIUM-2: timeout=10 prevents immediate OperationalError under concurrent load
+    conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -87,7 +88,7 @@ def upsert_user(user_id: int, username: str, full_name: str) -> None:
             ON CONFLICT(user_id) DO UPDATE SET
                 username  = excluded.username,
                 full_name = excluded.full_name
-        """, (user_id, username or "", full_name or "", datetime.utcnow().isoformat()))
+        """, (user_id, username or "", full_name or "", datetime.now(timezone.utc).isoformat()))
 
 
 def approve_user(user_id: int, approved_by: int) -> bool:
@@ -98,7 +99,7 @@ def approve_user(user_id: int, approved_by: int) -> bool:
                    approved_at = ?,
                    approved_by = ?
              WHERE user_id = ?
-        """, (datetime.utcnow().isoformat(), approved_by, user_id))
+        """, (datetime.now(timezone.utc).isoformat(), approved_by, user_id))
         return cur.rowcount > 0
 
 
@@ -159,13 +160,16 @@ def is_authorized(user_id: int) -> bool:
 
 def is_admin(user_id: int) -> bool:
     from config import ADMIN_IDS
-    if user_id in ADMIN_IDS:
-        return True
+    # Проверяем бан: забаненный пользователь НЕ может быть админом
     with get_connection() as conn:
         row = conn.execute(
-            "SELECT is_admin FROM users WHERE user_id = ?", (user_id,)
+            "SELECT is_admin, is_banned FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
-        return bool(row["is_admin"]) if row else False
+        if row and row["is_banned"]:
+            return False
+    if user_id in ADMIN_IDS:
+        return True
+    return bool(row["is_admin"]) if row else False
 
 
 # ── Download history ───────────────────────────────────────────────────────────
@@ -175,7 +179,7 @@ def add_download(user_id: int, url: str) -> int:
         cur = conn.execute("""
             INSERT INTO download_history (user_id, url, status, created_at)
             VALUES (?, ?, 'pending', ?)
-        """, (user_id, url, datetime.utcnow().isoformat()))
+        """, (user_id, url, datetime.now(timezone.utc).isoformat()))
         return cur.lastrowid
 
 
@@ -199,7 +203,7 @@ def update_download(
             values.append(val)
     if status in ("done", "error"):
         fields.append("finished_at = ?")
-        values.append(datetime.utcnow().isoformat())
+        values.append(datetime.now(timezone.utc).isoformat())
     if not fields:
         return
     values.append(download_id)
@@ -227,7 +231,7 @@ def save_session(chat_id: int, message_id: int, url: str, video_info_json: str) 
         conn.execute("""
             INSERT OR REPLACE INTO sessions (chat_id, message_id, url, video_info_json, created_at)
             VALUES (?, ?, ?, ?, ?)
-        """, (chat_id, message_id, url, video_info_json, datetime.utcnow().isoformat()))
+        """, (chat_id, message_id, url, video_info_json, datetime.now(timezone.utc).isoformat()))
 
 
 def get_session(chat_id: int, message_id: int) -> Optional[dict]:
@@ -250,16 +254,22 @@ def delete_session(chat_id: int, message_id: int) -> None:
 # ── Cleanup ────────────────────────────────────────────────────────────────────
 
 def cleanup_old_sessions(max_age_hours: int = 24) -> int:
-    cutoff = (datetime.utcnow() - timedelta(hours=max_age_hours)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
     with get_connection() as conn:
         cur = conn.execute("DELETE FROM sessions WHERE created_at < ?", (cutoff,))
         return cur.rowcount
 
 
 def cleanup_old_history(max_age_days: int = 30) -> int:
-    cutoff = (datetime.utcnow() - timedelta(days=max_age_days)).isoformat()
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
     with get_connection() as conn:
         cur = conn.execute("DELETE FROM download_history WHERE created_at < ?", (cutoff,))
+        return cur.rowcount
+
+
+def clear_user_history(user_id: int) -> int:
+    with get_connection() as conn:
+        cur = conn.execute("DELETE FROM download_history WHERE user_id = ?", (user_id,))
         return cur.rowcount
 
 
@@ -290,6 +300,20 @@ def get_pending_users() -> list:
             "SELECT user_id, username, full_name, created_at FROM users "
             "WHERE is_approved=0 AND is_banned=0 ORDER BY created_at"
         ).fetchall()
+
+
+def get_user_stats(user_id: int) -> dict:
+    """Возвращает статистику по конкретному пользователю."""
+    with get_connection() as conn:
+        total = conn.execute(
+            "SELECT COUNT(*) FROM download_history WHERE user_id=? AND status='done'",
+            (user_id,)
+        ).fetchone()[0]
+        size = conn.execute(
+            "SELECT COALESCE(SUM(file_size), 0) FROM download_history WHERE user_id=? AND status='done'",
+            (user_id,)
+        ).fetchone()[0]
+        return {"downloads": total, "total_bytes": size}
 
 
 def sync_admin_ids(admin_ids: list) -> None:

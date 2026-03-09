@@ -123,13 +123,24 @@ def move_and_register(src: Path, ttl_seconds: int = 3600) -> str:
     Возвращает full_token. Файл переносится из временной папки бота в
     /downloads/fileserver/<uuid_key>/<filename>, чтобы TTL-очистка не
     зависела от tmp_dir загрузчика.
+
+    Права явно выставляются в 755/644, чтобы telegram-bot-api контейнер
+    (работает под другим UID) мог выполнить stat() на файл через
+    общий том /downloads:ro — независимо от umask процесса.
     """
     from config import DOWNLOAD_DIR
     uuid_key, full_token = _make_token()
-    serve_dir = DOWNLOAD_DIR / "fileserver" / uuid_key
+    # Создаём промежуточный каталог /downloads/fileserver/ и uuid-подкаталог
+    fs_root = DOWNLOAD_DIR / "fileserver"
+    fs_root.mkdir(parents=True, exist_ok=True)
+    fs_root.chmod(0o755)
+    serve_dir = fs_root / uuid_key
     serve_dir.mkdir(parents=True, exist_ok=True)
+    serve_dir.chmod(0o755)
     dest = serve_dir / src.name
     shutil.move(str(src), str(dest))
+    # Явно выставляем 644: файл должен быть читаем другим UID (telegram-bot-api)
+    dest.chmod(0o644)
     _registry[uuid_key] = FileEntry(
         path=dest,
         filename=dest.name,
@@ -148,7 +159,7 @@ def get_entry(full_token: str) -> Optional[FileEntry]:
     if not uuid_key:
         return None
     entry = _registry.get(uuid_key)
-    if entry and time.time() > entry.expires_at:
+    if entry and time.time() >= entry.expires_at:
         _remove(uuid_key, "TTL истёк (get_entry)")
         return None
     return entry
@@ -161,7 +172,9 @@ def unregister(full_token: str, *, delete_file: bool = False) -> None:
     когда файл будет удалён отправителем (например, после send_document).
     delete_file=True: удаляет файл и его директорию.
     """
-    uuid_key = (full_token[:32] if len(full_token) >= 32 else full_token)
+    uuid_key = _verify_token(full_token)
+    if uuid_key is None:
+        return
     entry = _registry.pop(uuid_key, None)
     if entry is None:
         return
@@ -191,9 +204,15 @@ def _rmdir_safe(d: Path) -> None:
         pass
 
 
+_MAX_RATE_KEYS = 10_000  # Лимит уникальных IP в словаре (защита от memory leak)
+
+
 def _check_rate_limit(ip: str) -> bool:
     """True если IP ещё не исчерпал лимит запросов."""
     now = time.time()
+    # Защита от переполнения: если слишком много ключей — сбрасываем
+    if len(_rate_counters) > _MAX_RATE_KEYS:
+        _rate_counters.clear()
     hits = _rate_counters[ip]
     _rate_counters[ip] = [h for h in hits if now - h < 60]
     if len(_rate_counters[ip]) >= _RATE_LIMIT:
@@ -202,12 +221,24 @@ def _check_rate_limit(ip: str) -> bool:
     return True
 
 
+def _sanitize_header_value(name: str) -> str:
+    """Удаляет символы которые могут инжектировать дополнительные HTTP-заголовки.
+
+    Основная угроза: имя файла содержит \\r\\n — браузер или прокси интерпретирует
+    это как конец текущего заголовка и начало нового (HTTP response splitting).
+    aiohttp 3.x тоже выбрасывает исключение при \\r/\\n в заголовке, но явная
+    санитизация защищает на уровне приложения независимо от версии библиотеки.
+    """
+    return "".join(c for c in name if c not in "\r\n\x00")
+
+
 def _fmt_size(n: int) -> str:
+    size = float(n)
     for unit in ("Б", "КБ", "МБ", "ГБ"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} ТБ"
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} ТБ"
 
 
 def _fmt_ttl(seconds: int) -> str:
@@ -279,9 +310,13 @@ _INFO_TEMPLATE = """\
 async def _handle_info(request: web.Request) -> web.Response:
     """HTML-страница с информацией о файле и кнопкой «Скачать»."""
     token = request.match_info["token"]
-    ip = request.remote or "unknown"
+    # SECURITY: за nginx request.remote — это IP контейнера, а не реального клиента.
+    # Nginx выставляет X-Real-IP = $remote_addr; читаем его для корректного rate-limit.
+    # Поскольку fileserver слушает только внутри Docker-сети, этому заголовку можно доверять.
+    ip = request.headers.get("X-Real-IP") or request.remote or "unknown"
 
     if not _check_rate_limit(ip):
+        logger.warning("Rate limit exceeded: %s /info/%s…", ip, token[:8])
         raise web.HTTPTooManyRequests(
             reason="Слишком много запросов. Попробуйте через минуту.",
             headers=_SEC_HEADERS,
@@ -298,12 +333,18 @@ async def _handle_info(request: web.Request) -> web.Response:
             headers=_SEC_HEADERS,
         )
 
-    if time.time() > entry.expires_at:
+    if time.time() >= entry.expires_at:
         _remove(uuid_key, "TTL истёк (info)")
         raise web.HTTPGone(reason="Срок действия ссылки истёк.", headers=_SEC_HEADERS)
 
     remaining = int(entry.expires_at - time.time())
-    safe_name = entry.filename.replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
+    # & должен экранироваться первым, иначе уже экранированные &lt; превратятся в &amp;lt;
+    safe_name = (entry.filename
+                 .replace("&", "&amp;")
+                 .replace("<", "&lt;")
+                 .replace(">", "&gt;")
+                 .replace('"', "&quot;")
+                 .replace("'", "&#x27;"))
     html = _INFO_TEMPLATE.format(
         safe_name=safe_name,
         size_str=_fmt_size(entry.file_size),
@@ -321,9 +362,11 @@ async def _handle_info(request: web.Request) -> web.Response:
 async def _handle_download(request: web.Request) -> web.StreamResponse:
     """Стриминг файла клиенту с последующим удалением."""
     token = request.match_info["token"]
-    ip = request.remote or "unknown"
+    # SECURITY: используем X-Real-IP от nginx, а не IP Docker-контейнера.
+    ip = request.headers.get("X-Real-IP") or request.remote or "unknown"
 
     if not _check_rate_limit(ip):
+        logger.warning("Rate limit exceeded: %s /dl/%s…", ip, token[:8])
         raise web.HTTPTooManyRequests(
             reason="Слишком много запросов.",
             headers=_SEC_HEADERS,
@@ -333,30 +376,45 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
     if uuid_key is None:
         raise web.HTTPNotFound(headers=_SEC_HEADERS)
 
-    entry = _registry.get(uuid_key)
+    # SECURITY TOCTOU: атомарно извлекаем запись из реестра ДО начала стриминга.
+    # _registry.pop — атомарная операция в asyncio (однопоточный event loop), поэтому
+    # два одновременных запроса с одним токеном не могут оба получить entry.
+    # Первый получает entry, второй получает None → 410 Gone.
+    entry = _registry.pop(uuid_key, None)
     if entry is None:
         raise web.HTTPGone(
             reason="Файл не найден или ссылка уже использована.",
             headers=_SEC_HEADERS,
         )
 
-    if time.time() > entry.expires_at:
-        _remove(uuid_key, "TTL истёк (download)")
+    if time.time() >= entry.expires_at:
+        # TTL истёк — удаляем файл с диска (из реестра уже вынули выше)
+        entry.path.unlink(missing_ok=True)
+        _rmdir_safe(entry.path.parent)
+        logger.info("Файл '%s' удалён (TTL истёк на /dl/)", entry.filename)
         raise web.HTTPGone(reason="Срок действия ссылки истёк.", headers=_SEC_HEADERS)
 
     if not entry.path.exists():
-        _registry.pop(uuid_key, None)
         raise web.HTTPNotFound(
             reason="Файл не найден на диске.",
             headers=_SEC_HEADERS,
         )
 
     file_size = entry.path.stat().st_size
-    safe_name = entry.filename.replace('"', "_")
+    # RFC 5987: для ASCII-имён используем filename=, для Unicode добавляем filename*=
+    # SECURITY: сначала удаляем \r\n\x00 (HTTP response splitting), затем " (разрыв кавычек)
+    _clean = _sanitize_header_value(entry.filename)
+    ascii_name = _clean.encode("ascii", errors="replace").decode().replace('"', "_")
+    utf8_name = _clean.replace("\\", "").replace('"', "")
+    from urllib.parse import quote as _urlquote
+    content_disposition = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{_urlquote(utf8_name, safe='')}"
+    )
 
     response = web.StreamResponse(
         headers={
-            "Content-Disposition": f'attachment; filename="{safe_name}"',
+            "Content-Disposition": content_disposition,
             "Content-Type": "application/octet-stream",
             "Content-Length": str(file_size),
             **_SEC_HEADERS,
@@ -381,9 +439,15 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
         logger.error("Ошибка при отдаче '%s': %s", entry.filename, e)
         return response
 
+    # Удаляем файл с диска после стриминга (из реестра уже вынули в начале).
+    # Если соединение прервалось — файл всё равно удаляется: токен уже недействителен,
+    # пользователь должен запросить новую ссылку в боте.
+    entry.path.unlink(missing_ok=True)
+    _rmdir_safe(entry.path.parent)
     if downloaded_ok:
-        logger.info("Файл '%s' успешно отдан клиенту %s", safe_name, ip)
-        _remove(uuid_key, "успешно скачан")
+        logger.info("Файл '%s' успешно отдан клиенту %s и удалён", entry.filename, ip)
+    else:
+        logger.warning("Файл '%s' удалён (соединение прервано клиентом %s)", entry.filename, ip)
 
     return response
 
@@ -398,13 +462,13 @@ async def _handle_health(request: web.Request) -> web.Response:
 # ── Фоновая очистка ──────────────────────────────────────────────────────────────
 
 async def _cleanup_loop() -> None:
-    """Каждый час: удаляет файлы с истёкшим TTL и очищает rate-counters."""
+    """Каждые 5 минут: удаляет файлы с истёкшим TTL и очищает rate-counters."""
     while True:
-        await asyncio.sleep(3600)
+        await asyncio.sleep(300)
         now = time.time()
 
         # Удаляем просроченные файлы
-        expired = [k for k, e in list(_registry.items()) if now > e.expires_at]
+        expired = [k for k, e in list(_registry.items()) if now >= e.expires_at]
         for key in expired:
             _remove(key, "TTL истёк (cleanup)")
 
@@ -425,9 +489,84 @@ _runner: Optional[web.AppRunner] = None
 _cleanup_task: Optional[asyncio.Task] = None
 
 
+def _restore_registry() -> None:
+    """Восстанавливает реестр из файловой системы после перезапуска бота.
+
+    Сканирует DOWNLOAD_DIR/fileserver/<uuid_key>/<filename> и добавляет
+    в _registry все файлы, у которых TTL ещё не истёк.
+    TTL считается от mtime файла: expires_at = mtime + FILE_TTL_SECONDS.
+
+    Это решает «ссылка не работает после перезапуска»: файлы на диске живут,
+    но in-memory _registry был пуст → бот возвращал 410 Gone.
+    """
+    from config import DOWNLOAD_DIR, FILE_TTL_SECONDS
+
+    fs_root = DOWNLOAD_DIR / "fileserver"
+    if not fs_root.exists():
+        return
+
+    now = time.time()
+    restored = expired_removed = 0
+
+    for serve_dir in fs_root.iterdir():
+        if not serve_dir.is_dir():
+            continue
+        uuid_key = serve_dir.name
+        # Валидируем: должен быть ровно 32 hex-символа
+        if len(uuid_key) != 32 or not all(c in "0123456789abcdef" for c in uuid_key):
+            continue
+
+        files = [f for f in serve_dir.iterdir() if f.is_file()]
+        if not files:
+            try:
+                serve_dir.rmdir()
+            except OSError:
+                pass
+            continue
+
+        f = files[0]
+        # TTL отсчитываем от момента записи файла на диск (mtime)
+        expires_at = f.stat().st_mtime + FILE_TTL_SECONDS
+
+        if expires_at < now:
+            # Срок истёк — убираем с диска
+            for ff in files:
+                ff.unlink(missing_ok=True)
+            try:
+                serve_dir.rmdir()
+            except OSError:
+                pass
+            expired_removed += 1
+            continue
+
+        _registry[uuid_key] = FileEntry(
+            path=f,
+            filename=f.name,
+            file_size=f.stat().st_size,
+            expires_at=expires_at,
+        )
+        restored += 1
+
+    if restored or expired_removed:
+        logger.info(
+            "Файловый сервер: восстановлено %d файлов, удалено %d просроченных после рестарта",
+            restored, expired_removed,
+        )
+
+
 async def start(host: str = "0.0.0.0", port: int = 8080) -> web.AppRunner:
     """Запускает HTTP-сервер и фоновую очистку."""
     global _runner, _cleanup_task
+
+    # HIGH-2: warn when SERVER_SECRET is not set (tokens lack HMAC protection)
+    if not _SERVER_SECRET:
+        logger.warning(
+            "SERVER_SECRET не задан — токены выдаются без HMAC-подписи. "
+            "Установите SERVER_SECRET в .env для усиленной защиты."
+        )
+
+    # Восстанавливаем файлы, зарегистрированные до рестарта бота
+    _restore_registry()
 
     app = web.Application()
     app.router.add_get("/info/{token}", _handle_info)

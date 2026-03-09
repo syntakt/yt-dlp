@@ -29,6 +29,14 @@ DOWNLOAD_TIMEOUT = int(os.environ.get("DOWNLOAD_TIMEOUT", "3600"))  # seconds (1
 #   Пример: https://myserver.com  или  http://1.2.3.4:8080
 #   Если пусто — только Telegram (старое поведение), кнопка «Ссылка» не появляется
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+# Прямая ссылка на сервер по IP (без Cloudflare Tunnel).
+# Пример: http://1.2.3.4:8080
+# Если задан — добавляется кнопка «Прямая ссылка (IP)» в меню доставки.
+DIRECT_BASE_URL = os.environ.get("DIRECT_BASE_URL", "").rstrip("/")
+# Relay-сервер — резервный путь для пользователей с заблокированным Cloudflare/IP.
+# Второй сервер проксирует /info/ и /dl/ на основной бот-сервер.
+# Пример: https://1-2-3-4.sslip.io:5443
+RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", "").rstrip("/")
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 # TTL ссылки: по умолчанию 1 час (файл удаляется после скачивания ИЛИ по истечении TTL)
 FILE_TTL_SECONDS = int(os.environ.get("FILE_TTL_HOURS", "1")) * 3600
@@ -40,6 +48,12 @@ SERVER_SECRET = os.environ.get("SERVER_SECRET", "")
 ALLOW_PLAYLISTS = os.environ.get("ALLOW_PLAYLISTS", "true").lower() == "true"
 ALLOW_AUDIO = os.environ.get("ALLOW_AUDIO", "true").lower() == "true"
 ALLOW_SUBTITLES = os.environ.get("ALLOW_SUBTITLES", "true").lower() == "true"
+# Максимальное количество видео в плейлисте (кнопки покажут half и full)
+MAX_PLAYLIST_ITEMS = int(os.environ.get("MAX_PLAYLIST_ITEMS", "10"))
+# Аудио в формате OPUS — ремукс без перекодирования, значительно быстрее MP3
+ALLOW_OPUS = os.environ.get("ALLOW_OPUS", "true").lower() == "true"
+# Аудио в формате WAV — несжатый PCM, максимальное качество, большие файлы
+ALLOW_WAV = os.environ.get("ALLOW_WAV", "false").lower() == "true"
 # aria2c: параллельные соединения ускоряют загрузку больших файлов по HTTP
 # Требует aria2 в системе (уже установлен в Dockerfile)
 USE_ARIA2C = os.environ.get("USE_ARIA2C", "true").lower() == "true"
@@ -54,3 +68,18 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE", "")
 
 # Registration mode: "open" (anyone can register) or "closed" (admin approves only)
 REGISTRATION_MODE = os.environ.get("REGISTRATION_MODE", "closed")
+
+# Авто-удаление сообщений бота после завершения загрузки (секунды).
+# 0 = выключено. Пример: AUTO_DELETE_SECONDS=300 → удаляет через 5 минут.
+AUTO_DELETE_SECONDS = int(os.environ.get("AUTO_DELETE_SECONDS", "0"))
+
+# Webhook-режим (вместо polling). Требует публичного HTTPS-адреса.
+# WEBHOOK_URL — публичный URL бота (без trailing slash), например https://example.com
+# Если пусто — используется polling.
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "").rstrip("/")
+WEBHOOK_PORT = int(os.environ.get("WEBHOOK_PORT", "8443"))
+WEBHOOK_SECRET_TOKEN = os.environ.get("WEBHOOK_SECRET_TOKEN", "")
+
+# Мониторинг диска: процент заполнения, при котором слать алерт администраторам.
+# 0 = выключено.
+DISK_ALERT_THRESHOLD = int(os.environ.get("DISK_ALERT_THRESHOLD", "80"))

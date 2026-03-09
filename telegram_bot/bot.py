@@ -24,7 +24,9 @@ from telegram import (
     BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    InlineQueryResultArticle,
     InputFile,
+    InputTextMessageContent,
     Message,
     Update,
 )
@@ -35,6 +37,7 @@ from telegram.ext import (
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
+    InlineQueryHandler,
     MessageHandler,
     filters,
 )
@@ -87,6 +90,8 @@ KEY_VIDEO_INFO  = "video_info"
 KEY_DOWNLOAD_ID = "download_id"
 KEY_PENDING_URL = "pending_url"
 KEY_ORIG_URL    = "original_url"   # сохраняем оригинальный URL (с list=) для плейлиста
+KEY_MAIN_MENU_MSG = "main_menu_msg_id"  # message_id последнего сообщения главного меню
+KEY_QUALITY_MSG   = "quality_menu_msg_id"  # message_id меню выбора качества (для удаления при новой ссылке)
 
 
 # ── Session serialization (persist quality-menu state across restarts) ───────────
@@ -191,40 +196,97 @@ async def _send_access_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             pass
 
 
+# ── Версия бота ──────────────────────────────────────────────────────────────────
+
+def _get_bot_version() -> str:
+    """Возвращает версию бота: <yt-dlp version>-<git commit hash>.
+
+    Пример: 2026.03.03-1feacfc
+    """
+    # yt-dlp версия (из установленного пакета)
+    try:
+        from yt_dlp.version import __version__ as ytdlp_ver
+    except Exception:
+        ytdlp_ver = "unknown"
+    # Git commit hash бота (из ENV → файла .git_commit → git → "dev")
+    commit = os.environ.get("GIT_COMMIT", "")
+    if not commit or commit == "dev":
+        try:
+            commit = open(os.path.join(os.path.dirname(__file__) or ".", ".git_commit")).read().strip()
+        except Exception:
+            pass
+    if not commit or commit == "dev":
+        try:
+            import subprocess
+            commit = subprocess.check_output(
+                ["git", "rev-parse", "--short=7", "HEAD"],
+                cwd=os.path.dirname(__file__) or ".",
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+            ).decode().strip()
+        except Exception:
+            commit = "dev"
+    return f"{ytdlp_ver}-{commit[:7]}"
+
+
+BOT_VERSION = _get_bot_version()
+
+
 # ── Основные команды ─────────────────────────────────────────────────────────────
+
+def _build_main_menu(user_obj) -> tuple[str, InlineKeyboardMarkup]:
+    """Возвращает (текст, клавиатура) главного меню для авторизованного пользователя."""
+    text = (
+        f"👋 Привет, <b>{_esc(user_obj.first_name)}</b>!\n\n"
+        "Я помогу тебе скачать видео или аудио с популярных сайтов.\n"
+        "Просто отправь мне ссылку на видео!\n\n"
+        + SUPPORTED_SITES_TEXT +
+        "\n\n📋 <b>Команды:</b>\n"
+        "/help — справка\n"
+        "/history — история загрузок\n"
+        "/status — статус бота\n\n"
+        f"<code>v{BOT_VERSION}</code>"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📖 Справка", callback_data="menu:help"),
+            InlineKeyboardButton("📜 История", callback_data="menu:history"),
+            InlineKeyboardButton("📊 Статус", callback_data="menu:status"),
+        ]
+    ])
+    return text, keyboard
+
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.upsert_user(user.id, user.username, user.full_name)
 
     if db.is_admin(user.id) or db.is_authorized(user.id):
-        text = (
-            f"👋 Привет, <b>{_esc(user.first_name)}</b>!\n\n"
-            "Я помогу тебе скачать видео или аудио с популярных сайтов.\n"
-            "Просто отправь мне ссылку на видео!\n\n"
-            + SUPPORTED_SITES_TEXT +
-            "\n\n📋 <b>Команды:</b>\n"
-            "/help — справка\n"
-            "/history — история загрузок\n"
-            "/status — статус бота"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📖 Справка", callback_data="menu:help"),
-                InlineKeyboardButton("📜 История", callback_data="menu:history"),
-                InlineKeyboardButton("📊 Статус", callback_data="menu:status"),
-            ]
-        ])
-        await update.message.reply_text(
+        # Удаляем предыдущее сообщение главного меню, чтобы не накапливались
+        prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+        if prev_msg_id:
+            try:
+                await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+            except TelegramError:
+                pass
+        text, keyboard = _build_main_menu(user)
+        sent = await update.message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
+        ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
+        # Удаляем само сообщение /start чтобы не засорять чат
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
     else:
         await _send_access_request(update, ctx)
 
 
+@require_auth
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     is_adm = db.is_admin(update.effective_user.id)
     text = (
@@ -269,24 +331,34 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = ["📜 <b>Последние загрузки:</b>\n"]
     for i, row in enumerate(rows, 1):
         status_icon = {"done": "✅", "error": "❌", "pending": "⏳"}.get(row["status"], "•")
-        title = (row["title"] or row["url"])[:50]
+        title = _esc((row["title"] or row["url"])[:50])  # MEDIUM-3: escape HTML
         lines.append(f"{i}. {status_icon} {title}")
         if row["quality"]:
             lines.append(f"   └ {row['quality']}, {_human_size(row['file_size'])}")
-    await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
+    await update.message.reply_text(
+        "\n".join(lines),
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("🗑 Очистить историю", callback_data="clear_history"),
+        ]]),
+    )
 
 
 @require_auth
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     stats = db.get_global_stats()
+    user_stats = db.get_user_stats(update.effective_user.id)
     disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
+    disk_pct = disk.used / disk.total * 100
+    disk_warn = " ⚠️" if disk_pct >= config.DISK_ALERT_THRESHOLD else ""
     text = (
         "📊 <b>Статус бота</b>\n\n"
-        f"👥 Пользователей: {stats['total_users']}\n"
-        f"📥 Всего загрузок: {stats['total_downloads']}\n"
-        f"💾 Объём отправленного: {_human_size(stats['total_size_bytes'])}\n"
+        f"📥 Ваших загрузок: <b>{user_stats['downloads']}</b>\n"
+        f"💾 Вы скачали: <b>{_human_size(user_stats['total_bytes'])}</b>\n\n"
+        f"👥 Всего пользователей: {stats['total_users']}\n"
+        f"📦 Всего загрузок: {stats['total_downloads']}\n"
         f"⏳ Ожидают одобрения: {stats['pending_requests']}\n\n"
-        f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} всего"
+        f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
     )
     # Для администраторов — показываем кто именно ожидает
     if db.is_admin(update.effective_user.id) and stats['pending_requests']:
@@ -340,6 +412,11 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 # ── Обработчик URL ───────────────────────────────────────────────────────────────
 
+def _extract_urls(text: str) -> list[str]:
+    """Извлекает все http(s)-ссылки из текста."""
+    return re.findall(r'https?://[^\s<>"\']+', text)
+
+
 def _strip_playlist_param(url: str) -> str:
     """Убирает параметры list= и index= из YouTube URL."""
     parsed = urlparse(url)
@@ -347,7 +424,7 @@ def _strip_playlist_param(url: str) -> str:
     params.pop("list", None)
     params.pop("index", None)
     params.pop("start_radio", None)
-    new_query = urlencode({k: v[0] for k, v in params.items()})
+    new_query = urlencode([(k, val) for k, vals in params.items() for val in vals])
     return urlunparse(parsed._replace(query=new_query))
 
 
@@ -362,9 +439,15 @@ def _is_youtube_mixed_url(url: str) -> bool:
 
 @require_auth
 async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    url = update.message.text.strip()
+    if not update.message or not update.message.text:
+        return
+    text = update.message.text.strip()
 
-    if not is_supported_url(url):
+    # Ищем все URL в сообщении
+    urls = _extract_urls(text)
+    valid_urls = [u for u in urls if is_supported_url(u)]
+
+    if not valid_urls:
         await update.message.reply_text(
             "❓ Ссылка не распознана как поддерживаемая.\n\n"
             "Отправьте прямую ссылку на страницу видео.\n"
@@ -374,25 +457,109 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # Если YouTube URL с и video, и playlist — предлагаем выбор
-    if _is_youtube_mixed_url(url):
-        clean_url = _strip_playlist_param(url)
-        ctx.user_data[KEY_PENDING_URL] = clean_url
-        ctx.user_data[KEY_ORIG_URL] = url
-        keyboard = InlineKeyboardMarkup([
-            [InlineKeyboardButton("📹 Скачать это видео", callback_data="resolve:video")],
-            [InlineKeyboardButton("📋 Скачать плейлист целиком", callback_data="resolve:playlist")],
-            [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
-        ])
-        await update.message.reply_text(
-            "🔗 Ссылка содержит и видео, и плейлист.\n"
-            "Что вы хотите скачать?",
-            reply_markup=keyboard,
+    # Удаляем оригинальное сообщение пользователя (убирает превью ссылки).
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    # Удаляем предыдущее меню выбора качества (если не было нажато ни одной кнопки).
+    # Это очищает чат от неактуальных меню при вставке новой ссылки.
+    _prev_quality_msg = ctx.user_data.pop(KEY_QUALITY_MSG, None)
+    if _prev_quality_msg:
+        try:
+            await ctx.bot.delete_message(update.effective_chat.id, _prev_quality_msg)
+        except TelegramError:
+            pass  # уже удалено или бот нажал кнопку → меню трансформировалось в прогресс
+
+    # Одна ссылка — стандартный флоу с поддержкой смешанного YouTube URL
+    if len(valid_urls) == 1:
+        url = valid_urls[0]
+        if _is_youtube_mixed_url(url):
+            clean_url = _strip_playlist_param(url)
+            ctx.user_data[KEY_PENDING_URL] = clean_url
+            ctx.user_data[KEY_ORIG_URL] = url
+            keyboard = InlineKeyboardMarkup([
+                [InlineKeyboardButton("📹 Скачать это видео", callback_data="resolve:video")],
+                [InlineKeyboardButton("📋 Скачать плейлист целиком", callback_data="resolve:playlist")],
+                [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
+            ])
+            await update.effective_chat.send_message(
+                "🔗 Ссылка содержит и видео, и плейлист.\n"
+                "Что вы хотите скачать?",
+                reply_markup=keyboard,
+            )
+            return
+        msg = await update.effective_chat.send_message("🔍 Получаю информацию о видео…")
+        await _fetch_and_show_menu(url, msg, ctx)
+        return
+
+    # Несколько ссылок — отправляем все статусы сразу, затем получаем инфо параллельно.
+    # Сессии сохраняются в БД по (chat_id, message_id), поэтому параллельное обновление
+    # ctx.user_data не мешает: при нажатии кнопки бот восстанавливает данные из БД.
+    batch = valid_urls[:5]
+    msgs = []
+    for i, url in enumerate(batch, 1):
+        msg = await update.effective_chat.send_message(
+            f"🔍 [{i}/{len(batch)}] Получаю информацию о видео…"
+        )
+        msgs.append(msg)
+    await asyncio.gather(*(
+        _fetch_and_show_menu(url, msg, ctx)
+        for url, msg in zip(batch, msgs)
+    ))
+
+
+async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Inline-режим: @botname <url> в любом чате → кнопка «Скачать».
+
+    Результат вставляет URL как текст в текущий чат. Если это личный чат с ботом,
+    handle_url обработает его автоматически.
+    """
+    query = update.inline_query
+    user = update.effective_user
+
+    # Проверяем авторизацию (inline не проходит через require_auth)
+    if not (db.is_admin(user.id) or db.is_authorized(user.id)):
+        await query.answer(
+            results=[],
+            switch_pm_text="🔐 Требуется доступ — нажмите для регистрации",
+            switch_pm_parameter="start",
+            cache_time=5,
         )
         return
 
-    msg = await update.message.reply_text("🔍 Получаю информацию о видео…")
-    await _fetch_and_show_menu(url, msg, ctx)
+    raw = (query.query or "").strip()
+    if not raw:
+        await query.answer(
+            results=[],
+            switch_pm_text="📥 Введите ссылку на видео после @botname",
+            switch_pm_parameter="start",
+            cache_time=5,
+        )
+        return
+
+    urls = _extract_urls(raw)
+    valid = [u for u in urls if is_supported_url(u)]
+    if not valid:
+        await query.answer(
+            results=[],
+            switch_pm_text="❓ Ссылка не поддерживается",
+            switch_pm_parameter="start",
+            cache_time=5,
+        )
+        return
+
+    results = [
+        InlineQueryResultArticle(
+            id=f"dl_{i}",
+            title=f"📥 Скачать {'видео/аудио' if i == 0 else f'ссылку {i+1}'}",
+            description=u[:120],
+            input_message_content=InputTextMessageContent(u),
+        )
+        for i, u in enumerate(valid[:5])
+    ]
+    await query.answer(results, cache_time=10)
 
 
 async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT_TYPE):
@@ -401,10 +568,15 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
         info: VideoInfo = await get_video_info(url)
     except Exception as e:
         logger.error("get_video_info error: %s", e)
-        await msg.edit_text(
-            f"❌ Не удалось получить информацию о видео:\n<code>{_esc(str(e)[:300])}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        err_str = str(e)
+        friendly = _login_required_text(err_str)
+        if friendly:
+            await msg.edit_text(friendly, parse_mode=ParseMode.HTML)
+        else:
+            await msg.edit_text(
+                f"❌ Не удалось получить информацию о видео:\n<code>{_esc(err_str[:300])}</code>",
+                parse_mode=ParseMode.HTML,
+            )
         return
 
     ctx.user_data[KEY_VIDEO_INFO] = info
@@ -415,6 +587,8 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
     else:
         sent = await _show_video_menu(msg, info, ctx)
         if sent:
+            # Запоминаем message_id меню выбора качества — удалим при следующей ссылке.
+            ctx.user_data[KEY_QUALITY_MSG] = sent.message_id
             try:
                 db.save_session(sent.chat_id, sent.message_id, url, _serialize_video_info(info))
             except Exception as e:
@@ -427,22 +601,41 @@ def _build_quality_menu(info: VideoInfo) -> tuple[str, InlineKeyboardMarkup]:
     """Строит текст и клавиатуру меню выбора качества. Используется при показе и возврате."""
     video_fmts = get_best_video_formats(info.formats)
     likes_str = f"  👍 {_fmt_num(info.like_count)}" if info.like_count else ""
+    has_oversized = any(
+        (_estimate_download_size(f, info.duration or 0, audio_only=False) or 0) > config.MAX_FILE_SIZE_BYTES
+        for f in video_fmts
+    )
+    size_note = (
+        f"\n\n⚠️ — файл превышает лимит <b>{config.MAX_FILE_SIZE_MB} МБ</b>, скачивание будет отклонено"
+        if has_oversized else ""
+    )
     caption = (
         f"🎬 <b>{_esc(info.title)}</b>\n"
         f"👤 {_esc(info.uploader or '—')}\n"
         f"⏱ {info.duration_str}  👁 {info.views_str}{likes_str}\n"
         f"🌐 {_esc(info.extractor or '—')}\n\n"
-        "Выберите качество для загрузки:"
+        f"Выберите качество для загрузки:{size_note}"
     )
     buttons = []
     for f in video_fmts:
+        est = _estimate_download_size(f, info.duration or 0, audio_only=False)
+        too_large = est is not None and est > config.MAX_FILE_SIZE_BYTES
         size_hint = f" [{f.size_str}]" if f.filesize or f.tbr else ""
         fps_hint = f" {f.fps}fps" if f.fps and f.fps > 30 else ""
-        label = f"🎥 {f.resolution}{fps_hint} {f.ext.upper()}{size_hint}"
+        warn = " ⚠️" if too_large else ""
+        label = f"🎥 {f.resolution}{fps_hint} MP4{size_hint}{warn}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"dl:v:{f.format_id}")])
     buttons.append([InlineKeyboardButton("⚡ Лучшее качество (авто)", callback_data="dl:v:best")])
     if config.ALLOW_AUDIO:
-        buttons.append([InlineKeyboardButton("🎵 Только аудио (MP3 192kbps)", callback_data="dl:a:best")])
+        buttons.append([InlineKeyboardButton("🎵 Аудио MP3 (192 kbps)", callback_data="dl:a:best")])
+        # Альтернативные аудио-форматы объединяем в одну строку
+        _alt_audio: list[InlineKeyboardButton] = []
+        if config.ALLOW_OPUS:
+            _alt_audio.append(InlineKeyboardButton("⚡ OPUS (быстро)", callback_data="dl:ao:best"))
+        if config.ALLOW_WAV:
+            _alt_audio.append(InlineKeyboardButton("🎵 WAV (PCM)", callback_data="dl:aw:best"))
+        if _alt_audio:
+            buttons.append(_alt_audio)
     if config.ALLOW_SUBTITLES:
         buttons.append([
             InlineKeyboardButton("📄 + Субтитры RU", callback_data="dl:s:ru"),
@@ -457,19 +650,28 @@ def _build_quality_menu(info: VideoInfo) -> tuple[str, InlineKeyboardMarkup]:
 
 async def _show_video_menu(msg: Message, info: VideoInfo, ctx: ContextTypes.DEFAULT_TYPE):
     caption, keyboard = _build_quality_menu(info)
-    try:
-        if info.thumbnail:
+    if info.thumbnail:
+        try:
             await msg.delete()
-            sent = await ctx.bot.send_photo(
+            return await ctx.bot.send_photo(
                 msg.chat_id,
                 photo=info.thumbnail,
                 caption=caption,
                 parse_mode=ParseMode.HTML,
                 reply_markup=keyboard,
             )
-            return sent
-    except TelegramError:
-        pass
+        except TelegramError:
+            # Миниатюра недоступна или сообщение уже удалено —
+            # отправляем новое текстовое сообщение вместо редактирования удалённого.
+            try:
+                return await ctx.bot.send_message(
+                    msg.chat_id,
+                    text=caption,
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=keyboard,
+                )
+            except TelegramError:
+                pass
     return await msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
 
 
@@ -487,11 +689,13 @@ async def _show_playlist_menu(msg: Message, info: VideoInfo, ctx: ContextTypes.D
         "⚠️ Плейлисты могут быть очень большими.\n"
         "Выберите действие:"
     )
+    _pl_max = config.MAX_PLAYLIST_ITEMS
+    _pl_half = max(1, _pl_max // 2)
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("📥 Первые 5 видео (лучшее качество)", callback_data="pl:5:best")],
-        [InlineKeyboardButton("📥 Первые 10 видео (лучшее качество)", callback_data="pl:10:best")],
-        [InlineKeyboardButton("🎵 Только аудио — первые 5", callback_data="pl:5:audio")],
-        [InlineKeyboardButton("🎵 Только аудио — первые 10", callback_data="pl:10:audio")],
+        [InlineKeyboardButton(f"📥 Первые {_pl_half} видео (лучшее качество)", callback_data=f"pl:{_pl_half}:best")],
+        [InlineKeyboardButton(f"📥 Первые {_pl_max} видео (лучшее качество)", callback_data=f"pl:{_pl_max}:best")],
+        [InlineKeyboardButton(f"🎵 Только аудио — первые {_pl_half}", callback_data=f"pl:{_pl_half}:audio")],
+        [InlineKeyboardButton(f"🎵 Только аудио — первые {_pl_max}", callback_data=f"pl:{_pl_max}:audio")],
         [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
     ])
     await msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
@@ -502,7 +706,12 @@ async def _show_playlist_menu(msg: Message, info: VideoInfo, ctx: ContextTypes.D
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
-    await query.answer()
+    # Отвечаем на callback сразу — убирает «часики» на кнопке у пользователя.
+    # Игнорируем ошибку если запрос уже протух (повторное нажатие, рестарт бота).
+    try:
+        await query.answer()
+    except TelegramError:
+        pass
 
     data = query.data
 
@@ -529,13 +738,25 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "cancel":
         cancel_flag = ctx.user_data.get("cancel_flag")
         if cancel_flag is not None:
-            # Загрузка активна — устанавливаем флаг И отменяем asyncio-задачу
-            # (task.cancel() нужен для aria2c: он не опрашивает progress_hook)
+            # Загрузка активна: сигнализируем через cancel_flag.
+            # _cancel_hook в progress_hook yt-dlp поднимает _DownloadCancelled
+            # (BaseException) → поток корректно завершается → download_video()
+            # возвращает result.error="CANCELLED" → меню качества показывается снова.
+            #
+            # НЕ вызываем task.cancel(): он прерывает asyncio-сторону, но поток
+            # в executor продолжает работать и скачивать файл — это и есть
+            # причина «кнопка Стоп не работает».
             cancel_flag[0] = True
-            task = ctx.user_data.get("_download_task")
-            if task and not task.done():
-                task.cancel()
-            await query.answer("Отменяем загрузку…", show_alert=False)
+            # Визуальный фидбек: меняем кнопку на «Останавливаем…»
+            try:
+                await query.edit_message_reply_markup(
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("⏳ Останавливаем…", callback_data="noop"),
+                    ]])
+                )
+            except TelegramError:
+                pass
+            await query.answer("Останавливаем загрузку…", show_alert=False)
             return
         # Пользователь явно закрывает меню — удаляем сессию из БД
         try:
@@ -543,13 +764,27 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         ctx.user_data.clear()
+        # Возвращаем пользователя на главное меню вместо тупика "Отменено"
+        main_text, main_kb = _build_main_menu(user)
         try:
-            await query.edit_message_text("🛑 Отменено.")
+            await query.edit_message_text(
+                main_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=main_kb,
+            )
         except TelegramError:
             try:
                 await query.message.delete()
             except TelegramError:
                 pass
+            await ctx.bot.send_message(
+                query.message.chat_id,
+                main_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=main_kb,
+            )
         return
 
     if data == "info":
@@ -567,6 +802,21 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Выбор: видео или плейлист для смешанного URL
     if data.startswith("resolve:"):
         await _handle_resolve_callback(query, ctx, data)
+        return
+
+    if data == "clear_history":
+        deleted = db.clear_user_history(user.id)
+        await query.answer(f"🗑 Удалено записей: {deleted}", show_alert=True)
+        main_text, main_kb = _build_main_menu(user)
+        try:
+            await query.edit_message_text(
+                main_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=main_kb,
+            )
+        except TelegramError:
+            pass
         return
 
     if data.startswith("deliver:"):
@@ -597,7 +847,7 @@ async def _handle_menu_callback(query, ctx, data: str):
             "/history, /status, /cancel"
         )
         if is_adm:
-            text += "\n/pending, /users, /ban, /stats"
+            text += "\n/pending, /users, /approve, /deny, /ban, /unban, /addadmin, /stats"
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
@@ -611,19 +861,22 @@ async def _handle_menu_callback(query, ctx, data: str):
         rows = db.get_user_history(user.id, limit=10)
         if not rows:
             text = "📭 История загрузок пуста."
+            buttons = [[InlineKeyboardButton("« Назад", callback_data="menu:back")]]
         else:
             lines = ["📜 <b>Последние загрузки:</b>\n"]
             for i, row in enumerate(rows, 1):
                 icon = {"done": "✅", "error": "❌", "pending": "⏳"}.get(row["status"], "•")
-                title = (row["title"] or row["url"])[:50]
+                title = _esc((row["title"] or row["url"])[:50])  # MEDIUM-3: escape HTML
                 lines.append(f"{i}. {icon} {title}")
             text = "\n".join(lines)
+            buttons = [
+                [InlineKeyboardButton("🗑 Очистить историю", callback_data="clear_history")],
+                [InlineKeyboardButton("« Назад", callback_data="menu:back")],
+            ]
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("« Назад", callback_data="menu:back"),
-            ]]),
+            reply_markup=InlineKeyboardMarkup(buttons),
         )
 
     elif action == "status":
@@ -646,24 +899,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         )
 
     elif action == "back":
-        user_obj = query.from_user
-        text = (
-            f"👋 Привет, <b>{_esc(user_obj.first_name)}</b>!\n\n"
-            "Я помогу тебе скачать видео или аудио с популярных сайтов.\n"
-            "Просто отправь мне ссылку на видео!\n\n"
-            + SUPPORTED_SITES_TEXT +
-            "\n\n📋 <b>Команды:</b>\n"
-            "/help — справка\n"
-            "/history — история загрузок\n"
-            "/status — статус бота"
-        )
-        keyboard = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton("📖 Справка", callback_data="menu:help"),
-                InlineKeyboardButton("📜 История", callback_data="menu:history"),
-                InlineKeyboardButton("📊 Статус", callback_data="menu:status"),
-            ]
-        ])
+        text, keyboard = _build_main_menu(query.from_user)
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
@@ -681,7 +917,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         else:
             lines = ["⏳ <b>Ожидают одобрения:</b>\n"]
             for r in rows:
-                uname = f"@{r['username']}" if r['username'] else r['full_name']
+                uname = f"@{r['username']}" if r['username'] else _esc(r['full_name'])  # LOW-4
                 lines.append(f"• {uname} <code>{r['user_id']}</code>")
             text = "\n".join(lines) + "\n\nИспользуйте /pending для одобрения."
         await query.edit_message_text(
@@ -875,49 +1111,68 @@ async def _handle_download_callback(query, ctx, data: str):
     dl_type = parts[1]
     format_id = parts[2]
 
-    # Проверяем лимит одновременных загрузок
     sem: asyncio.Semaphore = ctx.bot_data.get("_download_sem")
-    if sem is not None and sem._value <= 0:
-        await query.answer(
-            f"⚠️ Достигнут лимит одновременных загрузок ({config.MAX_CONCURRENT_DOWNLOADS}). "
-            "Подождите завершения текущих загрузок.",
-            show_alert=True,
-        )
-        return
 
-    info: VideoInfo = ctx.user_data.get(KEY_VIDEO_INFO)
-    url = ctx.user_data.get(KEY_PENDING_URL)
+    # Сначала ищем сессию в БД по message_id — это корректно при групповой загрузке,
+    # когда каждое видео имеет своё сообщение-меню. ctx.user_data содержит данные
+    # только последнего видео и ведёт к ошибке при выборе качества для предыдущих.
+    info: VideoInfo = None
+    url: str = None
+    session = db.get_session(query.message.chat_id, query.message.message_id)
+    if session:
+        try:
+            info = _deserialize_video_info(session["video_info_json"])
+            url = session["url"]
+        except Exception as e:
+            logger.warning("restore_session failed: %s", e)
+    # Фолбэк на user_data (одиночная ссылка или отсутствие сессии в БД)
     if not info or not url:
-        # Пробуем восстановить сессию из БД (пережила перезапуск бота)
-        session = db.get_session(query.message.chat_id, query.message.message_id)
-        if session:
-            try:
-                info = _deserialize_video_info(session["video_info_json"])
-                url = session["url"]
-                ctx.user_data[KEY_VIDEO_INFO] = info
-                ctx.user_data[KEY_PENDING_URL] = url
-            except Exception as e:
-                logger.warning("restore_session failed: %s", e)
-        if not info or not url:
-            # query.answer работает и для фото-сообщений (edit_message_text — нет)
-            await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
-            return
+        info = ctx.user_data.get(KEY_VIDEO_INFO)
+        url = ctx.user_data.get(KEY_PENDING_URL)
+    if not info or not url:
+        await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
+        return
+    # Обновляем user_data для совместимости с остальным кодом
+    ctx.user_data[KEY_VIDEO_INFO] = info
+    ctx.user_data[KEY_PENDING_URL] = url
 
     # Сохраняем до возможного удаления сообщения (при фото-меню)
     _session_chat_id = query.message.chat_id
     _session_msg_id  = query.message.message_id
 
+    # Меню выбора качества трансформируется в сообщение прогресса —
+    # сбрасываем ключ, чтобы следующий URL не пытался удалить уже изменившееся сообщение.
+    ctx.user_data.pop(KEY_QUALITY_MSG, None)
+
     user = query.from_user
     dl_id = db.add_download(user.id, url)
     ctx.user_data[KEY_DOWNLOAD_ID] = dl_id
 
-    audio_only = dl_type == "a"
+    # CRITICAL-3: validate format_id against known formats (allowlist)
+    if dl_type == "v" and format_id not in ("best",):
+        valid_fids = {f.format_id for f in info.formats}
+        if format_id not in valid_fids:
+            logger.warning(
+                "Invalid format_id %r from user %s (not in offered formats)",
+                format_id, query.from_user.id,
+            )
+            await query.answer("❌ Неверный формат. Отправьте ссылку заново.", show_alert=True)
+            return
+
+    audio_only = dl_type in ("a", "ao", "aw")
+    audio_format = "opus" if dl_type == "ao" else "wav" if dl_type == "aw" else "mp3"
     subtitle_lang = format_id if dl_type == "s" else None
     if dl_type == "s":
         format_id = "best"
 
     if dl_type == "a":
         quality_label = "Аудио MP3"
+        fmt_obj = None
+    elif dl_type == "ao":
+        quality_label = "Аудио OPUS"
+        fmt_obj = None
+    elif dl_type == "aw":
+        quality_label = "Аудио WAV"
         fmt_obj = None
     elif dl_type == "s":
         quality_label = f"Субтитры ({subtitle_lang})"
@@ -935,12 +1190,19 @@ async def _handle_download_callback(query, ctx, data: str):
     if _est_size and _est_size > config.MAX_FILE_SIZE_BYTES:
         _known = fmt_obj and fmt_obj.filesize
         _label = _human_size(_est_size) + ("" if _known else " (оценка)")
-        await query.answer(
-            f"❌ Файл слишком большой: {_label}\n"
-            f"Лимит: {config.MAX_FILE_SIZE_MB} МБ ({_human_size(config.MAX_FILE_SIZE_BYTES)})\n"
-            "Выберите меньшее качество.",
-            show_alert=True,
-        )
+        # ВАЖНО: query.answer() уже вызван в handle_callback → второй вызов
+        # show_alert=True Telegram игнорирует. Показываем ошибку редактированием.
+        _caption, _keyboard = _build_quality_menu(info)
+        try:
+            await query.edit_message_text(
+                f"⚠️ <b>Файл слишком большой</b>: {_label}\n"
+                f"Лимит: <b>{config.MAX_FILE_SIZE_MB} МБ</b>\n"
+                f"Выберите более низкое качество:\n\n{_caption}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=_keyboard,
+            )
+        except TelegramError:
+            pass
         db.update_download(dl_id, status="error", error=f"pre-check: too large ~{_est_size}")
         return
 
@@ -977,20 +1239,50 @@ async def _handle_download_callback(query, ctx, data: str):
         )
 
     async def _on_progress(tracker: ProgressTracker) -> None:
-        if cancel_flag[0] or not tracker.total:
+        if cancel_flag[0]:
             return
-        pct = tracker.downloaded / tracker.total * 100
+        if tracker.status == "finished":
+            # Загрузка потока завершена — идёт пост-обработка (FFmpeg).
+            # Для аудио: конвертация в MP3.
+            # Для видео: слияние видео+аудио потоков (fired дважды — после каждого потока).
+            if not audio_only:
+                proc_str = "🔄 Обрабатываю (FFmpeg)..."
+            elif audio_format == "opus":
+                proc_str = "🔄 Извлекаю OPUS..."
+            elif audio_format == "wav":
+                proc_str = "🔄 Конвертирую в WAV..."
+            else:
+                proc_str = "🔄 Конвертирую в MP3..."
+            try:
+                await status_msg.edit_text(
+                    f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
+                    f"Качество: {quality_label}\n\n"
+                    f"{proc_str}",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=cancel_kb,
+                )
+            except TelegramError:
+                pass
+            return
         speed_str = f"{tracker.speed / 1_048_576:.1f} МБ/с" if tracker.speed else "—"
         if tracker.eta:
             m, s = divmod(int(tracker.eta), 60)
             eta_str = f"{m}м {s:02d}с" if m else f"{s}с"
         else:
             eta_str = "—"
+        if tracker.total:
+            pct = tracker.downloaded / tracker.total * 100
+            dl_str = f"⏳ {pct:.1f}% • {speed_str} • ETA: {eta_str}"
+        else:
+            # Размер неизвестен (HLS/DASH фрагменты, aria2c) — показываем скачанное
+            dl_str = f"⏳ {_human_size(tracker.downloaded)} • {speed_str}"
+            if eta_str != "—":
+                dl_str += f" • ETA: {eta_str}"
         try:
             await status_msg.edit_text(
                 f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
                 f"Качество: {quality_label}\n\n"
-                f"⏳ {pct:.1f}% • {speed_str} • ETA: {eta_str}",
+                f"{dl_str}",
                 parse_mode=ParseMode.HTML,
                 reply_markup=cancel_kb,
             )
@@ -1008,14 +1300,48 @@ async def _handle_download_callback(query, ctx, data: str):
         logger.warning("re-key session failed: %s", e)
 
     tmp_dir = config.DOWNLOAD_DIR / f"user_{user.id}" / f"dl_{dl_id}"
+    # MEDIUM-4: ensure tmp_dir is inside DOWNLOAD_DIR before use
     try:
-        async with (sem or asyncio.Semaphore(1)):
+        tmp_dir.resolve().relative_to(config.DOWNLOAD_DIR.resolve())
+    except ValueError:
+        logger.error("Download dir path traversal: %s is outside %s", tmp_dir, config.DOWNLOAD_DIR)
+        await query.answer("❌ Внутренняя ошибка.", show_alert=True)
+        return
+    # Если все слоты заняты — уведомляем пользователя и ждём в очереди.
+    _sem = sem or asyncio.Semaphore(1)
+    _need_queue = sem is not None and getattr(sem, '_value', 1) == 0
+    if _need_queue:
+        try:
+            await status_msg.edit_text(
+                f"⏳ <b>В очереди загрузок</b>\n"
+                f"{_esc(info.title)}\n\n"
+                f"Все {config.MAX_CONCURRENT_DOWNLOADS} слота заняты — загрузка начнётся автоматически.",
+                parse_mode=ParseMode.HTML,
+            )
+        except TelegramError:
+            pass
+
+    try:
+        async with _sem:
+            # Если ждали в очереди — восстанавливаем статус "загружаю"
+            if _need_queue:
+                try:
+                    await status_msg.edit_text(
+                        f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
+                        f"Качество: {quality_label}\n\n"
+                        "⏳ Пожалуйста, подождите…",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=cancel_kb,
+                    )
+                except TelegramError:
+                    pass
             try:
                 result: DownloadResult = await download_video(
                     url=url,
                     format_id=format_id,
                     output_dir=tmp_dir,
                     audio_only=audio_only,
+                    audio_format=audio_format,
                     subtitle_lang=subtitle_lang,
                     progress_callback=_on_progress,
                     cancel_flag=cancel_flag,
@@ -1027,26 +1353,38 @@ async def _handle_download_callback(query, ctx, data: str):
                 if not result.success:
                     _caption, _keyboard = _build_quality_menu(info)
                     if result.error == "CANCELLED":
-                        # Отмена через progress_hook — возвращаем меню качества
+                        # Отмена через _cancel_hook — возвращаем меню качества
                         try:
                             await status_msg.edit_text(_caption, parse_mode=ParseMode.HTML, reply_markup=_keyboard)
                         except TelegramError:
                             pass
                         return
                     db.update_download(dl_id, status="error", error=result.error)
-                    try:
-                        await status_msg.edit_text(
-                            f"❌ Ошибка: <code>{_esc(result.error[:300])}</code>\n\n{_caption}",
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=_keyboard,
+                    # Специальное сообщение для превышения лимита размера файла
+                    if result.error and result.error.startswith("File too large"):
+                        # Парсим "File too large: 12.3 GB (max 10.0 GB)" → берём размер
+                        actual_size = result.error.replace("File too large: ", "").split(" (")[0]
+                        err_text = (
+                            f"⚠️ <b>Файл слишком большой</b>\n\n"
+                            f"Скачанный файл <b>{actual_size}</b> превысил лимит "
+                            f"<b>{config.MAX_FILE_SIZE_MB} МБ</b>.\n\n"
+                            f"Выберите более низкое качество:\n\n{_caption}"
                         )
+                    elif result.error and _login_required_text(result.error):
+                        err_text = _login_required_text(result.error)
+                    else:
+                        err_text = f"❌ Ошибка: <code>{_esc(result.error[:300])}</code>\n\n{_caption}"
+                    try:
+                        await status_msg.edit_text(err_text, parse_mode=ParseMode.HTML, reply_markup=_keyboard)
+                        _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
                     except TelegramError:
                         pass
                     return
 
                 db.update_download(dl_id, status="done", file_size=result.file_size)
 
-                if config.PUBLIC_BASE_URL:
+                _has_fileserver = config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL
+                if _has_fileserver:
                     # Файловый сервер включён — предлагаем выбор доставки
                     try:
                         fs_token = fileserver.move_and_register(
@@ -1061,23 +1399,33 @@ async def _handle_download_callback(query, ctx, data: str):
                             "title": result.title or info.title,
                         }
                         ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
+                        deliver_buttons = [[
+                            InlineKeyboardButton(
+                                "📤 Отправить в Telegram",
+                                callback_data="deliver:tg",
+                            ),
+                        ]]
+                        if config.PUBLIC_BASE_URL:
+                            deliver_buttons.append([InlineKeyboardButton(
+                                f"🔗 Ссылка через Cloudflare ({ttl_h}ч)",
+                                callback_data="deliver:link",
+                            )])
+                        if config.DIRECT_BASE_URL:
+                            deliver_buttons.append([InlineKeyboardButton(
+                                f"🌐 Прямая ссылка с сервера ({ttl_h}ч)",
+                                callback_data="deliver:direct",
+                            )])
+                        if config.RELAY_BASE_URL:
+                            deliver_buttons.append([InlineKeyboardButton(
+                                f"🔄 Relay-ссылка ({ttl_h}ч)",
+                                callback_data="deliver:relay",
+                            )])
                         await status_msg.edit_text(
                             f"✅ <b>{_esc(result.title or info.title)}</b>\n"
                             f"📦 {_human_size(result.file_size)}\n\n"
                             "Как получить файл?",
                             parse_mode=ParseMode.HTML,
-                            reply_markup=InlineKeyboardMarkup([
-                                [
-                                    InlineKeyboardButton(
-                                        "📤 Отправить в Telegram",
-                                        callback_data="deliver:tg",
-                                    ),
-                                    InlineKeyboardButton(
-                                        f"🔗 Ссылка ({ttl_h}ч)",
-                                        callback_data="deliver:link",
-                                    ),
-                                ],
-                            ]),
+                            reply_markup=InlineKeyboardMarkup(deliver_buttons),
                         )
                     except Exception as e:
                         logger.error("fileserver.move_and_register failed: %s", e)
@@ -1094,6 +1442,7 @@ async def _handle_download_callback(query, ctx, data: str):
                                 parse_mode=ParseMode.HTML,
                                 reply_markup=_keyboard,
                             )
+                            _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
                         except TelegramError:
                             pass
                 else:
@@ -1110,6 +1459,7 @@ async def _handle_download_callback(query, ctx, data: str):
                             parse_mode=ParseMode.HTML,
                             reply_markup=_keyboard,
                         )
+                        _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
                     except TelegramError:
                         pass
                     try:
@@ -1144,20 +1494,33 @@ async def _handle_download_callback(query, ctx, data: str):
                 # Сессия удаляется только при явной отмене (❌ Отмена).
 
     except asyncio.CancelledError:
-        # Отмена через task.cancel() — срабатывает при aria2c, когда progress_hook
-        # вызывается редко и cancel_flag не успевает прочитаться до окончания загрузки.
-        # finally выше уже убрал tmp_dir; показываем меню качества.
+        # Не должно возникать при нормальной работе (task.cancel() больше не вызывается).
+        # Оставляем как safety-net на случай внешней отмены задачи (например, shutdown бота).
         db.update_download(dl_id, status="error", error="CANCELLED")
-        _caption, _keyboard = _build_quality_menu(info)
+        raise
+
+
+async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str, token: str, delay: int) -> None:
+    """Уведомляет пользователя за 10 минут до истечения ссылки файлового сервера."""
+    await asyncio.sleep(delay)
+    # Проверяем, что файл ещё существует (не был скачан досрочно)
+    if fileserver.get_entry(token):
         try:
-            await status_msg.edit_text(_caption, parse_mode=ParseMode.HTML, reply_markup=_keyboard)
+            await bot.send_message(
+                chat_id,
+                f"⏰ <b>Ссылка истекает через 10 минут:</b>\n"
+                f"<a href='{info_url}'>{_esc(title[:60])}</a>\n\n"
+                "Успейте скачать!",
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
         except TelegramError:
             pass
 
 
 async def _handle_deliver_callback(query, ctx, data: str):
-    """Обрабатывает выбор способа доставки файла: Telegram или ссылка."""
-    action = data.split(":", 1)[1]  # "tg" или "link"
+    """Обрабатывает выбор способа доставки файла: Telegram, ссылка Cloudflare, прямая с сервера или relay."""
+    action = data.split(":", 1)[1]  # "tg", "link", "direct" или "relay"
     pd = ctx.user_data.get("_pending_delivery")
 
     if not pd:
@@ -1179,6 +1542,57 @@ async def _handle_deliver_callback(query, ctx, data: str):
     title: str = pd.get("title", "")
 
     entry = fileserver.get_entry(token)
+
+    if action in ("link", "direct", "relay"):
+        # ── Доставка через ссылку файлового сервера ──────────────────────────────
+        if not entry:
+            await query.answer("❌ Файл недоступен (истёк TTL). Скачайте заново.", show_alert=True)
+            ctx.user_data.pop("_pending_delivery", None)
+            return
+
+        ctx.user_data.pop("_pending_delivery", None)
+
+        base = (
+            config.DIRECT_BASE_URL if action == "direct" else
+            config.RELAY_BASE_URL  if action == "relay"  else
+            config.PUBLIC_BASE_URL
+        )
+        info_url = f"{base}/info/{token}"
+        ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
+        _caption, _keyboard = _build_quality_menu(info)
+
+        via_label = "сервер" if action == "direct" else "relay" if action == "relay" else "Cloudflare"
+
+        # Планируем уведомление за 10 мин до истечения TTL
+        notify_delay = config.FILE_TTL_SECONDS - 600
+        if notify_delay > 60:
+            asyncio.create_task(_notify_link_expiry(
+                ctx.bot, query.message.chat_id, title, info_url, token, notify_delay
+            ))
+
+        try:
+            await query.edit_message_text(
+                f"🔗 <b>Ссылка для скачивания ({via_label}):</b>\n"
+                f"<a href='{info_url}'>{info_url}</a>\n\n"
+                f"📦 {_human_size(file_size)}\n"
+                f"⏱ Действует <b>{ttl_h} ч</b> (удаляется после первого скачивания)\n\n"
+                + _caption,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=_keyboard,
+            )
+            _schedule_delete(ctx.bot, query.message.chat_id, query.message.message_id)
+        except TelegramError:
+            pass
+        if url:
+            try:
+                db.save_session(
+                    query.message.chat_id, query.message.message_id,
+                    url, _serialize_video_info(info),
+                )
+            except Exception:
+                pass
+        return
 
     if action == "tg":
         # ── Доставка через Telegram ──────────────────────────────────────────────
@@ -1223,6 +1637,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
                 parse_mode=ParseMode.HTML,
                 reply_markup=_keyboard,
             )
+            _schedule_delete(ctx.bot, query.message.chat_id, query.message.message_id)
         except TelegramError:
             pass
         if url:
@@ -1234,40 +1649,6 @@ async def _handle_deliver_callback(query, ctx, data: str):
             except Exception:
                 pass
 
-    elif action == "link":
-        # ── Доставка через ссылку файлового сервера ──────────────────────────────
-        if not entry:
-            await query.answer("❌ Файл недоступен (истёк TTL). Скачайте заново.", show_alert=True)
-            ctx.user_data.pop("_pending_delivery", None)
-            return
-
-        ctx.user_data.pop("_pending_delivery", None)
-
-        info_url = f"{config.PUBLIC_BASE_URL}/info/{token}"
-        ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
-        _caption, _keyboard = _build_quality_menu(info)
-
-        try:
-            await query.edit_message_text(
-                f"🔗 <b>Ссылка для скачивания:</b>\n"
-                f"<a href='{info_url}'>{info_url}</a>\n\n"
-                f"📦 {_human_size(file_size)}\n"
-                f"⏱ Действует <b>{ttl_h} ч</b> (удаляется после первого скачивания)\n\n"
-                + _caption,
-                parse_mode=ParseMode.HTML,
-                disable_web_page_preview=True,
-                reply_markup=_keyboard,
-            )
-        except TelegramError:
-            pass
-        if url:
-            try:
-                db.save_session(
-                    query.message.chat_id, query.message.message_id,
-                    url, _serialize_video_info(info),
-                )
-            except Exception:
-                pass
 
 
 async def _handle_playlist_callback(query, ctx, data: str):
@@ -1307,17 +1688,51 @@ async def _handle_playlist_callback(query, ctx, data: str):
 
         sent = 0
         skipped = 0
+        fs_links: list[tuple[str, str, str]] = []  # (title, size_str, url)
+
         for r in results:
             if r.success and r.file_path and r.file_path.exists():
                 if r.file_size <= config.MAX_FILE_SIZE_BYTES:
-                    await _deliver_file(query.message.chat_id, r, ctx.bot)
+                    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL:
+                        # Файловый сервер включён — регистрируем файл и собираем ссылки.
+                        # move_and_register перемещает файл из tmp_dir → папку fileserver,
+                        # поэтому shutil.rmtree в finally не затронет его.
+                        _pl_base = config.DIRECT_BASE_URL or config.PUBLIC_BASE_URL
+                        try:
+                            token = fileserver.move_and_register(
+                                r.file_path, config.FILE_TTL_SECONDS
+                            )
+                            info_url = f"{_pl_base}/info/{token}"
+                            fs_links.append((
+                                r.title or r.file_path.stem,
+                                _human_size(r.file_size),
+                                info_url,
+                            ))
+                        except Exception as fs_err:
+                            logger.warning("fileserver playlist item failed: %s — fallback to TG", fs_err)
+                            await _deliver_file(query.message.chat_id, r, ctx.bot)
+                    else:
+                        await _deliver_file(query.message.chat_id, r, ctx.bot)
                     sent += 1
                     await asyncio.sleep(1)
                 else:
                     skipped += 1
 
+        # Отправляем все ссылки одним сообщением (только в режиме файлового сервера)
+        if fs_links:
+            ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
+            lines = [f"🔗 <b>Ссылки для скачивания</b> (действуют {ttl_h} ч):\n"]
+            for i, (title, size_str, link_url) in enumerate(fs_links, 1):
+                lines.append(f"{i}. <a href='{link_url}'>{_esc(title[:60])}</a>  {size_str}")
+            await ctx.bot.send_message(
+                query.message.chat_id,
+                "\n".join(lines),
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+            )
+
         db.update_download(dl_id, title=info.title, status="done")
-        summary = f"✅ Плейлист загружен. Отправлено: {sent}/{len(results)}"
+        summary = f"✅ Плейлист готов. Отправлено: {sent}/{len(results)}"
         if skipped:
             summary += f" (пропущено {skipped} — превышен лимит размера)"
         await ctx.bot.send_message(query.message.chat_id, summary)
@@ -1325,59 +1740,63 @@ async def _handle_playlist_callback(query, ctx, data: str):
     except Exception as e:
         logger.error("Playlist error: %s", e)
         db.update_download(dl_id, status="error", error=str(e))
-        await ctx.bot.send_message(
-            query.message.chat_id,
-            f"❌ Ошибка при загрузке плейлиста:\n<code>{_esc(str(e)[:300])}</code>",
-            parse_mode=ParseMode.HTML,
-        )
+        err_str = str(e)
+        if "rate-limit" in err_str.lower() or "ratelimit" in err_str.lower() or "429" in err_str:
+            user_msg = (
+                "⚠️ <b>YouTube ограничил скорость запросов</b>\n\n"
+                "YouTube временно заблокировал скачивание (rate limit).\n"
+                "Попробуйте снова через 30–60 минут.\n\n"
+                "<i>Совет: начните с меньшего количества видео (5 вместо 10).</i>"
+            )
+        else:
+            user_msg = f"❌ Ошибка при загрузке плейлиста:\n<code>{_esc(err_str[:300])}</code>"
+        await ctx.bot.send_message(query.message.chat_id, user_msg, parse_mode=ParseMode.HTML)
     finally:
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
 async def _deliver_file(chat_id: int, result: DownloadResult, bot: Bot, keep_file: bool = False):
-    """
-    Отправляет файл напрямую через Telegram Bot API (локальный сервер снимает лимит 2 ГБ).
+    """Отправляет файл напрямую через Telegram Bot API.
 
-    # ── Режим файлового HTTP-сервера (закомментировано) ─────────────────────────────
-    # При включении: раскомментировать import fileserver, _post_init и .post_init() в main(),
-    # задать PUBLIC_BASE_URL в .env — бот отправит ссылку вместо файла.
-    #
-    # if config.PUBLIC_BASE_URL:
-    #     token = fileserver.register_file(fp, ttl_seconds=config.FILE_TTL_SECONDS)
-    #     url = f"{config.PUBLIC_BASE_URL}/dl/{token}"
-    #     ttl_h = config.FILE_TTL_SECONDS // 3600
-    #     ttl_label = f"{ttl_h} ч" if ttl_h < 24 else f"{ttl_h // 24} д"
-    #     await bot.send_message(
-    #         chat_id,
-    #         f"📥 <b>Файл готов!</b>\n\n"
-    #         f"🔗 <a href='{url}'>{_esc(fp.name)}</a>\n"
-    #         f"📦 Размер: {_human_size(result.file_size)}\n"
-    #         f"⏳ Ссылка действительна: {ttl_label} (удаляется после скачивания)",
-    #         parse_mode=ParseMode.HTML,
-    #         disable_web_page_preview=True,
-    #     )
-    #     return
-    # ─────────────────────────────────────────────────────────────────────────────────
+    Используется в двух случаях:
+    - Режим Telegram API (LOCAL_API_SERVER): локальный сервер читает файл
+      с диска через общий том — нет ограничения 50 МБ, лимит до 2 ГБ.
+    - Режим файлового сервера: вызывается только когда пользователь выбрал
+      «📤 Отправить в Telegram» в _handle_deliver_callback() или при ошибке
+      fileserver.move_and_register(). Регистрация в fileserver и выдача
+      ссылок происходит в _handle_download_callback() / _handle_playlist_callback().
     """
     fp = result.file_path
     caption = f"📁 {fp.stem[:200]}  ({_human_size(result.file_size)})"
+    is_audio = fp.suffix in (".mp3", ".ogg", ".m4a", ".flac", ".wav", ".opus")
 
     if config.LOCAL_API_SERVER:
-        # local_mode=True: передаём абсолютный путь к файлу.
-        # Локальный Bot API сервер читает файл напрямую с диска через
-        # общий том /downloads — не нужен HTTP-upload от бота к серверу.
-        # Это устраняет узкое место при отправке больших файлов.
+        # local_mode=True: передаём абсолютный путь — локальный Bot API сервер
+        # читает файл напрямую с диска через общий том /downloads.
+        # Если API сервер не может stat() файл (например, права доступа),
+        # падаем на чтение содержимого через bot-контейнер (fallback).
         fp_path = fp.resolve()
-        if fp.suffix in (".mp3", ".ogg", ".m4a", ".flac", ".wav"):
-            await bot.send_audio(chat_id, audio=fp_path, caption=caption)
-        else:
-            await bot.send_document(chat_id, document=fp_path, caption=caption)
-    else:
-        with fp.open("rb") as fh:
-            if fp.suffix in (".mp3", ".ogg", ".m4a", ".flac", ".wav"):
-                await bot.send_audio(chat_id, audio=InputFile(fh, filename=fp.name), caption=caption)
+        try:
+            if is_audio:
+                await bot.send_audio(chat_id, audio=fp_path, caption=caption)
             else:
-                await bot.send_document(chat_id, document=InputFile(fh, filename=fp.name), caption=caption)
+                await bot.send_document(chat_id, document=fp_path, caption=caption)
+            if not keep_file:
+                fp.unlink(missing_ok=True)
+            return
+        except TelegramError as exc:
+            if "stat" not in str(exc).lower() and "bad request" not in str(exc).lower():
+                raise
+            logger.warning(
+                "_deliver_file: local API stat() failed (%s), falling back to direct upload", exc
+            )
+            # Продолжаем ниже — читаем файл и шлём как multipart
+
+    with fp.open("rb") as fh:
+        if is_audio:
+            await bot.send_audio(chat_id, audio=InputFile(fh, filename=fp.name), caption=caption)
+        else:
+            await bot.send_document(chat_id, document=InputFile(fh, filename=fp.name), caption=caption)
 
     if not keep_file:
         fp.unlink(missing_ok=True)
@@ -1464,7 +1883,7 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"👥 <b>Одобренные пользователи ({len(rows)}):</b>\n"]
     for r in rows:
-        uname = f"@{r['username']}" if r['username'] else r['full_name']
+        uname = f"@{r['username']}" if r['username'] else _esc(r['full_name'])  # LOW-4
         admin_tag = " 👑" if r['is_admin'] else ""
         lines.append(f"• {uname} <code>{r['user_id']}</code>{admin_tag}")
 
@@ -1561,6 +1980,53 @@ def _esc(text: str) -> str:
     return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
+_LOGIN_REQUIRED_HINTS = (
+    "login required",
+    "login_required",
+    "cookies",
+    "rate-limit reached",
+    "rate limit reached",
+    "not available",
+    "requested content is not available",
+    "private",
+    "sign in",
+)
+
+
+def _login_required_text(err: str) -> str | None:
+    """Если ошибка связана с авторизацией/куками — возвращает понятное сообщение,
+    иначе None. Используется для Instagram, TikTok, Twitter/X и т.п."""
+    low = err.lower()
+    if not any(h in low for h in _LOGIN_REQUIRED_HINTS):
+        return None
+    return (
+        "🔒 <b>Требуется авторизация</b>\n\n"
+        "Этот контент недоступен без входа в аккаунт (Instagram, TikTok, Twitter/X и т.п.).\n\n"
+        "<b>Как исправить:</b>\n"
+        "1. Экспортируйте cookies из браузера в формате Netscape (расширение <i>Get cookies.txt</i>)\n"
+        "2. Сохраните файл на сервер (например <code>/data/cookies.txt</code>)\n"
+        "3. Добавьте в <code>.env</code>:\n"
+        "   <code>COOKIES_FILE=/data/cookies.txt</code>\n"
+        "4. Перезапустите бот: <code>docker compose up -d --build ytdlp-bot</code>"
+    )
+
+
+def _schedule_delete(bot, chat_id: int, message_id: int, delay: int = 0) -> None:
+    """Планирует удаление сообщения через delay секунд (если AUTO_DELETE_SECONDS > 0)."""
+    secs = delay or config.AUTO_DELETE_SECONDS
+    if secs <= 0:
+        return
+
+    async def _do_delete():
+        await asyncio.sleep(secs)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError:
+            pass  # уже удалено или нет прав
+
+    asyncio.create_task(_do_delete())
+
+
 def _human_size(n) -> str:
     if not n:
         return "0 Б"
@@ -1582,33 +2048,72 @@ def _fmt_num(n: int) -> str:
 
 # ── Периодическая очистка (asyncio, без APScheduler) ─────────────────────────────
 
-async def _cleanup_loop() -> None:
+async def _check_disk_alert(bot: Bot) -> bool:
+    """Отправляет алерт администраторам если диск заполнен выше порога.
+
+    Возвращает True если алерт был отправлен (для rate-limiting).
+    """
+    if not config.DISK_ALERT_THRESHOLD or not config.ADMIN_IDS:
+        return False
+    disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
+    pct = disk.used / disk.total * 100
+    if pct < config.DISK_ALERT_THRESHOLD:
+        return False
+    msg = (
+        f"⚠️ <b>Диск заполнен на {pct:.0f}%</b>\n\n"
+        f"Свободно: <b>{_human_size(disk.free)}</b> / {_human_size(disk.total)}\n"
+        f"Порог алерта: {config.DISK_ALERT_THRESHOLD}%"
+    )
+    for admin_id in config.ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, msg, parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
+    return True
+
+
+async def _cleanup_loop(bot: Bot) -> None:
     """Фоновый цикл: очистка каждый час. Запускается через post_init."""
+    _last_disk_alert = 0.0
     while True:
         await asyncio.sleep(3600)
         try:
             await _cleanup_job()
         except Exception as e:
             logger.error("Ошибка очистки: %s", e)
+        # Алерт о диске — не чаще 1 раза в 4 часа
+        try:
+            now = time.monotonic()
+            if now - _last_disk_alert >= 14400:
+                alerted = await _check_disk_alert(bot)
+                if alerted:
+                    _last_disk_alert = now
+        except Exception as e:
+            logger.error("Disk alert check failed: %s", e)
 
 
 async def _post_init(application) -> None:
     application.bot_data["_download_sem"] = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
-    task = asyncio.create_task(_cleanup_loop())
+    task = asyncio.create_task(_cleanup_loop(application.bot))
     application.bot_data["_cleanup_task"] = task
 
-    # Файловый HTTP-сервер: запускается если задан PUBLIC_BASE_URL
-    if config.PUBLIC_BASE_URL:
+    # Файловый HTTP-сервер: запускается если задан PUBLIC_BASE_URL или DIRECT_BASE_URL
+    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL:
         try:
             await fileserver.start(port=config.HTTP_PORT)
+            urls = []
+            if config.PUBLIC_BASE_URL:
+                urls.append(f"туннель: {config.PUBLIC_BASE_URL}")
+            if config.DIRECT_BASE_URL:
+                urls.append(f"прямой IP: {config.DIRECT_BASE_URL}")
             logger.info(
-                "Файловый сервер запущен: порт %d | публичный URL: %s",
-                config.HTTP_PORT, config.PUBLIC_BASE_URL,
+                "Файловый сервер запущен: порт %d | %s",
+                config.HTTP_PORT, " | ".join(urls),
             )
         except Exception as e:
             logger.error("Не удалось запустить файловый сервер: %s", e)
     else:
-        logger.info("PUBLIC_BASE_URL не задан — файловый сервер отключён")
+        logger.info("PUBLIC_BASE_URL и DIRECT_BASE_URL не заданы — файловый сервер отключён")
 
     # Устанавливаем список команд (видны при вводе "/" в Telegram)
     try:
@@ -1633,7 +2138,7 @@ async def _post_shutdown(application) -> None:
         except asyncio.CancelledError:
             pass
     # Останавливаем файловый сервер
-    if config.PUBLIC_BASE_URL:
+    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL:
         await fileserver.stop()
 
 
@@ -1644,6 +2149,9 @@ async def _cleanup_job() -> None:
 
     if config.DOWNLOAD_DIR.exists():
         for item in config.DOWNLOAD_DIR.iterdir():
+            # Не удаляем директорию fileserver — её TTL управляется модулем fileserver
+            if item.name == "fileserver":
+                continue
             try:
                 if item.stat().st_mtime < cutoff_ts:
                     if item.is_dir():
@@ -1759,10 +2267,28 @@ def main():
     # Inline-кнопки
     app.add_handler(CallbackQueryHandler(handle_callback))
 
+    # Inline-режим (@botname <url>)
+    app.add_handler(InlineQueryHandler(handle_inline_query))
+
     app.add_error_handler(error_handler)
 
     logger.info("Бот запускается… Администраторы: %s", config.ADMIN_IDS)
-    app.run_polling(drop_pending_updates=True, bootstrap_retries=5)
+
+    if config.WEBHOOK_URL:
+        logger.info("Webhook-режим: %s → порт %d", config.WEBHOOK_URL, config.WEBHOOK_PORT)
+        # Используем безопасный путь вместо BOT_TOKEN — токен не попадёт в логи прокси
+        import hashlib as _hashlib
+        _webhook_path = _hashlib.sha256(config.BOT_TOKEN.encode()).hexdigest()[:24]
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=config.WEBHOOK_PORT,
+            url_path=_webhook_path,
+            webhook_url=f"{config.WEBHOOK_URL}/{_webhook_path}",
+            secret_token=config.WEBHOOK_SECRET_TOKEN or None,
+            drop_pending_updates=True,
+        )
+    else:
+        app.run_polling(drop_pending_updates=True, bootstrap_retries=5)
 
 
 if __name__ == "__main__":

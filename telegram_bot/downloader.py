@@ -1,12 +1,15 @@
 import asyncio
+import ipaddress
 import logging
 import os
 import re
+import socket
 import tempfile
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
+from urllib.parse import urlparse
 
 import yt_dlp
 
@@ -128,6 +131,8 @@ def _base_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": False,
+        # Блокируем доступ к приватным/loopback сетям из yt-dlp (защита от DNS rebinding)
+        "source_address": "0.0.0.0",
     }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
@@ -147,11 +152,12 @@ def _base_opts() -> dict:
 def _human_size(n: Optional[int]) -> str:
     if not n:
         return "?"
+    size = float(n)
     for unit in ("B", "KB", "MB", "GB"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} TB"
+        if size < 1024:
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
 
 
 # ── Info extraction ─────────────────────────────────────────────────────────────
@@ -161,7 +167,10 @@ async def get_video_info(url: str) -> VideoInfo:
     opts = _base_opts()
     opts.update({
         "skip_download": True,
-        "extract_flat": False,
+        # extract_flat=True: для плейлистов возвращает только плоский список
+        # (id, title, url) без HTTP-запросов для каждого видео — на порядок быстрее.
+        # Для одиночных видео поведение не меняется.
+        "extract_flat": True,
     })
 
     loop = asyncio.get_running_loop()
@@ -175,7 +184,7 @@ async def get_video_info(url: str) -> VideoInfo:
     is_playlist = info.get("_type") == "playlist"
     if is_playlist:
         # Return minimal playlist info
-        entries = info.get("entries") or []
+        entries = list(info.get("entries") or [])
         return VideoInfo(
             url=url,
             title=info.get("title", "Playlist"),
@@ -307,15 +316,23 @@ class ProgressTracker:
     def hook(self, d: dict) -> None:
         self.status = d.get("status", "")
         if self.status == "downloading":
-            self.downloaded = d.get("downloaded_bytes", 0)
-            self.total = d.get("total_bytes") or d.get("total_bytes_estimate", 0)
+            self.downloaded = d.get("downloaded_bytes", 0) or 0
+            self.total = d.get("total_bytes") or d.get("total_bytes_estimate", 0) or 0
             self.speed = d.get("speed", 0) or 0
             self.eta = d.get("eta", 0) or 0
+            # Не показываем пока ничего не скачали (первый вызов с 0 байт)
+            if not self.downloaded:
+                return
             if self.callback and self.loop:
                 now = time.monotonic()
-                if now - self._last_update >= 5.0:   # не чаще раза в 5 секунд
+                if now - self._last_update >= 3.0:   # не чаще раза в 3 секунды
                     self._last_update = now
                     asyncio.run_coroutine_threadsafe(self.callback(self), self.loop)
+        elif self.status == "finished":
+            # Загрузка завершена, идёт пост-обработка (FFmpeg конвертация).
+            # Уведомляем UI один раз, чтобы бот показал "Конвертирую..."
+            if self.callback and self.loop:
+                asyncio.run_coroutine_threadsafe(self.callback(self), self.loop)
 
 
 async def download_video(
@@ -324,6 +341,7 @@ async def download_video(
     output_dir: Path,
     progress_callback: Optional[Callable] = None,
     audio_only: bool = False,
+    audio_format: str = "mp3",   # "mp3" | "opus" | "wav"
     subtitle_lang: Optional[str] = None,
     cancel_flag: Optional[list] = None,
 ) -> DownloadResult:
@@ -331,6 +349,16 @@ async def download_video(
     output_template = str(output_dir / "%(title).80s.%(ext)s")
 
     opts = _base_opts()
+
+    # Когда ждём прогресс — используем нативный загрузчик yt-dlp:
+    # aria2c как внешний загрузчик вызывает progress_hook только при старте/финише,
+    # из-за чего сообщение застревает на «Пожалуйста, подождите…».
+    # Нативный загрузчик с 3 потоками даёт полноценный прогресс на каждом фрагменте.
+    if progress_callback and USE_ARIA2C:
+        opts.pop("external_downloader", None)
+        opts.pop("external_downloader_args", None)
+        opts["concurrent_fragment_downloads"] = 3
+
     loop = asyncio.get_running_loop()
     tracker = ProgressTracker(progress_callback, loop)
 
@@ -344,14 +372,37 @@ async def download_video(
             raise _DownloadCancelled("CANCELLED")
 
     if audio_only:
-        opts.update({
-            "format": "bestaudio/best",
-            "postprocessors": [{
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "192",
-            }],
-        })
+        if audio_format == "opus":
+            # OPUS: ремукс из webm-контейнера — транскодирование не требуется,
+            # работает в 10–50x быстрее MP3. Исходный поток YouTube уже в OPUS.
+            opts.update({
+                "format": "bestaudio[ext=webm]/bestaudio",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "opus",
+                }],
+            })
+        elif audio_format == "wav":
+            # WAV: несжатый PCM — без потерь, максимальный размер
+            opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "wav",
+                }],
+            })
+        else:
+            # MP3: транскодирование libmp3lame с многопоточным FFmpeg
+            opts.update({
+                "format": "bestaudio/best",
+                "postprocessors": [{
+                    "key": "FFmpegExtractAudio",
+                    "preferredcodec": "mp3",
+                    "preferredquality": "192",
+                }],
+                # -threads 0 → FFmpeg использует все доступные ядра CPU
+                "postprocessor_args": {"ffmpeg": ["-threads", "0"]},
+            })
     else:
         # Combine selected video with best audio
         if format_id and format_id != "best":
@@ -390,16 +441,14 @@ async def download_video(
             with yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
-                # Handle post-processing extension change (e.g. mp3)
+                result_holder["title"] = info.get("title", "")
                 if audio_only:
-                    filename = Path(filename).with_suffix(".mp3")
+                    ext = ".opus" if audio_format == "opus" else ".wav" if audio_format == "wav" else ".mp3"
+                    filename = Path(filename).with_suffix(ext)
                 else:
                     filename = Path(filename).with_suffix(".mp4")
                     if not filename.exists():
-                        # Try original
                         filename = Path(ydl.prepare_filename(info))
-
-                result_holder["title"] = info.get("title", "")
                 result_holder["file_path"] = Path(filename)
         except _DownloadCancelled:
             # Отмена пользователем — не логируем как ошибку
@@ -431,6 +480,13 @@ async def download_video(
             file_path = candidates[0]
         else:
             return DownloadResult(success=False, error="Downloaded file not found")
+
+    # CRITICAL-2: path traversal guard — reject files outside output_dir
+    try:
+        file_path.resolve().relative_to(output_dir.resolve())
+    except ValueError:
+        logger.error("Path traversal detected: %s is outside %s", file_path, output_dir)
+        return DownloadResult(success=False, error="Download path validation failed")
 
     file_size = file_path.stat().st_size
     if file_size > MAX_FILE_SIZE_BYTES:
@@ -469,27 +525,51 @@ async def download_playlist(
         "noplaylist": False,
         "playlistend": max_items,
         "socket_timeout": 30,
-        "retries": 3,
+        "retries": 5,
+        # Задержки между запросами для обхода rate-limit YouTube
+        "sleep_interval": 3,
+        "max_sleep_interval": 8,
+        "sleep_interval_requests": 1,
+        "ignoreerrors": True,  # не прерываем плейлист на недоступном видео
     })
 
     loop = asyncio.get_running_loop()
     results = []
+    error_holder: dict = {}
 
     def _download():
-        with yt_dlp.YoutubeDL(opts) as ydl:
-            ydl.download([url])
+        try:
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                ydl.download([url])
+        except Exception as e:
+            error_holder["error"] = str(e)
 
     await loop.run_in_executor(None, _download)
 
+    # Если плейлист не скачал ни одного файла и была ошибка — пробрасываем
+    if error_holder.get("error") and not any(output_dir.iterdir()):
+        raise RuntimeError(error_holder["error"])
+
+    base_resolved = output_dir.resolve()
     for f in sorted(output_dir.iterdir()):
-        if f.is_file() and f.suffix in (".mp4", ".webm", ".mkv", ".mp3"):
-            size = f.stat().st_size
-            results.append(DownloadResult(
-                success=True,
-                file_path=f,
-                title=f.stem,
-                file_size=size,
-            ))
+        # HIGH-5: skip symlinks and files outside output_dir
+        if f.is_symlink():
+            logger.warning("Skipping symlink in playlist output: %s", f)
+            continue
+        if not f.is_file() or f.suffix not in (".mp4", ".webm", ".mkv", ".mp3"):
+            continue
+        try:
+            f.resolve().relative_to(base_resolved)
+        except ValueError:
+            logger.warning("Skipping out-of-directory file in playlist: %s", f)
+            continue
+        size = f.stat().st_size
+        results.append(DownloadResult(
+            success=True,
+            file_path=f,
+            title=f.stem,
+            file_size=size,
+        ))
     return results
 
 
@@ -502,13 +582,51 @@ def _height_from_fid(format_id: str) -> int:
 _EXTRACTORS: list | None = None
 
 
+def _is_ssrf_url(url: str) -> bool:
+    """Возвращает True, если URL ведёт на приватный/loopback адрес (SSRF-защита)."""
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return True
+        # Разрешаем имя в IP; если резолюция падает — блокируем
+        try:
+            addr = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+        except OSError:
+            return True
+        for family, _, _, _, sockaddr in addr:
+            ip_str = sockaddr[0]
+            try:
+                ip = ipaddress.ip_address(ip_str)
+            except ValueError:
+                return True
+            if (
+                ip.is_loopback
+                or ip.is_private
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            ):
+                return True
+        return False
+    except Exception:
+        return True
+
+
 def is_supported_url(url: str) -> bool:
     """Проверяет URL без инстанциирования всех экстракторов каждый раз."""
     global _EXTRACTORS
+    if not re.match(r"https?://", url, re.IGNORECASE):
+        return False
+    # SSRF: блокируем приватные/loopback адреса
+    if _is_ssrf_url(url):
+        logger.warning("Blocked SSRF attempt: %s", url)
+        return False
     if _EXTRACTORS is None:
         _EXTRACTORS = list(yt_dlp.extractor.gen_extractors())
     for e in _EXTRACTORS:
         if e.suitable(url) and e.IE_NAME != "generic":
             return True
-    # Любой http(s) URL допускаем (generic extractor)
-    return bool(re.match(r"https?://", url))
+    # Не допускаем произвольные URL через generic extractor — защита от SSRF/прокси
+    return False

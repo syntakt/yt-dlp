@@ -32,8 +32,14 @@ services:
   # ── YT-DLP бот ───────────────────────────────────────────────────────────────
   ytdlp-bot:
     build:
+      # Локальная сборка из локального исходного кода.
+      # yt-dlp устанавливается из репозитория (yt_dlp/ + pyproject.toml), НЕ из PyPI.
+      # Обновление: git pull && docker compose build && docker compose up -d
       context: .
       dockerfile: Dockerfile
+      args:
+        # Опционально: точный коммит бота. Без этого — RELEASE_GIT_HEAD из yt_dlp/version.py.
+        GIT_COMMIT: "${GIT_COMMIT:-}"
     container_name: ytdlp-bot
     restart: unless-stopped
     depends_on:
@@ -52,6 +58,9 @@ services:
       - ./data/db:/data
       # Опционально: куки для контента 18+
       # - ./cookies.txt:/cookies.txt:ro
+      # Shared с cloudflared: entrypoint.sh читает URL тоннеля отсюда
+      # (только в quick tunnel режиме; в named tunnel PUBLIC_BASE_URL берётся из .env)
+      - cf-url:/cf-url
 
     # ── Лимиты ресурсов ──────────────────────────────────────────────────────
     # memory: файлы не буферизуются в RAM (стриминг при отправке в Telegram),
@@ -74,7 +83,8 @@ services:
 
     # ── Порт файлового HTTP-сервера ──────────────────────────────────────────
     # ports: НЕ используется — Docker iptables отключён (daemon.json: iptables=false).
-    # Проброс порта делается через DNAT в nftables (dockernat.prerouting).
+    # Проброс порта делается через DNAT в nftables (dockernat.prerouting) на 10.10.2.2:8080.
+    # Один и тот же порт обслуживает и Cloudflare Tunnel, и прямой доступ по IP.
     # Раскомментировать ТОЛЬКО для отладки без nftables (создаст docker-proxy):
     # ports:
     #   - "${HTTP_PORT:-8080}:8080"
@@ -92,9 +102,154 @@ services:
       retries: 3
       start_period: 15s
 
+  # ── Cloudflare Tunnel ────────────────────────────────────────────────────────
+  # Даёт публичный HTTPS-URL для файлового сервера без открытия портов на хосте.
+  # Cloudflared устанавливает ИСХОДЯЩЕЕ соединение к Cloudflare (443/7844) —
+  # дополнительных правил DNAT в nftables НЕ требуется.
+  #
+  # ВАЖНО — nftables: убедитесь, что MASQUERADE/SNAT покрывает весь subnet,
+  # а не только .2 и .3. Пример минимального правила (замените eth0 на ваш iface):
+  #   ip saddr 10.10.2.0/24 oifname "eth0" masquerade
+  # Если у вас правила на конкретные IP — добавьте 10.10.2.4:
+  #   ip saddr { 10.10.2.2, 10.10.2.3, 10.10.2.4 } oifname "eth0" masquerade
+  #
+  # ── Режимы (задаётся через .env) ───────────────────────────────────────────
+  # Режим A — NAMED TUNNEL (рекомендуется, постоянный URL):
+  #   1. Cloudflare Dashboard → Zero Trust → Networks → Tunnels → Create
+  #   2. Скопируйте токен → .env: CLOUDFLARE_TUNNEL_TOKEN=eyJ...
+  #   3. В настройках тоннеля: Public Hostname → Service http://ytdlp-bot:8080
+  #   4. .env: PUBLIC_BASE_URL=https://ваш-поддомен.domain.com
+  #
+  # Режим B — QUICK TUNNEL (тест, URL меняется при каждом рестарте):
+  #   Оставьте CLOUDFLARE_TUNNEL_TOKEN= пустым в .env.
+  #   URL появится в логах: docker compose logs -f cloudflared | grep trycloudflare
+  #   Затем: PUBLIC_BASE_URL=https://<random>.trycloudflare.com + restart ytdlp-bot
+  cloudflared:
+    # cloudflare/cloudflared:latest — scratch-образ, нет /bin/sh.
+    # Собираем свой: берём бинарник из scratch-образа, кладём в alpine + наш скрипт.
+    # Dockerfile.cloudflared использует multi-stage build.
+    build:
+      context: .
+      dockerfile: Dockerfile.cloudflared
+    image: yt-dlp-cloudflared   # кэшируем под именем, чтобы не пересобирать каждый раз
+    container_name: cloudflared
+    restart: unless-stopped
+    volumes:
+      - cf-url:/cf-url   # shared с ytdlp-bot: сюда пишется URL тоннеля
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+      HTTP_PORT: ${HTTP_PORT:-8080}
+    # Запускаем параллельно с ytdlp-bot (оба ждут telegram-bot-api).
+    # Убрано depends_on ytdlp-bot — иначе deadlock в quick tunnel режиме
+    # (ytdlp-bot ждёт URL от cloudflared, cloudflared ждёт health ytdlp-bot).
+    depends_on:
+      telegram-bot-api:
+        condition: service_healthy
+    networks:
+      botnet:
+        ipv4_address: 10.10.2.4   # добавьте в nftables MASQUERADE если нужно (см. выше)
+    healthcheck:
+      # cloudflared поднимает metrics-сервер на :2000 с /readyz
+      test: ["CMD-SHELL", "wget -qO- http://localhost:2000/readyz 2>/dev/null | grep -q 'ok' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  # ── Nginx SSL reverse proxy (прямой доступ по IP через HTTPS) ────────────────
+  # Активируется через: COMPOSE_PROFILES=ssl в .env
+  # (или: docker compose --profile ssl up -d)
+  #
+  # TLS-терминация: HTTPS на порту 7443 → проксирует к файловому серверу ytdlp-bot:8080.
+  # sslip.io даёт доменное имя для IP (напр. 15-24-9-1.sslip.io → 15.24.9.1).
+  # Сертификат: self-signed сразу, Let's Encrypt автоматически (если порт 80 доступен).
+  #
+  # ── nftables (обязательно) ──────────────────────────────────────────────────
+  #
+  # 1. Добавить в defines:
+  #   define NGINX_SSL_IP         = 10.10.2.5
+  #   define HTTPS_DIRECT_INPUT   = 7443
+  #   define HTTPS_DIRECT_OUTPUT  = 7443
+  #
+  # 2. DNAT — добавить в dockernat.prerouting:
+  #   fib daddr type local tcp dport $HTTPS_DIRECT_INPUT dnat to $NGINX_SSL_IP:$HTTPS_DIRECT_OUTPUT
+  #
+  # 3. DNAT — добавить в dockernat.output:
+  #   ip daddr != 127.0.0.0/8 fib daddr type local tcp dport $HTTPS_DIRECT_INPUT dnat to $NGINX_SSL_IP:$HTTPS_DIRECT_OUTPUT
+  #
+  # 4. Фильтрация — в forward chain (ПЕРЕД общим docker_nets accept):
+  #   Доступ к nginx-ssl ТОЛЬКО для $ASN и $MY_SERVER:
+  #   meta mark { $ASN, $MY_SERVER } ip daddr $NGINX_SSL_IP tcp dport $HTTPS_DIRECT_OUTPUT counter accept
+  #   ip daddr $NGINX_SSL_IP tcp dport $HTTPS_DIRECT_OUTPUT counter log prefix "[nft] nginx-ssl BLOCKED " drop
+  #
+  # 5. Удалить старый HTTP DNAT (порт 8080 больше не нужен снаружи):
+  #   # fib daddr type local tcp dport $FILESERVER_INPUT dnat to $YTDLP_IP:$FILESERVER_OUTPUT
+  #
+  # 6. Let's Encrypt (вручную, временно на время получения/обновления cert):
+  #   Заменить правило DNAT для порта 80 в prerouting/output:
+  #     fib daddr type local tcp dport 80 dnat to $NGINX_SSL_IP:80
+  #   ⚠ Порт 80 нужен ТОЛЬКО на время certbot (30 сек). После получения cert
+  #     верните DNAT порта 80 на vpnbot nginx и перезагрузите: nft -f /etc/nftables.conf
+  #   ⚠ Для ACME challenge порт 80 должен быть открыт всем (LE серверы не из $ASN)
+  #
+  # MASQUERADE: 10.10.2.0/24 уже покрыт. docker_nets set тоже содержит 10.10.2.0/24.
+  # ────────────────────────────────────────────────────────────────────────────
+  nginx-ssl:
+    profiles: ["ssl"]
+    build:
+      context: .
+      dockerfile: Dockerfile.nginx
+    image: yt-dlp-nginx-ssl
+    container_name: nginx-ssl
+    restart: unless-stopped
+    depends_on:
+      - ytdlp-bot
+    environment:
+      SSLIP_DOMAIN: ${SSLIP_DOMAIN:-}
+      HTTPS_PORT: ${HTTPS_PORT:-7443}
+      CERTBOT_EMAIL: ${CERTBOT_EMAIL:-}
+      ENABLE_CERTBOT: ${ENABLE_CERTBOT:-true}
+    volumes:
+      # Сертификаты (persist между перезапусками)
+      - nginx-ssl-certs:/etc/nginx/ssl
+      # Let's Encrypt state (persist для renewal)
+      - nginx-le-data:/etc/letsencrypt
+      # ACME challenge webroot (ephemeral)
+      - nginx-webroot:/var/www/certbot
+    networks:
+      botnet:
+        ipv4_address: 10.10.2.5
+    # ports: нет — nftables DNAT на 10.10.2.5:7443 (и опционально :80)
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:${HTTPS_PORT:-7443}/health 2>/dev/null | grep -q 'ok' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
 networks:
   botnet:
     driver: bridge
     ipam:
       config:
         - subnet: 10.10.2.0/24
+
+volumes:
+  # Канал передачи URL тоннеля от cloudflared к ytdlp-bot.
+  # Quick tunnel: cf-entrypoint.sh пишет URL → entrypoint.sh читает и экспортирует.
+  # Named tunnel: том примонтирован, но не используется (PUBLIC_BASE_URL из .env).
+  cf-url:
+  # nginx-ssl: TLS-сертификаты и Let's Encrypt данные
+  nginx-ssl-certs:
+  nginx-le-data:
+  nginx-webroot:
