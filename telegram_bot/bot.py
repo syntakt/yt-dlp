@@ -9,6 +9,7 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import time
 import traceback
@@ -126,20 +127,25 @@ def require_auth(func):
     @wraps(func)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        db.upsert_user(user.id, user.username, user.full_name)
-        if db.is_admin(user.id):
-            return await func(update, ctx)
-        if not db.is_authorized(user.id):
-            row = db.get_user(user.id)
-            if row and not row["is_approved"] and not row["is_banned"]:
-                await update.effective_message.reply_text(
-                    "⏳ Ваша заявка на доступ ожидает одобрения администратора.\n"
-                    "Вы получите уведомление после одобрения."
-                )
-            elif row and row["is_banned"]:
-                await update.effective_message.reply_text("🚫 Вы заблокированы и не можете использовать этого бота.")
-            else:
-                await _send_access_request(update, ctx)
+        try:
+            db.upsert_user(user.id, user.username, user.full_name)
+            if db.is_admin(user.id):
+                return await func(update, ctx)
+            if not db.is_authorized(user.id):
+                row = db.get_user(user.id)
+                if row and not row["is_approved"] and not row["is_banned"]:
+                    await update.effective_message.reply_text(
+                        "⏳ Ваша заявка на доступ ожидает одобрения администратора.\n"
+                        "Вы получите уведомление после одобрения."
+                    )
+                elif row and row["is_banned"]:
+                    await update.effective_message.reply_text("🚫 Вы заблокированы и не можете использовать этого бота.")
+                else:
+                    await _send_access_request(update, ctx)
+                return
+        except sqlite3.Error as e:
+            logger.error("DB error in require_auth: %s", e)
+            await update.effective_message.reply_text("⚠️ Временная ошибка. Попробуйте позже.")
             return
         return await func(update, ctx)
     return wrapper
@@ -150,8 +156,13 @@ def require_admin(func):
     @wraps(func)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if not db.is_admin(user.id):
-            await update.effective_message.reply_text("🚫 Требуется доступ администратора.")
+        try:
+            if not db.is_admin(user.id):
+                await update.effective_message.reply_text("🚫 Требуется доступ администратора.")
+                return
+        except sqlite3.Error as e:
+            logger.error("DB error in require_admin: %s", e)
+            await update.effective_message.reply_text("⚠️ Временная ошибка. Попробуйте позже.")
             return
         return await func(update, ctx)
     return wrapper
@@ -723,7 +734,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Авторизация: все остальные callback требуют одобренного аккаунта ─────────
-    user_is_auth = db.is_authorized(user.id) or db.is_admin(user.id)
+    try:
+        user_is_auth = db.is_authorized(user.id) or db.is_admin(user.id)
+    except sqlite3.Error as e:
+        logger.error("DB error in handle_callback auth check: %s", e)
+        await query.answer("⚠️ Временная ошибка. Попробуйте позже.", show_alert=True)
+        return
     if not user_is_auth:
         await query.answer(
             "🚫 Доступ запрещён. Отправьте /start чтобы запросить доступ.",
@@ -2295,6 +2311,11 @@ def main():
 
     db.init_db()
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Сбрасываем зависшие загрузки (pending/downloading) от прошлого запуска
+    stale = db.cleanup_stale_downloads()
+    if stale:
+        logger.info("Сброшено зависших загрузок: %d", stale)
 
     # Синхронизируем права администраторов с текущим ADMIN_IDS в .env
     # Если кто-то убран из ADMIN_IDS — теряет флаг is_admin в БД
