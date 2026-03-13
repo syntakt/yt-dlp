@@ -184,6 +184,20 @@ def is_admin(user_id: int) -> bool:
         return bool(row["is_admin"]) if row else False
 
 
+def is_super_admin(user_id: int) -> bool:
+    """Суперадмин — из ADMIN_IDS в .env и не забанен."""
+    from config import ADMIN_IDS
+    if user_id not in ADMIN_IDS:
+        return False
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT is_banned FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row and row["is_banned"]:
+            return False
+    return True
+
+
 # ── Download history ───────────────────────────────────────────────────────────
 
 def add_download(user_id: int, url: str) -> int:

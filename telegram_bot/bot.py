@@ -168,11 +168,38 @@ def require_admin(func):
     return wrapper
 
 
+def require_super_admin(func):
+    """Отклоняет не-суперадминов (только ADMIN_IDS из .env)."""
+    @wraps(func)
+    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        try:
+            if not db.is_super_admin(user.id):
+                await update.effective_message.reply_text(
+                    "🚫 Эта команда доступна только суперадминистраторам (ADMIN_IDS)."
+                )
+                return
+        except sqlite3.Error as e:
+            logger.error("DB error in require_super_admin: %s", e)
+            await update.effective_message.reply_text("⚠️ Временная ошибка. Попробуйте позже.")
+            return
+        return await func(update, ctx)
+    return wrapper
+
+
 # ── Запрос доступа ───────────────────────────────────────────────────────────────
 
 async def _send_access_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.upsert_user(user.id, user.username, user.full_name)
+
+    # Забаненный пользователь не может зарегистрироваться даже при open-режиме
+    row = db.get_user(user.id)
+    if row and row["is_banned"]:
+        await update.effective_message.reply_text(
+            "🚫 Вы заблокированы и не можете использовать этого бота."
+        )
+        return
 
     if config.REGISTRATION_MODE == "open":
         db.approve_user(user.id, 0)
@@ -326,9 +353,10 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/deny &lt;id&gt; — отклонить пользователя\n"
             "/ban &lt;id&gt; — заблокировать\n"
             "/unban &lt;id&gt; — разблокировать\n"
-            "/addadmin &lt;id&gt; — назначить администратором\n"
             "/stats — глобальная статистика\n"
         )
+        if db.is_super_admin(update.effective_user.id):
+            text += "/addadmin &lt;id&gt; — назначить администратором (👑 super)\n"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
@@ -1482,6 +1510,15 @@ async def _handle_download_callback(query, ctx, data: str):
 
                 db.update_download(dl_id, status="done", file_size=result.file_size)
 
+                # Re-auth: проверяем, не забанили ли пользователя во время загрузки
+                if not (db.is_admin(user.id) or db.is_authorized(user.id)):
+                    logger.info("User %s was banned/revoked during download %d — file not delivered", user.id, dl_id)
+                    try:
+                        await status_msg.edit_text("🚫 Ваш доступ был отозван. Файл не будет доставлен.")
+                    except TelegramError:
+                        pass
+                    return
+
                 _has_fileserver = config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL
                 if _has_fileserver:
                     # Файловый сервер включён — предлагаем выбор доставки
@@ -1795,6 +1832,15 @@ async def _handle_playlist_callback(query, ctx, data: str):
             max_items=max_items,
         )
 
+        # Re-auth: проверяем, не забанили ли пользователя во время загрузки плейлиста
+        if not (db.is_admin(user.id) or db.is_authorized(user.id)):
+            logger.info("User %s was banned/revoked during playlist download %d", user.id, dl_id)
+            await ctx.bot.send_message(
+                query.message.chat_id,
+                "🚫 Ваш доступ был отозван. Файлы не будут доставлены.",
+            )
+            return
+
         sent = 0
         skipped = 0
         fs_links: list[tuple[str, str, str]] = []  # (title, size_str, url)
@@ -1997,7 +2043,12 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"👥 <b>Одобренные пользователи ({len(rows)}):</b>\n"]
     for r in rows:
         uname = f"@{r['username']}" if r['username'] else _esc(r['full_name'])  # LOW-4
-        admin_tag = " 👑" if r['is_admin'] else ""
+        if r['user_id'] in config.ADMIN_IDS:
+            admin_tag = " 👑 super"
+        elif r['is_admin']:
+            admin_tag = " 🛡 admin"
+        else:
+            admin_tag = ""
         lines.append(f"• {uname} <code>{r['user_id']}</code>{admin_tag}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -2023,7 +2074,7 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _admin_user_action(update, ctx, "unban")
 
 
-@require_admin
+@require_super_admin
 async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _admin_user_action(update, ctx, "addadmin")
 
