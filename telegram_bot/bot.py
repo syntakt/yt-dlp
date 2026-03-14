@@ -349,7 +349,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_access_request(update, ctx)
 
 
-@require_auth
 def _build_help_text(user_id: int, verbose: bool = True) -> str:
     """Build help text. verbose=True for full /help version."""
     is_adm = db.is_admin(user_id)
@@ -389,6 +388,7 @@ def _build_help_text(user_id: int, verbose: bool = True) -> str:
     return text
 
 
+@require_auth
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = _build_help_text(update.effective_user.id, verbose=True)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
@@ -417,7 +417,6 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     )
 
 
-@require_auth
 def _build_status_text(user_id: int, verbose: bool = True) -> str:
     """Build status text. verbose=True for full /status version."""
     stats = db.get_global_stats()
@@ -448,6 +447,7 @@ def _build_status_text(user_id: int, verbose: bool = True) -> str:
     return text
 
 
+@require_auth
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = _build_status_text(update.effective_user.id, verbose=True)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
