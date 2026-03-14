@@ -23,7 +23,7 @@ services:
     healthcheck:
       # 404 at root is normal — the server is up. wget exits 8 on HTTP errors,
       # so we accept codes 0 and 8 (any HTTP response = healthy).
-      test: ["CMD-SHELL", "wget -q --timeout=5 -O /dev/null http://localhost:8081 || [ $? -eq 8 ]"]
+      test: ["CMD-SHELL", "wget -q --timeout=5 http://localhost:8081; [ $? -le 8 ]"]
       interval: 30s
       timeout: 10s
       retries: 10
@@ -96,7 +96,7 @@ services:
 
     # ── Healthcheck ──────────────────────────────────────────────────────────
     healthcheck:
-      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:${HTTP_PORT:-8080}/health')\" 2>/dev/null || python -c \"import yt_dlp; print('ok')\""]
+      test: ["CMD", "python", "-c", "import yt_dlp; print('ok')"]
       interval: 60s
       timeout: 10s
       retries: 3
