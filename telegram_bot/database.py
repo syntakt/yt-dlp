@@ -347,6 +347,31 @@ def get_pending_users() -> list:
         ).fetchall()
 
 
+def get_all_users_detailed() -> list[dict]:
+    """Возвращает подробную информацию о всех пользователях с их статистикой загрузок."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT u.user_id, u.username, u.full_name,
+                   u.is_approved, u.is_banned, u.is_admin,
+                   u.created_at, u.approved_at, u.approved_by,
+                   COALESCE(d.downloads, 0) AS downloads,
+                   COALESCE(d.total_bytes, 0) AS total_bytes,
+                   d.last_download_at
+              FROM users u
+              LEFT JOIN (
+                  SELECT user_id,
+                         COUNT(*) AS downloads,
+                         SUM(file_size) AS total_bytes,
+                         MAX(created_at) AS last_download_at
+                    FROM download_history
+                   WHERE status = 'done'
+                   GROUP BY user_id
+              ) d ON u.user_id = d.user_id
+             ORDER BY u.created_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_user_stats(user_id: int) -> dict:
     """Возвращает статистику по конкретному пользователю."""
     with get_connection() as conn:

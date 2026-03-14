@@ -494,12 +494,24 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
+def _fmt_date_short(iso_str: str | None) -> str:
+    """Форматирует ISO дату в короткий вид: 14.03.26 12:30."""
+    if not iso_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%y %H:%M")
+    except (ValueError, AttributeError):
+        return iso_str[:16] if iso_str else "—"
+
+
 def _build_status_text(user_id: int, verbose: bool = True) -> str:
     """Build status text. verbose=True for full /status version."""
     stats = db.get_global_stats()
     disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
     disk_pct = disk.used / disk.total * 100
     disk_warn = " ⚠️" if disk_pct >= config.DISK_ALERT_THRESHOLD else ""
+    is_adm = db.is_admin(user_id)
     text = "📊 <b>Статус бота</b>\n\n"
     if verbose:
         user_stats = db.get_user_stats(user_id)
@@ -514,13 +526,68 @@ def _build_status_text(user_id: int, verbose: bool = True) -> str:
         f"⏳ Ожидают: {stats['pending_requests']}\n\n"
         f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
     )
-    if verbose and db.is_admin(user_id) and stats['pending_requests']:
-        pending = db.get_pending_users()
-        lines = ["\n⏳ <b>Ожидают одобрения:</b>"]
-        for r in pending:
-            uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
-            lines.append(f"• {uname} — <code>{r['user_id']}</code>")
-        text += "\n".join(lines)
+
+    # Подробная информация для администраторов
+    if verbose and is_adm:
+        # Конфигурация
+        text += "\n\n⚙️ <b>Конфигурация:</b>\n"
+        text += f"• Режим регистрации: <code>{config.REGISTRATION_MODE}</code>\n"
+        text += f"• Макс. размер файла: {config.MAX_FILE_SIZE_MB} МБ\n"
+        text += f"• Параллельных загрузок: {config.MAX_CONCURRENT_DOWNLOADS}\n"
+        text += f"• Таймаут загрузки: {config.DOWNLOAD_TIMEOUT // 60} мин\n"
+        text += f"• TTL ссылок: {max(1, config.FILE_TTL_SECONDS // 3600)} ч\n"
+        _channels = []
+        if config.PUBLIC_BASE_URL:
+            _channels.append("CF")
+        if config.DIRECT_BASE_URL:
+            _channels.append("Direct")
+        if config.RELAY_BASE_URL:
+            _channels.append("Relay")
+        text += f"• Каналы доставки: {', '.join(_channels) if _channels else 'только Telegram'}\n"
+        text += f"• HMAC подпись: {'✓' if config.SERVER_SECRET else '✗'}\n"
+        text += f"• Версия: <code>v{BOT_VERSION}</code>"
+
+        # Список пользователей с подробностями
+        all_users = db.get_all_users_detailed()
+        if all_users:
+            text += f"\n\n👥 <b>Пользователи ({len(all_users)}):</b>\n"
+            for u in all_users:
+                uid = u["user_id"]
+                uname = f"@{_esc(u['username'])}" if u.get("username") else _esc(u.get("full_name") or "—")
+                # Роль
+                if uid in config.ADMIN_IDS:
+                    role = "👑"
+                elif u["is_admin"]:
+                    role = "🛡"
+                elif u["is_banned"]:
+                    role = "🚫"
+                elif not u["is_approved"]:
+                    role = "⏳"
+                else:
+                    role = "👤"
+                # Дата регистрации
+                reg_date = _fmt_date_short(u.get("created_at"))
+                # Статистика загрузок
+                dl_count = u.get("downloads", 0)
+                dl_size = _human_size(u.get("total_bytes", 0))
+                last_dl = _fmt_date_short(u.get("last_download_at"))
+
+                text += f"\n{role} {uname} <code>{uid}</code>\n"
+                text += f"   📅 Добавлен: {reg_date}\n"
+                if dl_count:
+                    text += f"   📥 Загрузок: {dl_count} ({dl_size})\n"
+                    text += f"   🕐 Последняя: {last_dl}\n"
+                else:
+                    text += f"   📥 Загрузок: 0\n"
+
+        # Ожидающие одобрения (отдельным блоком если есть)
+        if stats['pending_requests']:
+            pending = db.get_pending_users()
+            text += "\n⏳ <b>Ожидают одобрения:</b>\n"
+            for r in pending:
+                uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
+                text += f"• {uname} — <code>{r['user_id']}</code> ({_fmt_date_short(r['created_at'])})\n"
+
     return text
 
 
