@@ -75,18 +75,54 @@ class _TokenMaskFilter(logging.Filter):
         super().__init__()
         self._token = token
 
+    def _mask(self, text: str) -> str:
+        return text.replace(self._token, "<TOKEN>") if self._token else text
+
     def filter(self, record: logging.LogRecord) -> bool:
         if not self._token:
             return True
         if isinstance(record.msg, str):
-            record.msg = record.msg.replace(self._token, "<TOKEN>")
+            record.msg = self._mask(record.msg)
         if record.args:
-            args = record.args if isinstance(record.args, tuple) else (record.args,)
-            record.args = tuple(
-                a.replace(self._token, "<TOKEN>") if isinstance(a, str) else a
-                for a in args
-            )
+            if isinstance(record.args, dict):
+                record.args = {
+                    k: self._mask(v) if isinstance(v, str) else v
+                    for k, v in record.args.items()
+                }
+            else:
+                args = record.args if isinstance(record.args, tuple) else (record.args,)
+                record.args = tuple(
+                    self._mask(a) if isinstance(a, str) else a
+                    for a in args
+                )
+        # Маскируем exc_text (кешированный traceback) — без этого токен утекает
+        # через TelegramError, который содержит URL с токеном в str(exception)
+        if record.exc_text:
+            record.exc_text = self._mask(record.exc_text)
+        if record.exc_info and record.exc_info[1]:
+            # Перезаписываем args исключения, чтобы при форматировании токен не утёк
+            exc = record.exc_info[1]
+            if hasattr(exc, 'args') and exc.args:
+                exc.args = tuple(
+                    self._mask(a) if isinstance(a, str) else a
+                    for a in exc.args
+                )
+        if record.stack_info:
+            record.stack_info = self._mask(record.stack_info)
         return True
+
+
+class _TokenMaskFormatter(logging.Formatter):
+    """Форматтер, маскирующий токен в финальном выводе (включая traceback)."""
+    def __init__(self, token: str, fmt=None, datefmt=None):
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self._token = token
+
+    def format(self, record: logging.LogRecord) -> str:
+        output = super().format(record)
+        if self._token:
+            output = output.replace(self._token, "<TOKEN>")
+        return output
 
 # ── Session state keys ───────────────────────────────────────────────────────────
 KEY_VIDEO_INFO  = "video_info"
@@ -391,14 +427,52 @@ def _build_help_text(user_id: int, verbose: bool = True) -> str:
 @require_auth
 async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     text = _build_help_text(update.effective_user.id, verbose=True)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее меню бота, чтобы не захламлять чат
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id, text,
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("« Назад", callback_data="menu:back"),
+        ]]),
+    )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 @require_auth
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее сообщение меню
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
+
     rows = db.get_user_history(update.effective_user.id, limit=10)
     if not rows:
-        await update.message.reply_text("📭 История загрузок пуста.")
+        sent = await ctx.bot.send_message(
+            update.effective_chat.id, "📭 История загрузок пуста.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Назад", callback_data="menu:back"),
+            ]]),
+        )
+        ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
         return
 
     lines = ["📜 <b>Последние загрузки:</b>\n"]
@@ -408,13 +482,16 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {status_icon} {title}")
         if row["quality"]:
             lines.append(f"   └ {row['quality']}, {_human_size(row['file_size'])}")
-    await update.message.reply_text(
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id,
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🗑 Очистить историю", callback_data="clear_history"),
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Очистить историю", callback_data="clear_history")],
+            [InlineKeyboardButton("« Назад", callback_data="menu:back")],
+        ]),
     )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 def _build_status_text(user_id: int, verbose: bool = True) -> str:
@@ -449,8 +526,27 @@ def _build_status_text(user_id: int, verbose: bool = True) -> str:
 
 @require_auth
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее сообщение меню
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
     text = _build_status_text(update.effective_user.id, verbose=True)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id, text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("« Назад", callback_data="menu:back"),
+        ]]),
+    )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 @require_auth
@@ -458,17 +554,46 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cancel_flag = ctx.user_data.get("cancel_flag")
     if cancel_flag is not None:
         cancel_flag[0] = True
-    # Preserve main_menu_msg_id for correct UX
-    main_menu_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее сообщение меню
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
     ctx.user_data.clear()
-    if main_menu_id is not None:
-        ctx.user_data[KEY_MAIN_MENU_MSG] = main_menu_id
-    await update.message.reply_text("🛑 Отменено. Отправьте новую ссылку когда будете готовы.")
+    # Показываем главное меню вместо тупика "Отменено"
+    user = update.effective_user
+    text, keyboard = _build_main_menu(user)
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id, text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=keyboard,
+    )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 @require_auth
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Показывает клавиатуру с командами бота."""
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее сообщение меню
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
     is_adm = db.is_admin(update.effective_user.id)
     user_buttons = [
         [
@@ -489,11 +614,13 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ],
     ]
     buttons = user_buttons + (admin_buttons if is_adm else [])
-    await update.message.reply_text(
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id,
         "📋 <b>Меню команд</b>\n\nВыберите действие или отправьте ссылку на видео:",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 # ── Обработчик URL ───────────────────────────────────────────────────────────────
@@ -980,6 +1107,7 @@ async def _handle_menu_callback(query, ctx, data: str):
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
+        ctx.user_data[KEY_MAIN_MENU_MSG] = query.message.message_id
 
     elif action == "pending":
         if not db.is_admin(user.id):
@@ -1854,16 +1982,22 @@ async def _handle_playlist_callback(query, ctx, data: str):
                         # Файловый сервер включён — регистрируем файл и собираем ссылки.
                         # move_and_register перемещает файл из tmp_dir → папку fileserver,
                         # поэтому shutil.rmtree в finally не затронет его.
-                        _pl_base = config.DIRECT_BASE_URL or config.PUBLIC_BASE_URL
                         try:
                             token = fileserver.move_and_register(
                                 r.file_path, config.FILE_TTL_SECONDS
                             )
-                            info_url = f"{_pl_base}/info/{token}"
+                            # Собираем ссылки через все доступные каналы
+                            item_links: dict[str, str] = {}
+                            if config.DIRECT_BASE_URL:
+                                item_links["server"] = f"{config.DIRECT_BASE_URL}/info/{token}"
+                            if config.PUBLIC_BASE_URL:
+                                item_links["cf"] = f"{config.PUBLIC_BASE_URL}/info/{token}"
+                            if config.RELAY_BASE_URL:
+                                item_links["relay"] = f"{config.RELAY_BASE_URL}/info/{token}"
                             fs_links.append((
                                 r.title or r.file_path.stem,
                                 _human_size(r.file_size),
-                                info_url,
+                                item_links,
                             ))
                         except Exception as fs_err:
                             logger.warning("fileserver playlist item failed: %s — fallback to TG", fs_err)
@@ -1879,8 +2013,20 @@ async def _handle_playlist_callback(query, ctx, data: str):
         if fs_links:
             ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
             lines = [f"🔗 <b>Ссылки для скачивания</b> (действуют {ttl_h} ч):\n"]
-            for i, (title, size_str, link_url) in enumerate(fs_links, 1):
-                lines.append(f"{i}. <a href='{link_url}'>{_esc(title[:60])}</a>  {size_str}")
+            for i, (title, size_str, item_links) in enumerate(fs_links, 1):
+                # Основная ссылка (первая доступная)
+                primary_url = next(iter(item_links.values()))
+                lines.append(f"{i}. <a href='{primary_url}'>{_esc(title[:60])}</a>  {size_str}")
+                # Дополнительные каналы доставки
+                alt_parts: list[str] = []
+                if "server" in item_links:
+                    alt_parts.append(f"<a href='{item_links['server']}'>сервер</a>")
+                if "cf" in item_links:
+                    alt_parts.append(f"<a href='{item_links['cf']}'>CF</a>")
+                if "relay" in item_links:
+                    alt_parts.append(f"<a href='{item_links['relay']}'>relay</a>")
+                if len(alt_parts) > 1:
+                    lines.append(f"   └ {' | '.join(alt_parts)}")
             await ctx.bot.send_message(
                 query.message.chat_id,
                 "\n".join(lines),
@@ -2360,14 +2506,23 @@ def main():
 
     # Маскируем токен в логах — должно быть первым делом
     _mask = _TokenMaskFilter(config.BOT_TOKEN)
+    _fmt = _TokenMaskFormatter(
+        config.BOT_TOKEN,
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     logging.root.addFilter(_mask)
     for _h in logging.root.handlers:
         _h.addFilter(_mask)
+        _h.setFormatter(_fmt)
     # httpx (используется python-telegram-bot) логирует URL с токеном —
     # добавляем фильтр напрямую на его логгер и все дочерние
     for _name in ("httpx", "httpcore", "telegram"):
         _lg = logging.getLogger(_name)
         _lg.addFilter(_mask)
+        for _h2 in _lg.handlers:
+            _h2.addFilter(_mask)
+            _h2.setFormatter(_fmt)
 
     db.init_db()
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
