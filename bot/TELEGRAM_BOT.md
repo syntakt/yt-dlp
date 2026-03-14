@@ -95,7 +95,6 @@ cd bot
 | `/deny <id>` | Remove/deny a user |
 | `/ban <id>` | Ban a user |
 | `/unban <id>` | Unban a user |
-| `/addadmin <id>` | Promote user to admin |
 | `/stats` | Global download statistics |
 
 ---

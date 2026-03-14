@@ -73,6 +73,7 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS sessions (
                 chat_id         INTEGER NOT NULL,
                 message_id      INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL DEFAULT 0,
                 url             TEXT NOT NULL,
                 video_info_json TEXT NOT NULL,
                 created_at      TEXT,
@@ -81,6 +82,10 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
         """)
+        # Миграция: добавляем user_id в sessions если его нет (существующие БД)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+        if "user_id" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
     logger.info("Database initialized at %s", DB_PATH)
 
 
@@ -259,20 +264,26 @@ def get_user_history(user_id: int, limit: int = 10) -> list:
 
 # ── Sessions (persistent quality-selection state) ──────────────────────────────
 
-def save_session(chat_id: int, message_id: int, url: str, video_info_json: str) -> None:
+def save_session(chat_id: int, message_id: int, url: str, video_info_json: str, user_id: int = 0) -> None:
     with get_connection() as conn:
         conn.execute("""
-            INSERT OR REPLACE INTO sessions (chat_id, message_id, url, video_info_json, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (chat_id, message_id, url, video_info_json, datetime.now(timezone.utc).isoformat()))
+            INSERT OR REPLACE INTO sessions (chat_id, message_id, user_id, url, video_info_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (chat_id, message_id, user_id, url, video_info_json, datetime.now(timezone.utc).isoformat()))
 
 
-def get_session(chat_id: int, message_id: int) -> Optional[dict]:
+def get_session(chat_id: int, message_id: int, user_id: int = 0) -> Optional[dict]:
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id)
-        ).fetchone()
+        if user_id:
+            row = conn.execute(
+                "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=? AND user_id=?",
+                (chat_id, message_id, user_id)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id)
+            ).fetchone()
         return dict(row) if row else None
 
 

@@ -134,7 +134,7 @@ KEY_QUALITY_MSG   = "quality_menu_msg_id"  # message_id меню выбора к
 
 
 
-def _restore_session(ctx, chat_id: int, message_id: int):
+def _restore_session(ctx, chat_id: int, message_id: int, user_id: int = 0):
     """Restore VideoInfo and URL from DB session (by message_id), fallback to user_data.
 
     DB session is authoritative: each quality menu is saved with its own
@@ -143,8 +143,8 @@ def _restore_session(ctx, chat_id: int, message_id: int):
 
     Returns (info, url) or (None, None).
     """
-    # DB first — keyed by message_id, correct even with multiple videos
-    session = db.get_session(chat_id, message_id)
+    # DB first — keyed by message_id + user_id, correct even with multiple videos
+    session = db.get_session(chat_id, message_id, user_id=user_id)
     if session:
         try:
             info = _deserialize_video_info(session["video_info_json"])
@@ -194,7 +194,7 @@ def require_auth(func):
         user = update.effective_user
         try:
             db.upsert_user(user.id, user.username, user.full_name)
-            if db.is_admin(user.id):
+            if db.is_super_admin(user.id):
                 return await func(update, ctx)
             if not db.is_authorized(user.id):
                 row = db.get_user(user.id)
@@ -217,35 +217,16 @@ def require_auth(func):
 
 
 def require_admin(func):
-    """Отклоняет не-администраторов."""
-    @wraps(func)
-    async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        try:
-            if not db.is_admin(user.id):
-                await update.effective_message.reply_text("🚫 Требуется доступ администратора.")
-                return
-        except sqlite3.Error as e:
-            logger.error("DB error in require_admin: %s", e)
-            await update.effective_message.reply_text("⚠️ Временная ошибка. Попробуйте позже.")
-            return
-        return await func(update, ctx)
-    return wrapper
-
-
-def require_super_admin(func):
-    """Отклоняет не-суперадминов (только ADMIN_IDS из .env)."""
+    """Отклоняет не-администраторов (только ADMIN_IDS из .env)."""
     @wraps(func)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         try:
             if not db.is_super_admin(user.id):
-                await update.effective_message.reply_text(
-                    "🚫 Эта команда доступна только суперадминистраторам (ADMIN_IDS)."
-                )
+                await update.effective_message.reply_text("🚫 Требуется доступ администратора.")
                 return
         except sqlite3.Error as e:
-            logger.error("DB error in require_super_admin: %s", e)
+            logger.error("DB error in require_admin: %s", e)
             await update.effective_message.reply_text("⚠️ Временная ошибка. Попробуйте позже.")
             return
         return await func(update, ctx)
@@ -364,7 +345,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.upsert_user(user.id, user.username, user.full_name)
 
-    if db.is_admin(user.id) or db.is_authorized(user.id):
+    if db.is_super_admin(user.id) or db.is_authorized(user.id):
         # Удаляем предыдущее сообщение главного меню, чтобы не накапливались
         prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
         if prev_msg_id:
@@ -391,7 +372,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 def _build_help_text(user_id: int, verbose: bool = True) -> str:
     """Build help text. verbose=True for full /help version."""
-    is_adm = db.is_admin(user_id)
+    is_adm = db.is_super_admin(user_id)
     text = (
         "📖 <b>Справка по боту</b>\n\n"
         "<b>Как использовать:</b>\n"
@@ -423,8 +404,6 @@ def _build_help_text(user_id: int, verbose: bool = True) -> str:
             "/unban &lt;id&gt; — разблокировать\n"
             "/stats — глобальная статистика\n"
         )
-        if db.is_super_admin(user_id):
-            text += "/addadmin &lt;id&gt; — назначить администратором (👑 super)\n"
     return text
 
 
@@ -566,8 +545,6 @@ def _build_status_text(user_id: int, verbose: bool = True) -> str:
                 # Роль
                 if uid in config.ADMIN_IDS:
                     role = "👑"
-                elif u["is_admin"]:
-                    role = "🛡"
                 elif u["is_banned"]:
                     role = "🚫"
                 elif not u["is_approved"]:
@@ -670,7 +647,7 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
         except TelegramError:
             pass
-    is_adm = db.is_admin(update.effective_user.id)
+    is_adm = db.is_super_admin(update.effective_user.id)
     user_buttons = [
         [
             InlineKeyboardButton("📜 История", callback_data="menu:history"),
@@ -781,7 +758,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         msg = await update.effective_chat.send_message("🔍 Получаю информацию о видео…")
-        await _fetch_and_show_menu(url, msg, ctx)
+        await _fetch_and_show_menu(url, msg, ctx, user_id=update.effective_user.id)
         return
 
     # Несколько ссылок — отправляем все статусы сразу, затем получаем инфо параллельно.
@@ -794,8 +771,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔍 [{i}/{len(batch)}] Получаю информацию о видео…"
         )
         msgs.append(msg)
+    _uid = update.effective_user.id
     await asyncio.gather(*(
-        _fetch_and_show_menu(url, msg, ctx)
+        _fetch_and_show_menu(url, msg, ctx, user_id=_uid)
         for url, msg in zip(batch, msgs)
     ))
 
@@ -810,7 +788,7 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
 
     # Проверяем авторизацию (inline не проходит через require_auth)
-    if not (db.is_admin(user.id) or db.is_authorized(user.id)):
+    if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
         await query.answer(
             results=[],
             switch_pm_text="🔐 Требуется доступ — нажмите для регистрации",
@@ -852,7 +830,7 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     await query.answer(results, cache_time=10)
 
 
-async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT_TYPE):
+async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, user_id: int = 0):
     """Получает информацию о видео и показывает меню выбора качества."""
     try:
         info: VideoInfo = await get_video_info(url)
@@ -876,7 +854,7 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
         await _show_playlist_menu(msg, info, ctx)
         # Сохраняем сессию плейлиста в БД (для корректной работы при нескольких URL)
         try:
-            db.save_session(msg.chat_id, msg.message_id, url, _serialize_video_info(info))
+            db.save_session(msg.chat_id, msg.message_id, url, _serialize_video_info(info), user_id=user_id)
         except Exception as e:
             logger.warning("save_session (playlist) failed: %s", e)
     else:
@@ -885,7 +863,7 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
             # Запоминаем message_id меню выбора качества — удалим при следующей ссылке.
             ctx.user_data[KEY_QUALITY_MSG] = sent.message_id
             try:
-                db.save_session(sent.chat_id, sent.message_id, url, _serialize_video_info(info))
+                db.save_session(sent.chat_id, sent.message_id, url, _serialize_video_info(info), user_id=user_id)
             except Exception as e:
                 logger.warning("save_session failed: %s", e)
 
@@ -1019,7 +997,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # ── Авторизация: все остальные callback требуют одобренного аккаунта ─────────
     try:
-        user_is_auth = db.is_authorized(user.id) or db.is_admin(user.id)
+        user_is_auth = db.is_authorized(user.id) or db.is_super_admin(user.id)
     except sqlite3.Error as e:
         logger.error("DB error in handle_callback auth check: %s", e)
         await query.answer("⚠️ Временная ошибка. Попробуйте позже.", show_alert=True)
@@ -1095,7 +1073,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "info":
-        info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
+        info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=user.id)
         if not info:
             await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
             return
@@ -1198,7 +1176,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         ctx.user_data[KEY_MAIN_MENU_MSG] = query.message.message_id
 
     elif action == "pending":
-        if not db.is_admin(user.id):
+        if not db.is_super_admin(user.id):
             await query.answer("🚫 Только для администраторов.", show_alert=True)
             return
         rows = db.get_pending_users()
@@ -1216,7 +1194,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         )
 
     elif action == "users":
-        if not db.is_admin(user.id):
+        if not db.is_super_admin(user.id):
             await query.answer("🚫 Только для администраторов.", show_alert=True)
             return
         rows = db.list_users(approved=True)
@@ -1226,7 +1204,7 @@ async def _handle_menu_callback(query, ctx, data: str):
             lines = [f"👥 <b>Пользователи ({len(rows)}):</b>\n"]
             for r in rows[:20]:  # ограничиваем 20
                 uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
-                admin_tag = " 👑" if r['is_admin'] else ""
+                admin_tag = " 👑" if r['user_id'] in config.ADMIN_IDS else ""
                 lines.append(f"• {uname} <code>{r['user_id']}</code>{admin_tag}")
             text = "\n".join(lines)
         await query.edit_message_text(
@@ -1235,7 +1213,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         )
 
     elif action == "stats":
-        if not db.is_admin(user.id):
+        if not db.is_super_admin(user.id):
             await query.answer("🚫 Только для администраторов.", show_alert=True)
             return
         stats = db.get_global_stats()
@@ -1271,7 +1249,7 @@ async def _handle_resolve_callback(query, ctx, data: str):
         return
 
     await query.edit_message_text("🔍 Получаю информацию о видео…")
-    await _fetch_and_show_menu(url, query.message, ctx)
+    await _fetch_and_show_menu(url, query.message, ctx, user_id=query.from_user.id)
 
 
 async def _show_info(query, info: VideoInfo, url: str = ""):
@@ -1294,14 +1272,14 @@ async def _show_info(query, info: VideoInfo, url: str = ""):
     # Сбрасываем таймер 2-часовой очистки при активном использовании
     if url:
         try:
-            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info))
+            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
         except Exception:
             pass
 
 
 async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     """Возврат к меню выбора качества из экрана 'Подробнее'."""
-    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=query.from_user.id)
     if not info:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
@@ -1316,14 +1294,14 @@ async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     # Сбрасываем таймер 2-часовой очистки при активном использовании
     if url:
         try:
-            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info))
+            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
         except Exception:
             pass
 
 
 async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     """Повторно запрашивает форматы видео и обновляет меню выбора качества."""
-    old_info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
+    old_info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=query.from_user.id)
     if not url:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
@@ -1370,7 +1348,7 @@ async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Обновляем сессию в БД
     try:
-        db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info))
+        db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
     except Exception:
         pass
 
@@ -1384,8 +1362,8 @@ async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _handle_admin_approval(query, ctx, data: str):
-    if not db.is_admin(query.from_user.id):
-        await query.answer("Нет прав.", show_alert=True)
+    if not db.is_super_admin(query.from_user.id):
+        await query.answer("🚫 Только администраторы (ADMIN_IDS) могут одобрять/отклонять.", show_alert=True)
         return
 
     action, uid_str = data.split(":", 1)
@@ -1393,6 +1371,11 @@ async def _handle_admin_approval(query, ctx, data: str):
         target_id = int(uid_str)
     except ValueError:
         await query.answer("Некорректный ID пользователя.", show_alert=True)
+        return
+
+    # Защита суперадминов от deny через inline-кнопку
+    if action == "deny" and target_id in config.ADMIN_IDS:
+        await query.answer("🚫 Нельзя отклонить суперадминистратора.", show_alert=True)
         return
 
     if action == "approve":
@@ -1450,11 +1433,22 @@ def _estimate_download_size(fmt_obj: Optional[FormatInfo], duration: int, audio_
     return int((base + audio_overhead) * 1.1)
 
 
+_VALID_DL_TYPES = {"v", "a", "ao", "aw", "s"}
+
+
 async def _handle_download_callback(query, ctx, data: str):
     # data: dl:<type>:<format_id>   type: v=video, a=audio, s=subtitle
     parts = data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("❌ Некорректный запрос.", show_alert=True)
+        return
     dl_type = parts[1]
     format_id = parts[2]
+
+    if dl_type not in _VALID_DL_TYPES:
+        logger.warning("Invalid dl_type %r from user %s", dl_type, query.from_user.id)
+        await query.answer("❌ Некорректный тип загрузки.", show_alert=True)
+        return
 
     sem: asyncio.Semaphore = ctx.bot_data.get("_download_sem")
     if sem is None:
@@ -1462,7 +1456,8 @@ async def _handle_download_callback(query, ctx, data: str):
         ctx.bot_data["_download_sem"] = sem
 
     # Restore session: DB first (correct for multi-URL), fallback to user_data.
-    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
+    user = query.from_user
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=user.id)
     if not info or not url:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
@@ -1475,7 +1470,6 @@ async def _handle_download_callback(query, ctx, data: str):
     # сбрасываем ключ, чтобы следующий URL не пытался удалить уже изменившееся сообщение.
     ctx.user_data.pop(KEY_QUALITY_MSG, None)
 
-    user = query.from_user
     dl_id = db.add_download(user.id, url)
     ctx.user_data[KEY_DOWNLOAD_ID] = dl_id
 
@@ -1629,7 +1623,7 @@ async def _handle_download_callback(query, ctx, data: str):
 
     # Перепривязываем сессию к текущему сообщению (если меню было фото и удалено)
     try:
-        db.save_session(status_msg.chat_id, status_msg.message_id, url, _serialize_video_info(info))
+        db.save_session(status_msg.chat_id, status_msg.message_id, url, _serialize_video_info(info), user_id=user.id)
         if _session_msg_id != status_msg.message_id:
             db.delete_session(_session_chat_id, _session_msg_id)
     except Exception as e:
@@ -1719,7 +1713,7 @@ async def _handle_download_callback(query, ctx, data: str):
                 db.update_download(dl_id, status="done", file_size=result.file_size)
 
                 # Re-auth: проверяем, не забанили ли пользователя во время загрузки
-                if not (db.is_admin(user.id) or db.is_authorized(user.id)):
+                if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
                     logger.info("User %s was banned/revoked during download %d — file not delivered", user.id, dl_id)
                     try:
                         await status_msg.edit_text("🚫 Ваш доступ был отозван. Файл не будет доставлен.")
@@ -1813,6 +1807,7 @@ async def _handle_download_callback(query, ctx, data: str):
                         db.save_session(
                             status_msg.chat_id, status_msg.message_id,
                             url, _serialize_video_info(info),
+                            user_id=user.id,
                         )
                     except Exception:
                         pass
@@ -1878,6 +1873,14 @@ async def _handle_deliver_callback(query, ctx, data: str):
         await query.answer("❌ Некорректный запрос.", show_alert=True)
         return
     action = parts[2]  # "tg", "link", "direct" или "relay"
+    if action not in ("tg", "link", "direct", "relay"):
+        await query.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+
+    # Re-auth: проверяем, не забанили ли пользователя
+    if not (db.is_super_admin(query.from_user.id) or db.is_authorized(query.from_user.id)):
+        await query.answer("🚫 Ваш доступ был отозван.", show_alert=True)
+        return
 
     deliveries = ctx.user_data.get("_deliveries", {})
     pd = deliveries.get(cb_dl_id)
@@ -1949,6 +1952,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
                 db.save_session(
                     query.message.chat_id, query.message.message_id,
                     url, _serialize_video_info(info),
+                    user_id=query.from_user.id,
                 )
             except Exception:
                 pass
@@ -2015,6 +2019,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
                 db.save_session(
                     query.message.chat_id, query.message.message_id,
                     url, _serialize_video_info(info),
+                    user_id=query.from_user.id,
                 )
             except Exception:
                 pass
@@ -2033,12 +2038,11 @@ async def _handle_playlist_callback(query, ctx, data: str):
     max_items = max(1, min(max_items, config.MAX_PLAYLIST_ITEMS))
     audio_only = quality == "audio"
 
-    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
+    user = query.from_user
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=user.id)
     if not info or not url:
         await query.edit_message_text("❌ Сессия истекла.")
         return
-
-    user = query.from_user
     dl_id = db.add_download(user.id, url)
 
     await query.edit_message_text(
@@ -2058,7 +2062,7 @@ async def _handle_playlist_callback(query, ctx, data: str):
         )
 
         # Re-auth: проверяем, не забанили ли пользователя во время загрузки плейлиста
-        if not (db.is_admin(user.id) or db.is_authorized(user.id)):
+        if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
             logger.info("User %s was banned/revoked during playlist download %d", user.id, dl_id)
             await ctx.bot.send_message(
                 query.message.chat_id,
@@ -2286,12 +2290,7 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines = [f"👥 <b>Одобренные пользователи ({len(rows)}):</b>\n"]
     for r in rows:
         uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
-        if r['user_id'] in config.ADMIN_IDS:
-            admin_tag = " 👑 super"
-        elif r['is_admin']:
-            admin_tag = " 🛡 admin"
-        else:
-            admin_tag = ""
+        admin_tag = " 👑" if r['user_id'] in config.ADMIN_IDS else ""
         lines.append(f"• {uname} <code>{r['user_id']}</code>{admin_tag}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -2317,11 +2316,6 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _admin_user_action(update, ctx, "unban")
 
 
-@require_super_admin
-async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _admin_user_action(update, ctx, "addadmin")
-
-
 async def _admin_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str):
     args = ctx.args
     if not args:
@@ -2332,6 +2326,11 @@ async def _admin_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, act
         target_id = int(args[0])
     except ValueError:
         await update.message.reply_text("Некорректный user ID.")
+        return
+
+    # Защита суперадминов: нельзя банить/отклонять/разбанивать суперадмина
+    if action in ("ban", "deny", "unban") and target_id in config.ADMIN_IDS:
+        await update.message.reply_text("🚫 Нельзя выполнить это действие над суперадминистратором.")
         return
 
     if action == "approve":
@@ -2351,9 +2350,6 @@ async def _admin_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, act
     elif action == "unban":
         ok = db.unban_user(target_id)
         msg = f"✅ Пользователь {target_id} разблокирован." if ok else "Пользователь не найден."
-    elif action == "addadmin":
-        ok = db.set_admin(target_id, True)
-        msg = f"👑 Пользователь {target_id} назначен администратором." if ok else "Пользователь не найден."
     else:
         msg = "Неизвестное действие."
 
@@ -2696,7 +2692,6 @@ def main():
     app.add_handler(CommandHandler("deny", cmd_deny))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("stats", cmd_stats))
 
     # URL-сообщения
