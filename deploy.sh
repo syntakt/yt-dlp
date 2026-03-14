@@ -19,7 +19,16 @@ cd "$(dirname "$0")"
 export GIT_COMMIT
 GIT_COMMIT=$(git rev-parse --short=7 HEAD 2>/dev/null || echo "dev")
 
-COMPOSE="docker compose --profile ssl"
+# Подключаем ssl profile если COMPOSE_PROFILES=ssl задан в .env или окружении
+if [ -f .env ]; then
+    # shellcheck disable=SC1091
+    . ./.env 2>/dev/null || true
+fi
+PROFILES=""
+case "${COMPOSE_PROFILES:-}" in
+    *ssl*) PROFILES="--profile ssl" ;;
+esac
+COMPOSE="docker compose $PROFILES"
 
 case "${1:-all}" in
     build)

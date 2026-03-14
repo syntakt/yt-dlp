@@ -15,6 +15,7 @@ import time
 import traceback
 from dataclasses import asdict
 from datetime import datetime
+import html as _html
 from functools import wraps
 from pathlib import Path
 from typing import Optional
@@ -77,7 +78,8 @@ class _TokenMaskFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if not self._token:
             return True
-        record.msg = str(record.msg).replace(self._token, "<TOKEN>")
+        if isinstance(record.msg, str):
+            record.msg = record.msg.replace(self._token, "<TOKEN>")
         if record.args:
             args = record.args if isinstance(record.args, tuple) else (record.args,)
             record.args = tuple(
@@ -93,6 +95,29 @@ KEY_PENDING_URL = "pending_url"
 KEY_ORIG_URL    = "original_url"   # сохраняем оригинальный URL (с list=) для плейлиста
 KEY_MAIN_MENU_MSG = "main_menu_msg_id"  # message_id последнего сообщения главного меню
 KEY_QUALITY_MSG   = "quality_menu_msg_id"  # message_id меню выбора качества (для удаления при новой ссылке)
+
+
+
+def _restore_session(ctx, chat_id: int, message_id: int):
+    """Restore VideoInfo and URL from user_data or DB session.
+
+    Returns (info, url) or (None, None).
+    """
+    info = ctx.user_data.get(KEY_VIDEO_INFO)
+    url = ctx.user_data.get(KEY_PENDING_URL)
+    if info and url:
+        return info, url
+    session = db.get_session(chat_id, message_id)
+    if session:
+        try:
+            info = _deserialize_video_info(session["video_info_json"])
+            url = session["url"]
+            ctx.user_data[KEY_VIDEO_INFO] = info
+            ctx.user_data[KEY_PENDING_URL] = url
+            return info, url
+        except Exception as e:
+            logger.warning("restore_session failed: %s", e)
+    return None, None
 
 
 # ── Session serialization (persist quality-menu state across restarts) ───────────
@@ -325,8 +350,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    is_adm = db.is_admin(update.effective_user.id)
+def _build_help_text(user_id: int, verbose: bool = True) -> str:
+    """Build help text. verbose=True for full /help version."""
+    is_adm = db.is_admin(user_id)
     text = (
         "📖 <b>Справка по боту</b>\n\n"
         "<b>Как использовать:</b>\n"
@@ -336,8 +362,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + SUPPORTED_SITES_TEXT +
         "\n\n⚠️ <b>Ограничения:</b>\n"
         f"• Максимальный размер файла: {config.MAX_FILE_SIZE_MB} МБ\n"
-        f"• Таймаут загрузки: {config.DOWNLOAD_TIMEOUT // 60} мин\n\n"
-        "<b>Команды:</b>\n"
+    )
+    if verbose:
+        text += f"• Таймаут загрузки: {config.DOWNLOAD_TIMEOUT // 60} мин\n"
+    text += (
+        "\n<b>Команды:</b>\n"
         "/start — главное меню\n"
         "/help — эта справка\n"
         "/history — последние 10 загрузок\n"
@@ -355,8 +384,13 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/unban &lt;id&gt; — разблокировать\n"
             "/stats — глобальная статистика\n"
         )
-        if db.is_super_admin(update.effective_user.id):
+        if db.is_super_admin(user_id):
             text += "/addadmin &lt;id&gt; — назначить администратором (👑 super)\n"
+    return text
+
+
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = _build_help_text(update.effective_user.id, verbose=True)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
 
 
@@ -384,29 +418,38 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
-async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+def _build_status_text(user_id: int, verbose: bool = True) -> str:
+    """Build status text. verbose=True for full /status version."""
     stats = db.get_global_stats()
-    user_stats = db.get_user_stats(update.effective_user.id)
     disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
     disk_pct = disk.used / disk.total * 100
     disk_warn = " ⚠️" if disk_pct >= config.DISK_ALERT_THRESHOLD else ""
-    text = (
-        "📊 <b>Статус бота</b>\n\n"
-        f"📥 Ваших загрузок: <b>{user_stats['downloads']}</b>\n"
-        f"💾 Вы скачали: <b>{_human_size(user_stats['total_bytes'])}</b>\n\n"
-        f"👥 Всего пользователей: {stats['total_users']}\n"
-        f"📦 Всего загрузок: {stats['total_downloads']}\n"
-        f"⏳ Ожидают одобрения: {stats['pending_requests']}\n\n"
+    text = "📊 <b>Статус бота</b>\n\n"
+    if verbose:
+        user_stats = db.get_user_stats(user_id)
+        text += (
+            f"📥 Ваших загрузок: <b>{user_stats['downloads']}</b>\n"
+            f"💾 Вы скачали: <b>{_human_size(user_stats['total_bytes'])}</b>\n\n"
+        )
+    text += (
+        f"👥 Пользователей: {stats['total_users']}\n"
+        f"📥 Всего загрузок: {stats['total_downloads']}\n"
+        f"💾 Отправлено: {_human_size(stats['total_size_bytes'])}\n"
+        f"⏳ Ожидают: {stats['pending_requests']}\n\n"
         f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
     )
-    # Для администраторов — показываем кто именно ожидает
-    if db.is_admin(update.effective_user.id) and stats['pending_requests']:
+    if verbose and db.is_admin(user_id) and stats['pending_requests']:
         pending = db.get_pending_users()
         lines = ["\n⏳ <b>Ожидают одобрения:</b>"]
         for r in pending:
             uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
             lines.append(f"• {uname} — <code>{r['user_id']}</code>")
         text += "\n".join(lines)
+    return text
+
+
+async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = _build_status_text(update.effective_user.id, verbose=True)
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
@@ -415,7 +458,11 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cancel_flag = ctx.user_data.get("cancel_flag")
     if cancel_flag is not None:
         cancel_flag[0] = True
+    # Preserve main_menu_msg_id for correct UX
+    main_menu_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
     ctx.user_data.clear()
+    if main_menu_id is not None:
+        ctx.user_data[KEY_MAIN_MENU_MSG] = main_menu_id
     await update.message.reply_text("🛑 Отменено. Отправьте новую ссылку когда будете готовы.")
 
 
@@ -452,8 +499,9 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Обработчик URL ───────────────────────────────────────────────────────────────
 
 def _extract_urls(text: str) -> list[str]:
-    """Извлекает все http(s)-ссылки из текста."""
-    return re.findall(r'https?://[^\s<>"\']+', text)
+    """Извлекает все http(s)-ссылки из текста (до 2048 символов каждый)."""
+    urls = re.findall(r'https?://[^\s<>"\']+', text)
+    return [u[:2048] for u in urls]
 
 
 def _strip_playlist_param(url: str) -> str:
@@ -801,7 +849,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
             except TelegramError:
                 pass
-            await query.answer("Останавливаем загрузку…", show_alert=False)
+            # query.answer() already called in handle_callback
             return
         # Пользователь явно закрывает меню — удаляем сессию из БД
         try:
@@ -882,21 +930,7 @@ async def _handle_menu_callback(query, ctx, data: str):
     user = query.from_user
 
     if action == "help":
-        is_adm = db.is_admin(user.id)
-        text = (
-            "📖 <b>Справка по боту</b>\n\n"
-            "<b>Как использовать:</b>\n"
-            "1. Отправьте ссылку на видео\n"
-            "2. Выберите качество или аудио\n"
-            "3. Дождитесь файла\n\n"
-            + SUPPORTED_SITES_TEXT +
-            "\n\n⚠️ <b>Ограничения:</b>\n"
-            f"• Максимальный размер: {config.MAX_FILE_SIZE_MB} МБ\n\n"
-            "<b>Команды:</b>\n"
-            "/history, /status, /cancel"
-        )
-        if is_adm:
-            text += "\n/pending, /users, /approve, /deny, /ban, /unban, /addadmin, /stats"
+        text = _build_help_text(user.id, verbose=False)
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
@@ -929,16 +963,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         )
 
     elif action == "status":
-        stats = db.get_global_stats()
-        disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
-        text = (
-            "📊 <b>Статус бота</b>\n\n"
-            f"👥 Пользователей: {stats['total_users']}\n"
-            f"📥 Всего загрузок: {stats['total_downloads']}\n"
-            f"💾 Отправлено: {_human_size(stats['total_size_bytes'])}\n"
-            f"⏳ Ожидают: {stats['pending_requests']}\n\n"
-            f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)}"
-        )
+        text = _build_status_text(user.id, verbose=False)
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
@@ -966,7 +991,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         else:
             lines = ["⏳ <b>Ожидают одобрения:</b>\n"]
             for r in rows:
-                uname = f"@{r['username']}" if r['username'] else _esc(r['full_name'])  # LOW-4
+                uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
                 lines.append(f"• {uname} <code>{r['user_id']}</code>")
             text = "\n".join(lines) + "\n\nИспользуйте /pending для одобрения."
         await query.edit_message_text(
@@ -984,7 +1009,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         else:
             lines = [f"👥 <b>Пользователи ({len(rows)}):</b>\n"]
             for r in rows[:20]:  # ограничиваем 20
-                uname = f"@{r['username']}" if r['username'] else r['full_name']
+                uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
                 admin_tag = " 👑" if r['is_admin'] else ""
                 lines.append(f"• {uname} <code>{r['user_id']}</code>{admin_tag}")
             text = "\n".join(lines)
@@ -1060,16 +1085,7 @@ async def _show_info(query, info: VideoInfo, url: str = ""):
 
 async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     """Возврат к меню выбора качества из экрана 'Подробнее'."""
-    info: VideoInfo = ctx.user_data.get(KEY_VIDEO_INFO)
-    if not info:
-        session = db.get_session(query.message.chat_id, query.message.message_id)
-        if session:
-            try:
-                info = _deserialize_video_info(session["video_info_json"])
-                ctx.user_data[KEY_VIDEO_INFO] = info
-                ctx.user_data[KEY_PENDING_URL] = session["url"]
-            except Exception as e:
-                logger.warning("restore_session (back) failed: %s", e)
+    info, _ = _restore_session(ctx, query.message.chat_id, query.message.message_id)
     if not info:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
@@ -1092,17 +1108,7 @@ async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     """Повторно запрашивает форматы видео и обновляет меню выбора качества."""
-    # Восстанавливаем URL из user_data или сессии в БД
-    url = ctx.user_data.get(KEY_PENDING_URL)
-    if not url:
-        session = db.get_session(query.message.chat_id, query.message.message_id)
-        if session:
-            url = session["url"]
-            try:
-                old_info = _deserialize_video_info(session["video_info_json"])
-                ctx.user_data[KEY_VIDEO_INFO] = old_info
-            except Exception:
-                pass
+    _, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
     if not url:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
@@ -1226,9 +1232,12 @@ def _estimate_download_size(fmt_obj: Optional[FormatInfo], duration: int, audio_
     else:
         return None
 
-    # Прибавляем примерный размер аудио-дорожки (128 kbps * duration)
-    audio_overhead = int(128 * 1000 / 8 * duration) if duration else 0
-    # Добавляем 10% запас на контейнер и метаданные
+    # Add audio overhead only for video-only formats (no built-in audio)
+    has_audio = fmt_obj.acodec not in ("none", "", None)
+    audio_overhead = 0
+    if not has_audio and duration:
+        audio_overhead = int(128 * 1000 / 8 * duration)
+    # 10% overhead for container and metadata
     return int((base + audio_overhead) * 1.1)
 
 
@@ -1239,29 +1248,15 @@ async def _handle_download_callback(query, ctx, data: str):
     format_id = parts[2]
 
     sem: asyncio.Semaphore = ctx.bot_data.get("_download_sem")
+    if sem is None:
+        sem = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
+        ctx.bot_data["_download_sem"] = sem
 
-    # Сначала ищем сессию в БД по message_id — это корректно при групповой загрузке,
-    # когда каждое видео имеет своё сообщение-меню. ctx.user_data содержит данные
-    # только последнего видео и ведёт к ошибке при выборе качества для предыдущих.
-    info: VideoInfo = None
-    url: str = None
-    session = db.get_session(query.message.chat_id, query.message.message_id)
-    if session:
-        try:
-            info = _deserialize_video_info(session["video_info_json"])
-            url = session["url"]
-        except Exception as e:
-            logger.warning("restore_session failed: %s", e)
-    # Фолбэк на user_data (одиночная ссылка или отсутствие сессии в БД)
-    if not info or not url:
-        info = ctx.user_data.get(KEY_VIDEO_INFO)
-        url = ctx.user_data.get(KEY_PENDING_URL)
+    # Restore session: DB first (correct for multi-URL), fallback to user_data.
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
     if not info or not url:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
-    # Обновляем user_data для совместимости с остальным кодом
-    ctx.user_data[KEY_VIDEO_INFO] = info
-    ctx.user_data[KEY_PENDING_URL] = url
 
     # Сохраняем до возможного удаления сообщения (при фото-меню)
     _session_chat_id = query.message.chat_id
@@ -1290,6 +1285,11 @@ async def _handle_download_callback(query, ctx, data: str):
     audio_format = "opus" if dl_type == "ao" else "wav" if dl_type == "aw" else "mp3"
     subtitle_lang = format_id if dl_type == "s" else None
     if dl_type == "s":
+        # SEC: validate subtitle_lang (callback_data is user-controllable)
+        if not subtitle_lang or not re.match(r'^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)?$', subtitle_lang):
+            logger.warning("Invalid subtitle_lang %r from user %s", subtitle_lang, query.from_user.id)
+            await query.answer("\u274c \u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 \u044f\u0437\u044b\u043a \u0441\u0443\u0431\u0442\u0438\u0442\u0440\u043e\u0432.", show_alert=True)
+            return
         format_id = "best"
 
     if dl_type == "a":
@@ -1435,8 +1435,7 @@ async def _handle_download_callback(query, ctx, data: str):
         await query.answer("❌ Внутренняя ошибка.", show_alert=True)
         return
     # Если все слоты заняты — уведомляем пользователя и ждём в очереди.
-    _sem = sem or asyncio.Semaphore(1)
-    _need_queue = sem is not None and getattr(sem, '_value', 1) == 0
+    _need_queue = sem.locked()
     if _need_queue:
         try:
             await status_msg.edit_text(
@@ -1449,7 +1448,7 @@ async def _handle_download_callback(query, ctx, data: str):
             pass
 
     try:
-        async with _sem:
+        async with sem:
             # Если ждали в очереди — восстанавливаем статус "загружаю"
             if _need_queue:
                 try:
@@ -1645,7 +1644,7 @@ async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str,
             await bot.send_message(
                 chat_id,
                 f"⏰ <b>Ссылка истекает через 10 минут:</b>\n"
-                f"<a href='{info_url}'>{_esc(title[:60])}</a>\n\n"
+                f"<a href='{_esc(info_url)}'>{_esc(title[:60])}</a>\n\n"
                 "Успейте скачать!",
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
@@ -1702,14 +1701,15 @@ async def _handle_deliver_callback(query, ctx, data: str):
         # Планируем уведомление за 10 мин до истечения TTL
         notify_delay = config.FILE_TTL_SECONDS - 600
         if notify_delay > 60:
-            asyncio.create_task(_notify_link_expiry(
-                ctx.bot, query.message.chat_id, title, info_url, token, notify_delay
-            ))
+            asyncio.create_task(
+                _notify_link_expiry(ctx.bot, query.message.chat_id, title, info_url, token, notify_delay),
+                name=f"link_expiry_{query.message.chat_id}",
+            )
 
         try:
             await query.edit_message_text(
                 f"🔗 <b>Ссылка для скачивания ({via_label}):</b>\n"
-                f"<a href='{info_url}'>{info_url}</a>\n\n"
+                f"<a href='{_esc(info_url)}'>{_esc(info_url)}</a>\n\n"
                 f"📦 {_human_size(file_size)}\n"
                 f"⏱ Действует <b>{ttl_h} ч</b> (удаляется после первого скачивания)\n\n"
                 + _caption,
@@ -1805,6 +1805,8 @@ async def _handle_playlist_callback(query, ctx, data: str):
     except (IndexError, ValueError):
         await query.answer("❌ Некорректный запрос.", show_alert=True)
         return
+    # SEC: callback_data is user-controllable, clamp max_items
+    max_items = max(1, min(max_items, config.MAX_PLAYLIST_ITEMS))
     audio_only = quality == "audio"
 
     info: VideoInfo = ctx.user_data.get(KEY_VIDEO_INFO)
@@ -2014,13 +2016,13 @@ async def _deliver_file_with_progress(
 
 @require_admin
 async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = db.pending_users()
+    rows = db.get_pending_users()
     if not rows:
         await update.message.reply_text("✅ Заявок на доступ нет.")
         return
 
     for row in rows:
-        uname = f"@{row['username']}" if row['username'] else "(нет username)"
+        uname = f"@{_esc(row['username'])}" if row['username'] else "(нет username)"
         text = (
             f"👤 <b>{_esc(row['full_name'])}</b> {uname}\n"
             f"🆔 <code>{row['user_id']}</code>\n"
@@ -2042,7 +2044,7 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"👥 <b>Одобренные пользователи ({len(rows)}):</b>\n"]
     for r in rows:
-        uname = f"@{r['username']}" if r['username'] else _esc(r['full_name'])  # LOW-4
+        uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
         if r['user_id'] in config.ADMIN_IDS:
             admin_tag = " 👑 super"
         elif r['is_admin']:
@@ -2188,18 +2190,20 @@ def _schedule_delete(bot, chat_id: int, message_id: int, delay: int = 0) -> None
         except TelegramError:
             pass  # уже удалено или нет прав
 
-    asyncio.create_task(_do_delete())
+    asyncio.create_task(_do_delete(), name=f"auto_delete_{chat_id}_{message_id}")
 
 
 def _human_size(n) -> str:
     if not n:
         return "0 Б"
-    n = int(n)
+    size = float(int(n))
     for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} ПБ"
+        if size < 1024:
+            if unit == "Б":
+                return f"{int(size)} Б"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} ПБ"
 
 
 def _fmt_num(n: int) -> str:

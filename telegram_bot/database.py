@@ -154,13 +154,6 @@ def list_users(approved: Optional[bool] = None, banned: bool = False) -> list:
         ).fetchall()
 
 
-def pending_users() -> list:
-    with get_connection() as conn:
-        return conn.execute(
-            "SELECT * FROM users WHERE is_approved = 0 AND is_banned = 0 ORDER BY created_at"
-        ).fetchall()
-
-
 def is_authorized(user_id: int) -> bool:
     with get_connection() as conn:
         row = conn.execute(
