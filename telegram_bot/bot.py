@@ -511,7 +511,7 @@ def _build_status_text(user_id: int, verbose: bool = True) -> str:
     disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
     disk_pct = disk.used / disk.total * 100
     disk_warn = " ⚠️" if disk_pct >= config.DISK_ALERT_THRESHOLD else ""
-    is_adm = db.is_admin(user_id)
+    is_super = db.is_super_admin(user_id)
     text = "📊 <b>Статус бота</b>\n\n"
     if verbose:
         user_stats = db.get_user_stats(user_id)
@@ -519,16 +519,21 @@ def _build_status_text(user_id: int, verbose: bool = True) -> str:
             f"📥 Ваших загрузок: <b>{user_stats['downloads']}</b>\n"
             f"💾 Вы скачали: <b>{_human_size(user_stats['total_bytes'])}</b>\n\n"
         )
-    text += (
-        f"👥 Пользователей: {stats['total_users']}\n"
-        f"📥 Всего загрузок: {stats['total_downloads']}\n"
-        f"💾 Отправлено: {_human_size(stats['total_size_bytes'])}\n"
-        f"⏳ Ожидают: {stats['pending_requests']}\n\n"
-        f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
-    )
+    if is_super:
+        # Полная статистика — только для суперадминов (ADMIN_IDS)
+        text += (
+            f"👥 Пользователей: {stats['total_users']}\n"
+            f"📥 Всего загрузок: {stats['total_downloads']}\n"
+            f"💾 Отправлено: {_human_size(stats['total_size_bytes'])}\n"
+            f"⏳ Ожидают: {stats['pending_requests']}\n\n"
+            f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
+        )
+    else:
+        # Обычные пользователи и обычные админы — только диск
+        text += f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
 
-    # Подробная информация для администраторов
-    if verbose and is_adm:
+    # Подробная информация — только для суперадминов (ADMIN_IDS)
+    if verbose and is_super:
         # Конфигурация
         text += "\n\n⚙️ <b>Конфигурация:</b>\n"
         text += f"• Режим регистрации: <code>{config.REGISTRATION_MODE}</code>\n"
