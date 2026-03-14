@@ -39,6 +39,7 @@ with your numeric ID (e.g. `123456789`).
 ### 3. Configure
 
 ```bash
+cd bot
 cp .env.example .env
 # Edit .env — at minimum set BOT_TOKEN and ADMIN_IDS
 nano .env
@@ -47,18 +48,20 @@ nano .env
 ### 4. Create data directories
 
 ```bash
-mkdir -p data/downloads data/db
+mkdir -p bot/data/downloads bot/data/db
 ```
 
 ### 5. Build & run
 
 ```bash
-docker compose up -d --build
+cd bot
+./deploy.sh
 ```
 
 Check logs:
 ```bash
-docker compose logs -f ytdlp-bot
+cd bot
+./deploy.sh logs bot
 ```
 
 ---
@@ -130,7 +133,7 @@ and place the file at `./cookies.txt`, then uncomment the volume line in
 
 ```bash
 git pull
-docker compose up -d --build
+cd bot && ./deploy.sh
 ```
 
 ---
@@ -158,14 +161,24 @@ will inform you that the file is too big. You can work around this by:
 ## Architecture
 
 ```
-telegram_bot/
-├── bot.py          — Telegram handlers, inline menus, admin commands
-├── downloader.py   — yt-dlp wrapper (async, format parsing, progress)
-├── database.py     — SQLite: users, download history, stats
-├── config.py       — Settings from environment variables
-└── requirements.txt
-
-Dockerfile          — Python 3.12 + ffmpeg + yt-dlp from source
-docker-compose.yml  — Service definition with volumes and resource limits
-.env.example        — Configuration template
+bot/                          — all bot infrastructure (separate from yt-dlp core)
+├── telegram_bot/
+│   ├── bot.py                — Telegram handlers, inline menus, admin commands
+│   ├── downloader.py         — yt-dlp wrapper (async, format parsing, progress)
+│   ├── database.py           — SQLite: users, download history, stats
+│   ├── fileserver.py         — HTTP file server with token-based access
+│   ├── config.py             — Settings from environment variables
+│   ├── entrypoint.sh         — Docker entrypoint (gosu privilege drop)
+│   └── requirements.txt
+├── nginx/
+│   ├── nginx.conf.template   — SSL reverse proxy config
+│   └── entrypoint.sh         — Certificate management
+├── Dockerfile                — Python 3.12 + ffmpeg + yt-dlp from source
+├── Dockerfile.cloudflared    — Cloudflare Tunnel container
+├── Dockerfile.nginx          — Nginx SSL container
+├── docker-compose.yml        — Service orchestration
+├── deploy.sh                 — Build & deploy script
+├── entrypoint.sh             — Quick Tunnel URL injection
+├── cf-entrypoint.sh          — Cloudflared entrypoint
+└── .env.example              — Configuration template
 ```

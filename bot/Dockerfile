@@ -23,11 +23,11 @@ COPY yt_dlp/ /build/yt_dlp/
 RUN pip install --no-cache-dir /build && rm -rf /build
 
 # ── Устанавливаем зависимости бота ─────────────────────────────────────────
-COPY telegram_bot/requirements.txt /app/requirements.txt
+COPY bot/telegram_bot/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
 
 # ── Копируем код бота ──────────────────────────────────────────────────────
-COPY telegram_bot/ /app/
+COPY bot/telegram_bot/ /app/
 
 # ── Версия: записываем git commit в файл ───────────────────────────────────
 # Передаётся автоматически через deploy.sh (рекомендуется).
