@@ -135,24 +135,28 @@ KEY_QUALITY_MSG   = "quality_menu_msg_id"  # message_id меню выбора к
 
 
 def _restore_session(ctx, chat_id: int, message_id: int):
-    """Restore VideoInfo and URL from user_data or DB session.
+    """Restore VideoInfo and URL from DB session (by message_id), fallback to user_data.
+
+    DB session is authoritative: each quality menu is saved with its own
+    (chat_id, message_id) key, so multiple videos don't interfere.
+    user_data is a fallback for single-URL flow or when DB write failed.
 
     Returns (info, url) or (None, None).
     """
-    info = ctx.user_data.get(KEY_VIDEO_INFO)
-    url = ctx.user_data.get(KEY_PENDING_URL)
-    if info and url:
-        return info, url
+    # DB first — keyed by message_id, correct even with multiple videos
     session = db.get_session(chat_id, message_id)
     if session:
         try:
             info = _deserialize_video_info(session["video_info_json"])
             url = session["url"]
-            ctx.user_data[KEY_VIDEO_INFO] = info
-            ctx.user_data[KEY_PENDING_URL] = url
             return info, url
         except Exception as e:
             logger.warning("restore_session failed: %s", e)
+    # Fallback to user_data (single-URL flow, or DB unavailable)
+    info = ctx.user_data.get(KEY_VIDEO_INFO)
+    url = ctx.user_data.get(KEY_PENDING_URL)
+    if info and url:
+        return info, url
     return None, None
 
 
@@ -870,6 +874,11 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
 
     if info.is_playlist:
         await _show_playlist_menu(msg, info, ctx)
+        # Сохраняем сессию плейлиста в БД (для корректной работы при нескольких URL)
+        try:
+            db.save_session(msg.chat_id, msg.message_id, url, _serialize_video_info(info))
+        except Exception as e:
+            logger.warning("save_session (playlist) failed: %s", e)
     else:
         sent = await _show_video_menu(msg, info, ctx)
         if sent:
@@ -1082,11 +1091,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "info":
-        info: VideoInfo = ctx.user_data.get(KEY_VIDEO_INFO)
+        info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
         if not info:
             await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
             return
-        await _show_info(query, info, url=ctx.user_data.get(KEY_PENDING_URL, ""))
+        await _show_info(query, info, url=url or "")
         return
 
     if data == "back_to_quality":
@@ -1288,7 +1297,7 @@ async def _show_info(query, info: VideoInfo, url: str = ""):
 
 async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     """Возврат к меню выбора качества из экрана 'Подробнее'."""
-    info, _ = _restore_session(ctx, query.message.chat_id, query.message.message_id)
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
     if not info:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
@@ -1301,7 +1310,6 @@ async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
     # Сбрасываем таймер 2-часовой очистки при активном использовании
-    url = ctx.user_data.get(KEY_PENDING_URL, "")
     if url:
         try:
             db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info))
@@ -1311,7 +1319,7 @@ async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     """Повторно запрашивает форматы видео и обновляет меню выбора качества."""
-    _, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
+    old_info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
     if not url:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
@@ -1332,7 +1340,6 @@ async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error("refresh get_video_info error: %s", e)
         # Восстанавливаем старое меню при ошибке
-        old_info = ctx.user_data.get(KEY_VIDEO_INFO)
         if old_info:
             caption, keyboard = _build_quality_menu(old_info)
             try:
@@ -1345,13 +1352,8 @@ async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"❌ Ошибка обновления: {str(e)[:100]}", show_alert=True)
         return
 
-    old_info = ctx.user_data.get(KEY_VIDEO_INFO)
     old_count = len(get_best_video_formats(old_info.formats)) if old_info else 0
     new_count = len(get_best_video_formats(info.formats))
-
-    # Сохраняем обновлённую информацию
-    ctx.user_data[KEY_VIDEO_INFO] = info
-    ctx.user_data[KEY_PENDING_URL] = url
 
     caption, keyboard = _build_quality_menu(info)
     try:
@@ -2012,8 +2014,7 @@ async def _handle_playlist_callback(query, ctx, data: str):
     max_items = max(1, min(max_items, config.MAX_PLAYLIST_ITEMS))
     audio_only = quality == "audio"
 
-    info: VideoInfo = ctx.user_data.get(KEY_VIDEO_INFO)
-    url = ctx.user_data.get(KEY_PENDING_URL)
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id)
     if not info or not url:
         await query.edit_message_text("❌ Сессия истекла.")
         return
