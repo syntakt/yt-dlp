@@ -1065,18 +1065,20 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=main_kb,
             )
+            ctx.user_data[KEY_MAIN_MENU_MSG] = query.message.message_id
         except TelegramError:
             try:
                 await query.message.delete()
             except TelegramError:
                 pass
-            await ctx.bot.send_message(
+            sent = await ctx.bot.send_message(
                 query.message.chat_id,
                 main_text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=main_kb,
             )
+            ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
         return
 
     if data == "info":
@@ -1111,6 +1113,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=main_kb,
             )
+            ctx.user_data[KEY_MAIN_MENU_MSG] = query.message.message_id
         except TelegramError:
             pass
         return
