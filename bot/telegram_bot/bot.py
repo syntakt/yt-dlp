@@ -1064,7 +1064,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             db.delete_session(query.message.chat_id, query.message.message_id)
         except Exception:
             pass
+        # Сохраняем _deliveries — параллельные загрузки могут ожидать доставки
+        saved_deliveries = ctx.user_data.get("_deliveries")
         ctx.user_data.clear()
+        if saved_deliveries:
+            ctx.user_data["_deliveries"] = saved_deliveries
         # Возвращаем пользователя на главное меню вместо тупика "Отменено"
         main_text, main_kb = _build_main_menu(user)
         try:
@@ -1730,7 +1734,10 @@ async def _handle_download_callback(query, ctx, data: str):
                         fs_token = fileserver.move_and_register(
                             result.file_path, config.FILE_TTL_SECONDS
                         )
-                        ctx.user_data["_pending_delivery"] = {
+                        # Привязываем delivery к dl_id (не к глобальному user_data),
+                        # чтобы параллельные загрузки не перезаписывали друг друга.
+                        deliveries = ctx.user_data.setdefault("_deliveries", {})
+                        deliveries[dl_id] = {
                             "token": fs_token,
                             "dl_id": dl_id,
                             "info": info,
@@ -1742,23 +1749,23 @@ async def _handle_download_callback(query, ctx, data: str):
                         deliver_buttons = [[
                             InlineKeyboardButton(
                                 "📤 Отправить в Telegram",
-                                callback_data="deliver:tg",
+                                callback_data=f"deliver:{dl_id}:tg",
                             ),
                         ]]
                         if config.PUBLIC_BASE_URL:
                             deliver_buttons.append([InlineKeyboardButton(
                                 f"🔗 Ссылка через Cloudflare ({ttl_h}ч)",
-                                callback_data="deliver:link",
+                                callback_data=f"deliver:{dl_id}:link",
                             )])
                         if config.DIRECT_BASE_URL:
                             deliver_buttons.append([InlineKeyboardButton(
                                 f"🌐 Прямая ссылка с сервера ({ttl_h}ч)",
-                                callback_data="deliver:direct",
+                                callback_data=f"deliver:{dl_id}:direct",
                             )])
                         if config.RELAY_BASE_URL:
                             deliver_buttons.append([InlineKeyboardButton(
                                 f"🔄 Relay-ссылка ({ttl_h}ч)",
-                                callback_data="deliver:relay",
+                                callback_data=f"deliver:{dl_id}:relay",
                             )])
                         await status_msg.edit_text(
                             f"✅ <b>{_esc(result.title or info.title)}</b>\n"
@@ -1860,8 +1867,20 @@ async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str,
 
 async def _handle_deliver_callback(query, ctx, data: str):
     """Обрабатывает выбор способа доставки файла: Telegram, ссылка Cloudflare, прямая с сервера или relay."""
-    action = data.split(":", 1)[1]  # "tg", "link", "direct" или "relay"
-    pd = ctx.user_data.get("_pending_delivery")
+    # callback_data format: "deliver:<dl_id>:<action>"
+    parts = data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+    try:
+        cb_dl_id = int(parts[1])
+    except ValueError:
+        await query.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+    action = parts[2]  # "tg", "link", "direct" или "relay"
+
+    deliveries = ctx.user_data.get("_deliveries", {})
+    pd = deliveries.get(cb_dl_id)
 
     if not pd:
         await query.answer(
@@ -1887,10 +1906,10 @@ async def _handle_deliver_callback(query, ctx, data: str):
         # ── Доставка через ссылку файлового сервера ──────────────────────────────
         if not entry:
             await query.answer("❌ Файл недоступен (истёк TTL). Скачайте заново.", show_alert=True)
-            ctx.user_data.pop("_pending_delivery", None)
+            deliveries.pop(cb_dl_id, None)
             return
 
-        ctx.user_data.pop("_pending_delivery", None)
+        deliveries.pop(cb_dl_id, None)
 
         base = (
             config.DIRECT_BASE_URL if action == "direct" else
@@ -1939,12 +1958,12 @@ async def _handle_deliver_callback(query, ctx, data: str):
         # ── Доставка через Telegram ──────────────────────────────────────────────
         if not entry or not entry.path.exists():
             await query.answer("❌ Файл недоступен (истёк TTL). Скачайте заново.", show_alert=True)
-            ctx.user_data.pop("_pending_delivery", None)
+            deliveries.pop(cb_dl_id, None)
             return
 
         # Снимаем с учёта файлового сервера ДО отправки (чтобы TTL-cleanup не удалил файл)
         fileserver.unregister(token, delete_file=False)
-        ctx.user_data.pop("_pending_delivery", None)
+        deliveries.pop(cb_dl_id, None)
 
         result = DownloadResult(
             success=True,

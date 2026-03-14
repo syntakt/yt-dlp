@@ -109,6 +109,7 @@ def approve_user(user_id: int, approved_by: int) -> bool:
         cur = conn.execute("""
             UPDATE users
                SET is_approved = 1,
+                   is_banned   = 0,
                    approved_at = ?,
                    approved_by = ?
              WHERE user_id = ?
