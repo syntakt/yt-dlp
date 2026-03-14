@@ -2363,6 +2363,11 @@ def main():
     logging.root.addFilter(_mask)
     for _h in logging.root.handlers:
         _h.addFilter(_mask)
+    # httpx (используется python-telegram-bot) логирует URL с токеном —
+    # добавляем фильтр напрямую на его логгер и все дочерние
+    for _name in ("httpx", "httpcore", "telegram"):
+        _lg = logging.getLogger(_name)
+        _lg.addFilter(_mask)
 
     db.init_db()
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
