@@ -1,6 +1,7 @@
 import sqlite3
 import json
 import logging
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
@@ -10,12 +11,21 @@ from config import DB_PATH, MAX_HISTORY_PER_USER
 logger = logging.getLogger(__name__)
 
 
-def get_connection() -> sqlite3.Connection:
+@contextmanager
+def get_connection():
+    """Контекстный менеджер: открывает соединение, коммитит/откатывает и ЗАКРЫВАЕТ."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # MEDIUM-2: timeout=10 prevents immediate OperationalError under concurrent load
     conn = sqlite3.connect(str(DB_PATH), timeout=10)
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db() -> None:
@@ -58,16 +68,24 @@ def init_db() -> None:
 
             CREATE INDEX IF NOT EXISTS idx_history_user ON download_history(user_id);
             CREATE INDEX IF NOT EXISTS idx_history_status ON download_history(status);
+            CREATE INDEX IF NOT EXISTS idx_history_created ON download_history(created_at);
 
             CREATE TABLE IF NOT EXISTS sessions (
                 chat_id         INTEGER NOT NULL,
                 message_id      INTEGER NOT NULL,
+                user_id         INTEGER NOT NULL DEFAULT 0,
                 url             TEXT NOT NULL,
                 video_info_json TEXT NOT NULL,
                 created_at      TEXT,
                 PRIMARY KEY (chat_id, message_id)
             );
+
+            CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
         """)
+        # Миграция: добавляем user_id в sessions если его нет (существующие БД)
+        cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
+        if "user_id" not in cols:
+            conn.execute("ALTER TABLE sessions ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
     logger.info("Database initialized at %s", DB_PATH)
 
 
@@ -96,6 +114,7 @@ def approve_user(user_id: int, approved_by: int) -> bool:
         cur = conn.execute("""
             UPDATE users
                SET is_approved = 1,
+                   is_banned   = 0,
                    approved_at = ?,
                    approved_by = ?
              WHERE user_id = ?
@@ -141,13 +160,6 @@ def list_users(approved: Optional[bool] = None, banned: bool = False) -> list:
         ).fetchall()
 
 
-def pending_users() -> list:
-    with get_connection() as conn:
-        return conn.execute(
-            "SELECT * FROM users WHERE is_approved = 0 AND is_banned = 0 ORDER BY created_at"
-        ).fetchall()
-
-
 def is_authorized(user_id: int) -> bool:
     with get_connection() as conn:
         row = conn.execute(
@@ -160,16 +172,29 @@ def is_authorized(user_id: int) -> bool:
 
 def is_admin(user_id: int) -> bool:
     from config import ADMIN_IDS
-    # Проверяем бан: забаненный пользователь НЕ может быть админом
     with get_connection() as conn:
         row = conn.execute(
             "SELECT is_admin, is_banned FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
         if row and row["is_banned"]:
             return False
-    if user_id in ADMIN_IDS:
-        return True
-    return bool(row["is_admin"]) if row else False
+        if user_id in ADMIN_IDS:
+            return True
+        return bool(row["is_admin"]) if row else False
+
+
+def is_super_admin(user_id: int) -> bool:
+    """Суперадмин — из ADMIN_IDS в .env и не забанен."""
+    from config import ADMIN_IDS
+    if user_id not in ADMIN_IDS:
+        return False
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT is_banned FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        if row and row["is_banned"]:
+            return False
+    return True
 
 
 # ── Download history ───────────────────────────────────────────────────────────
@@ -180,7 +205,20 @@ def add_download(user_id: int, url: str) -> int:
             INSERT INTO download_history (user_id, url, status, created_at)
             VALUES (?, ?, 'pending', ?)
         """, (user_id, url, datetime.now(timezone.utc).isoformat()))
-        return cur.lastrowid
+        dl_id = cur.lastrowid
+        # Удаляем старые записи сверх лимита на пользователя
+        if MAX_HISTORY_PER_USER > 0:
+            conn.execute("""
+                DELETE FROM download_history
+                 WHERE user_id = ?
+                   AND id NOT IN (
+                       SELECT id FROM download_history
+                        WHERE user_id = ?
+                        ORDER BY created_at DESC
+                        LIMIT ?
+                   )
+            """, (user_id, user_id, MAX_HISTORY_PER_USER))
+        return dl_id
 
 
 def update_download(
@@ -226,21 +264,27 @@ def get_user_history(user_id: int, limit: int = 10) -> list:
 
 # ── Sessions (persistent quality-selection state) ──────────────────────────────
 
-def save_session(chat_id: int, message_id: int, url: str, video_info_json: str) -> None:
+def save_session(chat_id: int, message_id: int, url: str, video_info_json: str, user_id: int = 0) -> None:
     with get_connection() as conn:
         conn.execute("""
-            INSERT OR REPLACE INTO sessions (chat_id, message_id, url, video_info_json, created_at)
-            VALUES (?, ?, ?, ?, ?)
-        """, (chat_id, message_id, url, video_info_json, datetime.now(timezone.utc).isoformat()))
+            INSERT OR REPLACE INTO sessions (chat_id, message_id, user_id, url, video_info_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (chat_id, message_id, user_id, url, video_info_json, datetime.now(timezone.utc).isoformat()))
 
 
-def get_session(chat_id: int, message_id: int) -> Optional[dict]:
+def get_session(chat_id: int, message_id: int, user_id: int = 0) -> Optional[dict]:
     with get_connection() as conn:
-        row = conn.execute(
-            "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id)
-        ).fetchone()
-    return dict(row) if row else None
+        if user_id:
+            row = conn.execute(
+                "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=? AND user_id=?",
+                (chat_id, message_id, user_id)
+            ).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id)
+            ).fetchone()
+        return dict(row) if row else None
 
 
 def delete_session(chat_id: int, message_id: int) -> None:
@@ -252,6 +296,19 @@ def delete_session(chat_id: int, message_id: int) -> None:
 
 
 # ── Cleanup ────────────────────────────────────────────────────────────────────
+
+def cleanup_stale_downloads() -> int:
+    """Сбрасывает зависшие загрузки (pending/downloading) в error при старте бота."""
+    with get_connection() as conn:
+        cur = conn.execute("""
+            UPDATE download_history
+               SET status = 'error',
+                   error = 'Прервано при перезапуске бота',
+                   finished_at = ?
+             WHERE status IN ('pending', 'downloading')
+        """, (datetime.now(timezone.utc).isoformat(),))
+        return cur.rowcount
+
 
 def cleanup_old_sessions(max_age_hours: int = 24) -> int:
     cutoff = (datetime.now(timezone.utc) - timedelta(hours=max_age_hours)).isoformat()
@@ -302,6 +359,31 @@ def get_pending_users() -> list:
         ).fetchall()
 
 
+def get_all_users_detailed() -> list[dict]:
+    """Возвращает подробную информацию о всех пользователях с их статистикой загрузок."""
+    with get_connection() as conn:
+        rows = conn.execute("""
+            SELECT u.user_id, u.username, u.full_name,
+                   u.is_approved, u.is_banned, u.is_admin,
+                   u.created_at, u.approved_at, u.approved_by,
+                   COALESCE(d.downloads, 0) AS downloads,
+                   COALESCE(d.total_bytes, 0) AS total_bytes,
+                   d.last_download_at
+              FROM users u
+              LEFT JOIN (
+                  SELECT user_id,
+                         COUNT(*) AS downloads,
+                         SUM(file_size) AS total_bytes,
+                         MAX(created_at) AS last_download_at
+                    FROM download_history
+                   WHERE status = 'done'
+                   GROUP BY user_id
+              ) d ON u.user_id = d.user_id
+             ORDER BY u.created_at DESC
+        """).fetchall()
+        return [dict(r) for r in rows]
+
+
 def get_user_stats(user_id: int) -> dict:
     """Возвращает статистику по конкретному пользователю."""
     with get_connection() as conn:
@@ -319,17 +401,16 @@ def get_user_stats(user_id: int) -> dict:
 def sync_admin_ids(admin_ids: list) -> None:
     """Синхронизирует is_admin в БД с ADMIN_IDS из конфига.
 
-    Снимает флаг is_admin И is_approved у пользователей, которых нет в ADMIN_IDS.
-    Это критично: без сброса is_approved удалённый администратор остаётся авторизован
-    как обычный пользователь даже после смены ADMIN_IDS и пересборки контейнера.
+    Снимает только флаг is_admin (не is_approved) у пользователей, которых нет
+    в ADMIN_IDS. Ранее одобренный пользователь сохраняет доступ как обычный юзер.
     """
     with get_connection() as conn:
         if admin_ids:
             placeholders = ",".join("?" * len(admin_ids))
             conn.execute(
-                f"UPDATE users SET is_admin = 0, is_approved = 0 "
+                f"UPDATE users SET is_admin = 0 "
                 f"WHERE is_admin = 1 AND user_id NOT IN ({placeholders})",
                 admin_ids,
             )
         else:
-            conn.execute("UPDATE users SET is_admin = 0, is_approved = 0 WHERE is_admin = 1")
+            conn.execute("UPDATE users SET is_admin = 0 WHERE is_admin = 1")

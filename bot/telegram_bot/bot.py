@@ -9,11 +9,13 @@ import logging
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
 import time
 import traceback
 from dataclasses import asdict
 from datetime import datetime
+import html as _html
 from functools import wraps
 from pathlib import Path
 from typing import Optional
@@ -73,17 +75,54 @@ class _TokenMaskFilter(logging.Filter):
         super().__init__()
         self._token = token
 
+    def _mask(self, text: str) -> str:
+        return text.replace(self._token, "<TOKEN>") if self._token else text
+
     def filter(self, record: logging.LogRecord) -> bool:
         if not self._token:
             return True
-        record.msg = str(record.msg).replace(self._token, "<TOKEN>")
+        if isinstance(record.msg, str):
+            record.msg = self._mask(record.msg)
         if record.args:
-            args = record.args if isinstance(record.args, tuple) else (record.args,)
-            record.args = tuple(
-                a.replace(self._token, "<TOKEN>") if isinstance(a, str) else a
-                for a in args
-            )
+            if isinstance(record.args, dict):
+                record.args = {
+                    k: self._mask(v) if isinstance(v, str) else v
+                    for k, v in record.args.items()
+                }
+            else:
+                args = record.args if isinstance(record.args, tuple) else (record.args,)
+                record.args = tuple(
+                    self._mask(a) if isinstance(a, str) else a
+                    for a in args
+                )
+        # Маскируем exc_text (кешированный traceback) — без этого токен утекает
+        # через TelegramError, который содержит URL с токеном в str(exception)
+        if record.exc_text:
+            record.exc_text = self._mask(record.exc_text)
+        if record.exc_info and record.exc_info[1]:
+            # Перезаписываем args исключения, чтобы при форматировании токен не утёк
+            exc = record.exc_info[1]
+            if hasattr(exc, 'args') and exc.args:
+                exc.args = tuple(
+                    self._mask(a) if isinstance(a, str) else a
+                    for a in exc.args
+                )
+        if record.stack_info:
+            record.stack_info = self._mask(record.stack_info)
         return True
+
+
+class _TokenMaskFormatter(logging.Formatter):
+    """Форматтер, маскирующий токен в финальном выводе (включая traceback)."""
+    def __init__(self, token: str, fmt=None, datefmt=None):
+        super().__init__(fmt=fmt, datefmt=datefmt)
+        self._token = token
+
+    def format(self, record: logging.LogRecord) -> str:
+        output = super().format(record)
+        if self._token:
+            output = output.replace(self._token, "<TOKEN>")
+        return output
 
 # ── Session state keys ───────────────────────────────────────────────────────────
 KEY_VIDEO_INFO  = "video_info"
@@ -92,6 +131,33 @@ KEY_PENDING_URL = "pending_url"
 KEY_ORIG_URL    = "original_url"   # сохраняем оригинальный URL (с list=) для плейлиста
 KEY_MAIN_MENU_MSG = "main_menu_msg_id"  # message_id последнего сообщения главного меню
 KEY_QUALITY_MSG   = "quality_menu_msg_id"  # message_id меню выбора качества (для удаления при новой ссылке)
+
+
+
+def _restore_session(ctx, chat_id: int, message_id: int, user_id: int = 0):
+    """Restore VideoInfo and URL from DB session (by message_id), fallback to user_data.
+
+    DB session is authoritative: each quality menu is saved with its own
+    (chat_id, message_id) key, so multiple videos don't interfere.
+    user_data is a fallback for single-URL flow or when DB write failed.
+
+    Returns (info, url) or (None, None).
+    """
+    # DB first — keyed by message_id + user_id, correct even with multiple videos
+    session = db.get_session(chat_id, message_id, user_id=user_id)
+    if session:
+        try:
+            info = _deserialize_video_info(session["video_info_json"])
+            url = session["url"]
+            return info, url
+        except Exception as e:
+            logger.warning("restore_session failed: %s", e)
+    # Fallback to user_data (single-URL flow, or DB unavailable)
+    info = ctx.user_data.get(KEY_VIDEO_INFO)
+    url = ctx.user_data.get(KEY_PENDING_URL)
+    if info and url:
+        return info, url
+    return None, None
 
 
 # ── Session serialization (persist quality-menu state across restarts) ───────────
@@ -126,32 +192,42 @@ def require_auth(func):
     @wraps(func)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        db.upsert_user(user.id, user.username, user.full_name)
-        if db.is_admin(user.id):
-            return await func(update, ctx)
-        if not db.is_authorized(user.id):
-            row = db.get_user(user.id)
-            if row and not row["is_approved"] and not row["is_banned"]:
-                await update.effective_message.reply_text(
-                    "⏳ Ваша заявка на доступ ожидает одобрения администратора.\n"
-                    "Вы получите уведомление после одобрения."
-                )
-            elif row and row["is_banned"]:
-                await update.effective_message.reply_text("🚫 Вы заблокированы и не можете использовать этого бота.")
-            else:
-                await _send_access_request(update, ctx)
+        try:
+            db.upsert_user(user.id, user.username, user.full_name)
+            if db.is_super_admin(user.id):
+                return await func(update, ctx)
+            if not db.is_authorized(user.id):
+                row = db.get_user(user.id)
+                if row and not row["is_approved"] and not row["is_banned"]:
+                    await update.effective_message.reply_text(
+                        "⏳ Ваша заявка на доступ ожидает одобрения администратора.\n"
+                        "Вы получите уведомление после одобрения."
+                    )
+                elif row and row["is_banned"]:
+                    await update.effective_message.reply_text("🚫 Вы заблокированы и не можете использовать этого бота.")
+                else:
+                    await _send_access_request(update, ctx)
+                return
+        except sqlite3.Error as e:
+            logger.error("DB error in require_auth: %s", e)
+            await update.effective_message.reply_text("⚠️ Временная ошибка. Попробуйте позже.")
             return
         return await func(update, ctx)
     return wrapper
 
 
 def require_admin(func):
-    """Отклоняет не-администраторов."""
+    """Отклоняет не-администраторов (только ADMIN_IDS из .env)."""
     @wraps(func)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
-        if not db.is_admin(user.id):
-            await update.effective_message.reply_text("🚫 Требуется доступ администратора.")
+        try:
+            if not db.is_super_admin(user.id):
+                await update.effective_message.reply_text("🚫 Требуется доступ администратора.")
+                return
+        except sqlite3.Error as e:
+            logger.error("DB error in require_admin: %s", e)
+            await update.effective_message.reply_text("⚠️ Временная ошибка. Попробуйте позже.")
             return
         return await func(update, ctx)
     return wrapper
@@ -162,6 +238,14 @@ def require_admin(func):
 async def _send_access_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.upsert_user(user.id, user.username, user.full_name)
+
+    # Забаненный пользователь не может зарегистрироваться даже при open-режиме
+    row = db.get_user(user.id)
+    if row and row["is_banned"]:
+        await update.effective_message.reply_text(
+            "🚫 Вы заблокированы и не можете использовать этого бота."
+        )
+        return
 
     if config.REGISTRATION_MODE == "open":
         db.approve_user(user.id, 0)
@@ -261,7 +345,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.upsert_user(user.id, user.username, user.full_name)
 
-    if db.is_admin(user.id) or db.is_authorized(user.id):
+    if db.is_super_admin(user.id) or db.is_authorized(user.id):
         # Удаляем предыдущее сообщение главного меню, чтобы не накапливались
         prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
         if prev_msg_id:
@@ -286,9 +370,9 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await _send_access_request(update, ctx)
 
 
-@require_auth
-async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    is_adm = db.is_admin(update.effective_user.id)
+def _build_help_text(user_id: int, verbose: bool = True) -> str:
+    """Build help text. verbose=True for full /help version."""
+    is_adm = db.is_super_admin(user_id)
     text = (
         "📖 <b>Справка по боту</b>\n\n"
         "<b>Как использовать:</b>\n"
@@ -298,8 +382,11 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         + SUPPORTED_SITES_TEXT +
         "\n\n⚠️ <b>Ограничения:</b>\n"
         f"• Максимальный размер файла: {config.MAX_FILE_SIZE_MB} МБ\n"
-        f"• Таймаут загрузки: {config.DOWNLOAD_TIMEOUT // 60} мин\n\n"
-        "<b>Команды:</b>\n"
+    )
+    if verbose:
+        text += f"• Таймаут загрузки: {config.DOWNLOAD_TIMEOUT // 60} мин\n"
+    text += (
+        "\n<b>Команды:</b>\n"
         "/start — главное меню\n"
         "/help — эта справка\n"
         "/history — последние 10 загрузок\n"
@@ -315,17 +402,60 @@ async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "/deny &lt;id&gt; — отклонить пользователя\n"
             "/ban &lt;id&gt; — заблокировать\n"
             "/unban &lt;id&gt; — разблокировать\n"
-            "/addadmin &lt;id&gt; — назначить администратором\n"
             "/stats — глобальная статистика\n"
         )
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML, disable_web_page_preview=True)
+    return text
+
+
+@require_auth
+async def cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    text = _build_help_text(update.effective_user.id, verbose=True)
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее меню бота, чтобы не захламлять чат
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id, text,
+        parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("« Назад", callback_data="menu:back"),
+        ]]),
+    )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 @require_auth
 async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее сообщение меню
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
+
     rows = db.get_user_history(update.effective_user.id, limit=10)
     if not rows:
-        await update.message.reply_text("📭 История загрузок пуста.")
+        sent = await ctx.bot.send_message(
+            update.effective_chat.id, "📭 История загрузок пуста.",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("« Назад", callback_data="menu:back"),
+            ]]),
+        )
+        ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
         return
 
     lines = ["📜 <b>Последние загрузки:</b>\n"]
@@ -335,40 +465,141 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{i}. {status_icon} {title}")
         if row["quality"]:
             lines.append(f"   └ {row['quality']}, {_human_size(row['file_size'])}")
-    await update.message.reply_text(
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id,
         "\n".join(lines),
         parse_mode=ParseMode.HTML,
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("🗑 Очистить историю", callback_data="clear_history"),
-        ]]),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 Очистить историю", callback_data="clear_history")],
+            [InlineKeyboardButton("« Назад", callback_data="menu:back")],
+        ]),
     )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
+
+
+def _fmt_date_short(iso_str: str | None) -> str:
+    """Форматирует ISO дату в короткий вид: 14.03.26 12:30."""
+    if not iso_str:
+        return "—"
+    try:
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%d.%m.%y %H:%M")
+    except (ValueError, AttributeError):
+        return iso_str[:16] if iso_str else "—"
+
+
+def _build_status_text(user_id: int, verbose: bool = True) -> str:
+    """Build status text. verbose=True for full /status version."""
+    stats = db.get_global_stats()
+    disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
+    disk_pct = disk.used / disk.total * 100
+    disk_warn = " ⚠️" if disk_pct >= config.DISK_ALERT_THRESHOLD else ""
+    is_super = db.is_super_admin(user_id)
+    text = "📊 <b>Статус бота</b>\n\n"
+    if verbose:
+        user_stats = db.get_user_stats(user_id)
+        text += (
+            f"📥 Ваших загрузок: <b>{user_stats['downloads']}</b>\n"
+            f"💾 Вы скачали: <b>{_human_size(user_stats['total_bytes'])}</b>\n\n"
+        )
+    if is_super:
+        # Полная статистика — только для суперадминов (ADMIN_IDS)
+        text += (
+            f"👥 Пользователей: {stats['total_users']}\n"
+            f"📥 Всего загрузок: {stats['total_downloads']}\n"
+            f"💾 Отправлено: {_human_size(stats['total_size_bytes'])}\n"
+            f"⏳ Ожидают: {stats['pending_requests']}\n\n"
+            f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
+        )
+    else:
+        # Обычные пользователи и обычные админы — только диск
+        text += f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
+
+    # Подробная информация — только для суперадминов (ADMIN_IDS)
+    if verbose and is_super:
+        # Конфигурация
+        text += "\n\n⚙️ <b>Конфигурация:</b>\n"
+        text += f"• Режим регистрации: <code>{config.REGISTRATION_MODE}</code>\n"
+        text += f"• Макс. размер файла: {config.MAX_FILE_SIZE_MB} МБ\n"
+        text += f"• Параллельных загрузок: {config.MAX_CONCURRENT_DOWNLOADS}\n"
+        text += f"• Таймаут загрузки: {config.DOWNLOAD_TIMEOUT // 60} мин\n"
+        text += f"• TTL ссылок: {max(1, config.FILE_TTL_SECONDS // 3600)} ч\n"
+        _channels = []
+        if config.PUBLIC_BASE_URL:
+            _channels.append("CF")
+        if config.DIRECT_BASE_URL:
+            _channels.append("Direct")
+        if config.RELAY_BASE_URL:
+            _channels.append("Relay")
+        text += f"• Каналы доставки: {', '.join(_channels) if _channels else 'только Telegram'}\n"
+        text += f"• HMAC подпись: {'✓' if config.SERVER_SECRET else '✗'}\n"
+        text += f"• Версия: <code>v{BOT_VERSION}</code>"
+
+        # Список пользователей с подробностями
+        all_users = db.get_all_users_detailed()
+        if all_users:
+            text += f"\n\n👥 <b>Пользователи ({len(all_users)}):</b>\n"
+            for u in all_users:
+                uid = u["user_id"]
+                uname = f"@{_esc(u['username'])}" if u.get("username") else _esc(u.get("full_name") or "—")
+                # Роль
+                if uid in config.ADMIN_IDS:
+                    role = "👑"
+                elif u["is_banned"]:
+                    role = "🚫"
+                elif not u["is_approved"]:
+                    role = "⏳"
+                else:
+                    role = "👤"
+                # Дата регистрации
+                reg_date = _fmt_date_short(u.get("created_at"))
+                # Статистика загрузок
+                dl_count = u.get("downloads", 0)
+                dl_size = _human_size(u.get("total_bytes", 0))
+                last_dl = _fmt_date_short(u.get("last_download_at"))
+
+                text += f"\n{role} {uname} <code>{uid}</code>\n"
+                text += f"   📅 Добавлен: {reg_date}\n"
+                if dl_count:
+                    text += f"   📥 Загрузок: {dl_count} ({dl_size})\n"
+                    text += f"   🕐 Последняя: {last_dl}\n"
+                else:
+                    text += f"   📥 Загрузок: 0\n"
+
+        # Ожидающие одобрения (отдельным блоком если есть)
+        if stats['pending_requests']:
+            pending = db.get_pending_users()
+            text += "\n⏳ <b>Ожидают одобрения:</b>\n"
+            for r in pending:
+                uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
+                text += f"• {uname} — <code>{r['user_id']}</code> ({_fmt_date_short(r['created_at'])})\n"
+
+    return text
 
 
 @require_auth
 async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    stats = db.get_global_stats()
-    user_stats = db.get_user_stats(update.effective_user.id)
-    disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
-    disk_pct = disk.used / disk.total * 100
-    disk_warn = " ⚠️" if disk_pct >= config.DISK_ALERT_THRESHOLD else ""
-    text = (
-        "📊 <b>Статус бота</b>\n\n"
-        f"📥 Ваших загрузок: <b>{user_stats['downloads']}</b>\n"
-        f"💾 Вы скачали: <b>{_human_size(user_stats['total_bytes'])}</b>\n\n"
-        f"👥 Всего пользователей: {stats['total_users']}\n"
-        f"📦 Всего загрузок: {stats['total_downloads']}\n"
-        f"⏳ Ожидают одобрения: {stats['pending_requests']}\n\n"
-        f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)} ({disk_pct:.0f}%){disk_warn}"
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее сообщение меню
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
+    text = _build_status_text(update.effective_user.id, verbose=True)
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id, text,
+        parse_mode=ParseMode.HTML,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("« Назад", callback_data="menu:back"),
+        ]]),
     )
-    # Для администраторов — показываем кто именно ожидает
-    if db.is_admin(update.effective_user.id) and stats['pending_requests']:
-        pending = db.get_pending_users()
-        lines = ["\n⏳ <b>Ожидают одобрения:</b>"]
-        for r in pending:
-            uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
-            lines.append(f"• {uname} — <code>{r['user_id']}</code>")
-        text += "\n".join(lines)
-    await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 @require_auth
@@ -376,14 +607,47 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     cancel_flag = ctx.user_data.get("cancel_flag")
     if cancel_flag is not None:
         cancel_flag[0] = True
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее сообщение меню
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
     ctx.user_data.clear()
-    await update.message.reply_text("🛑 Отменено. Отправьте новую ссылку когда будете готовы.")
+    # Показываем главное меню вместо тупика "Отменено"
+    user = update.effective_user
+    text, keyboard = _build_main_menu(user)
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id, text,
+        parse_mode=ParseMode.HTML,
+        disable_web_page_preview=True,
+        reply_markup=keyboard,
+    )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 @require_auth
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Показывает клавиатуру с командами бота."""
-    is_adm = db.is_admin(update.effective_user.id)
+    # Удаляем команду пользователя
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+    # Удаляем предыдущее сообщение меню
+    prev_msg_id = ctx.user_data.get(KEY_MAIN_MENU_MSG)
+    if prev_msg_id:
+        try:
+            await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
+        except TelegramError:
+            pass
+    is_adm = db.is_super_admin(update.effective_user.id)
     user_buttons = [
         [
             InlineKeyboardButton("📜 История", callback_data="menu:history"),
@@ -403,18 +667,21 @@ async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ],
     ]
     buttons = user_buttons + (admin_buttons if is_adm else [])
-    await update.message.reply_text(
+    sent = await ctx.bot.send_message(
+        update.effective_chat.id,
         "📋 <b>Меню команд</b>\n\nВыберите действие или отправьте ссылку на видео:",
         parse_mode=ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+    ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
 
 
 # ── Обработчик URL ───────────────────────────────────────────────────────────────
 
 def _extract_urls(text: str) -> list[str]:
-    """Извлекает все http(s)-ссылки из текста."""
-    return re.findall(r'https?://[^\s<>"\']+', text)
+    """Извлекает все http(s)-ссылки из текста (до 2048 символов каждый)."""
+    urls = re.findall(r'https?://[^\s<>"\']+', text)
+    return [u[:2048] for u in urls]
 
 
 def _strip_playlist_param(url: str) -> str:
@@ -491,7 +758,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             )
             return
         msg = await update.effective_chat.send_message("🔍 Получаю информацию о видео…")
-        await _fetch_and_show_menu(url, msg, ctx)
+        await _fetch_and_show_menu(url, msg, ctx, user_id=update.effective_user.id)
         return
 
     # Несколько ссылок — отправляем все статусы сразу, затем получаем инфо параллельно.
@@ -504,8 +771,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"🔍 [{i}/{len(batch)}] Получаю информацию о видео…"
         )
         msgs.append(msg)
+    _uid = update.effective_user.id
     await asyncio.gather(*(
-        _fetch_and_show_menu(url, msg, ctx)
+        _fetch_and_show_menu(url, msg, ctx, user_id=_uid)
         for url, msg in zip(batch, msgs)
     ))
 
@@ -520,7 +788,7 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
 
     # Проверяем авторизацию (inline не проходит через require_auth)
-    if not (db.is_admin(user.id) or db.is_authorized(user.id)):
+    if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
         await query.answer(
             results=[],
             switch_pm_text="🔐 Требуется доступ — нажмите для регистрации",
@@ -562,7 +830,7 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     await query.answer(results, cache_time=10)
 
 
-async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT_TYPE):
+async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, user_id: int = 0):
     """Получает информацию о видео и показывает меню выбора качества."""
     try:
         info: VideoInfo = await get_video_info(url)
@@ -584,13 +852,18 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
 
     if info.is_playlist:
         await _show_playlist_menu(msg, info, ctx)
+        # Сохраняем сессию плейлиста в БД (для корректной работы при нескольких URL)
+        try:
+            db.save_session(msg.chat_id, msg.message_id, url, _serialize_video_info(info), user_id=user_id)
+        except Exception as e:
+            logger.warning("save_session (playlist) failed: %s", e)
     else:
         sent = await _show_video_menu(msg, info, ctx)
         if sent:
             # Запоминаем message_id меню выбора качества — удалим при следующей ссылке.
             ctx.user_data[KEY_QUALITY_MSG] = sent.message_id
             try:
-                db.save_session(sent.chat_id, sent.message_id, url, _serialize_video_info(info))
+                db.save_session(sent.chat_id, sent.message_id, url, _serialize_video_info(info), user_id=user_id)
             except Exception as e:
                 logger.warning("save_session failed: %s", e)
 
@@ -642,6 +915,7 @@ def _build_quality_menu(info: VideoInfo) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("📄 + Субтитры EN", callback_data="dl:s:en"),
         ])
     buttons.append([
+        InlineKeyboardButton("🔄 Обновить", callback_data="refresh"),
         InlineKeyboardButton("ℹ️ Подробнее", callback_data="info"),
         InlineKeyboardButton("❌ Отмена", callback_data="cancel"),
     ])
@@ -722,7 +996,12 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # ── Авторизация: все остальные callback требуют одобренного аккаунта ─────────
-    user_is_auth = db.is_authorized(user.id) or db.is_admin(user.id)
+    try:
+        user_is_auth = db.is_authorized(user.id) or db.is_super_admin(user.id)
+    except sqlite3.Error as e:
+        logger.error("DB error in handle_callback auth check: %s", e)
+        await query.answer("⚠️ Временная ошибка. Попробуйте позже.", show_alert=True)
+        return
     if not user_is_auth:
         await query.answer(
             "🚫 Доступ запрещён. Отправьте /start чтобы запросить доступ.",
@@ -756,14 +1035,18 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 )
             except TelegramError:
                 pass
-            await query.answer("Останавливаем загрузку…", show_alert=False)
+            # query.answer() already called in handle_callback
             return
         # Пользователь явно закрывает меню — удаляем сессию из БД
         try:
             db.delete_session(query.message.chat_id, query.message.message_id)
         except Exception:
             pass
+        # Сохраняем _deliveries — параллельные загрузки могут ожидать доставки
+        saved_deliveries = ctx.user_data.get("_deliveries")
         ctx.user_data.clear()
+        if saved_deliveries:
+            ctx.user_data["_deliveries"] = saved_deliveries
         # Возвращаем пользователя на главное меню вместо тупика "Отменено"
         main_text, main_kb = _build_main_menu(user)
         try:
@@ -773,30 +1056,36 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=main_kb,
             )
+            ctx.user_data[KEY_MAIN_MENU_MSG] = query.message.message_id
         except TelegramError:
             try:
                 await query.message.delete()
             except TelegramError:
                 pass
-            await ctx.bot.send_message(
+            sent = await ctx.bot.send_message(
                 query.message.chat_id,
                 main_text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=main_kb,
             )
+            ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
         return
 
     if data == "info":
-        info: VideoInfo = ctx.user_data.get(KEY_VIDEO_INFO)
+        info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=user.id)
         if not info:
             await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
             return
-        await _show_info(query, info, url=ctx.user_data.get(KEY_PENDING_URL, ""))
+        await _show_info(query, info, url=url or "")
         return
 
     if data == "back_to_quality":
         await _handle_back_to_quality(query, ctx)
+        return
+
+    if data == "refresh":
+        await _handle_refresh_quality(query, ctx)
         return
 
     # Выбор: видео или плейлист для смешанного URL
@@ -815,6 +1104,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
                 reply_markup=main_kb,
             )
+            ctx.user_data[KEY_MAIN_MENU_MSG] = query.message.message_id
         except TelegramError:
             pass
         return
@@ -833,21 +1123,7 @@ async def _handle_menu_callback(query, ctx, data: str):
     user = query.from_user
 
     if action == "help":
-        is_adm = db.is_admin(user.id)
-        text = (
-            "📖 <b>Справка по боту</b>\n\n"
-            "<b>Как использовать:</b>\n"
-            "1. Отправьте ссылку на видео\n"
-            "2. Выберите качество или аудио\n"
-            "3. Дождитесь файла\n\n"
-            + SUPPORTED_SITES_TEXT +
-            "\n\n⚠️ <b>Ограничения:</b>\n"
-            f"• Максимальный размер: {config.MAX_FILE_SIZE_MB} МБ\n\n"
-            "<b>Команды:</b>\n"
-            "/history, /status, /cancel"
-        )
-        if is_adm:
-            text += "\n/pending, /users, /approve, /deny, /ban, /unban, /addadmin, /stats"
+        text = _build_help_text(user.id, verbose=False)
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
@@ -880,16 +1156,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         )
 
     elif action == "status":
-        stats = db.get_global_stats()
-        disk = shutil.disk_usage(str(config.DOWNLOAD_DIR))
-        text = (
-            "📊 <b>Статус бота</b>\n\n"
-            f"👥 Пользователей: {stats['total_users']}\n"
-            f"📥 Всего загрузок: {stats['total_downloads']}\n"
-            f"💾 Отправлено: {_human_size(stats['total_size_bytes'])}\n"
-            f"⏳ Ожидают: {stats['pending_requests']}\n\n"
-            f"🖥 Диск: {_human_size(disk.free)} свободно / {_human_size(disk.total)}"
-        )
+        text = _build_status_text(user.id, verbose=False)
         await query.edit_message_text(
             text,
             parse_mode=ParseMode.HTML,
@@ -906,9 +1173,10 @@ async def _handle_menu_callback(query, ctx, data: str):
             disable_web_page_preview=True,
             reply_markup=keyboard,
         )
+        ctx.user_data[KEY_MAIN_MENU_MSG] = query.message.message_id
 
     elif action == "pending":
-        if not db.is_admin(user.id):
+        if not db.is_super_admin(user.id):
             await query.answer("🚫 Только для администраторов.", show_alert=True)
             return
         rows = db.get_pending_users()
@@ -917,7 +1185,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         else:
             lines = ["⏳ <b>Ожидают одобрения:</b>\n"]
             for r in rows:
-                uname = f"@{r['username']}" if r['username'] else _esc(r['full_name'])  # LOW-4
+                uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
                 lines.append(f"• {uname} <code>{r['user_id']}</code>")
             text = "\n".join(lines) + "\n\nИспользуйте /pending для одобрения."
         await query.edit_message_text(
@@ -926,7 +1194,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         )
 
     elif action == "users":
-        if not db.is_admin(user.id):
+        if not db.is_super_admin(user.id):
             await query.answer("🚫 Только для администраторов.", show_alert=True)
             return
         rows = db.list_users(approved=True)
@@ -935,8 +1203,8 @@ async def _handle_menu_callback(query, ctx, data: str):
         else:
             lines = [f"👥 <b>Пользователи ({len(rows)}):</b>\n"]
             for r in rows[:20]:  # ограничиваем 20
-                uname = f"@{r['username']}" if r['username'] else r['full_name']
-                admin_tag = " 👑" if r['is_admin'] else ""
+                uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
+                admin_tag = " 👑" if r['user_id'] in config.ADMIN_IDS else ""
                 lines.append(f"• {uname} <code>{r['user_id']}</code>{admin_tag}")
             text = "\n".join(lines)
         await query.edit_message_text(
@@ -945,7 +1213,7 @@ async def _handle_menu_callback(query, ctx, data: str):
         )
 
     elif action == "stats":
-        if not db.is_admin(user.id):
+        if not db.is_super_admin(user.id):
             await query.answer("🚫 Только для администраторов.", show_alert=True)
             return
         stats = db.get_global_stats()
@@ -981,7 +1249,7 @@ async def _handle_resolve_callback(query, ctx, data: str):
         return
 
     await query.edit_message_text("🔍 Получаю информацию о видео…")
-    await _fetch_and_show_menu(url, query.message, ctx)
+    await _fetch_and_show_menu(url, query.message, ctx, user_id=query.from_user.id)
 
 
 async def _show_info(query, info: VideoInfo, url: str = ""):
@@ -1004,23 +1272,14 @@ async def _show_info(query, info: VideoInfo, url: str = ""):
     # Сбрасываем таймер 2-часовой очистки при активном использовании
     if url:
         try:
-            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info))
+            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
         except Exception:
             pass
 
 
 async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     """Возврат к меню выбора качества из экрана 'Подробнее'."""
-    info: VideoInfo = ctx.user_data.get(KEY_VIDEO_INFO)
-    if not info:
-        session = db.get_session(query.message.chat_id, query.message.message_id)
-        if session:
-            try:
-                info = _deserialize_video_info(session["video_info_json"])
-                ctx.user_data[KEY_VIDEO_INFO] = info
-                ctx.user_data[KEY_PENDING_URL] = session["url"]
-            except Exception as e:
-                logger.warning("restore_session (back) failed: %s", e)
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=query.from_user.id)
     if not info:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
@@ -1033,17 +1292,78 @@ async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
         except TelegramError:
             pass
     # Сбрасываем таймер 2-часовой очистки при активном использовании
-    url = ctx.user_data.get(KEY_PENDING_URL, "")
     if url:
         try:
-            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info))
+            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
         except Exception:
             pass
 
 
+async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
+    """Повторно запрашивает форматы видео и обновляет меню выбора качества."""
+    old_info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=query.from_user.id)
+    if not url:
+        await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
+        return
+
+    # Показываем индикатор загрузки — заменяем кнопки на «Обновление…»
+    try:
+        await query.edit_message_reply_markup(
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("⏳ Обновление форматов…", callback_data="noop"),
+            ]])
+        )
+    except TelegramError:
+        pass
+
+    # Повторная экстракция форматов
+    try:
+        info: VideoInfo = await get_video_info(url)
+    except Exception as e:
+        logger.error("refresh get_video_info error: %s", e)
+        # Восстанавливаем старое меню при ошибке
+        if old_info:
+            caption, keyboard = _build_quality_menu(old_info)
+            try:
+                await query.edit_message_caption(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+            except TelegramError:
+                try:
+                    await query.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+                except TelegramError:
+                    pass
+        await query.answer(f"❌ Ошибка обновления: {str(e)[:100]}", show_alert=True)
+        return
+
+    old_count = len(get_best_video_formats(old_info.formats)) if old_info else 0
+    new_count = len(get_best_video_formats(info.formats))
+
+    caption, keyboard = _build_quality_menu(info)
+    try:
+        await query.edit_message_caption(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+    except TelegramError:
+        try:
+            await query.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+        except TelegramError:
+            pass
+
+    # Обновляем сессию в БД
+    try:
+        db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
+    except Exception:
+        pass
+
+    # Уведомляем пользователя о результате
+    if new_count > old_count:
+        await query.answer(f"✅ Найдено форматов: {new_count} (было {old_count})", show_alert=False)
+    elif new_count == old_count:
+        await query.answer(f"Форматов: {new_count} (без изменений)", show_alert=False)
+    else:
+        await query.answer(f"Форматов: {new_count}", show_alert=False)
+
+
 async def _handle_admin_approval(query, ctx, data: str):
-    if not db.is_admin(query.from_user.id):
-        await query.answer("Нет прав.", show_alert=True)
+    if not db.is_super_admin(query.from_user.id):
+        await query.answer("🚫 Только администраторы (ADMIN_IDS) могут одобрять/отклонять.", show_alert=True)
         return
 
     action, uid_str = data.split(":", 1)
@@ -1051,6 +1371,11 @@ async def _handle_admin_approval(query, ctx, data: str):
         target_id = int(uid_str)
     except ValueError:
         await query.answer("Некорректный ID пользователя.", show_alert=True)
+        return
+
+    # Защита суперадминов от deny через inline-кнопку
+    if action == "deny" and target_id in config.ADMIN_IDS:
+        await query.answer("🚫 Нельзя отклонить суперадминистратора.", show_alert=True)
         return
 
     if action == "approve":
@@ -1099,42 +1424,43 @@ def _estimate_download_size(fmt_obj: Optional[FormatInfo], duration: int, audio_
     else:
         return None
 
-    # Прибавляем примерный размер аудио-дорожки (128 kbps * duration)
-    audio_overhead = int(128 * 1000 / 8 * duration) if duration else 0
-    # Добавляем 10% запас на контейнер и метаданные
+    # Add audio overhead only for video-only formats (no built-in audio)
+    has_audio = fmt_obj.acodec not in ("none", "", None)
+    audio_overhead = 0
+    if not has_audio and duration:
+        audio_overhead = int(128 * 1000 / 8 * duration)
+    # 10% overhead for container and metadata
     return int((base + audio_overhead) * 1.1)
+
+
+_VALID_DL_TYPES = {"v", "a", "ao", "aw", "s"}
 
 
 async def _handle_download_callback(query, ctx, data: str):
     # data: dl:<type>:<format_id>   type: v=video, a=audio, s=subtitle
     parts = data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("❌ Некорректный запрос.", show_alert=True)
+        return
     dl_type = parts[1]
     format_id = parts[2]
 
-    sem: asyncio.Semaphore = ctx.bot_data.get("_download_sem")
+    if dl_type not in _VALID_DL_TYPES:
+        logger.warning("Invalid dl_type %r from user %s", dl_type, query.from_user.id)
+        await query.answer("❌ Некорректный тип загрузки.", show_alert=True)
+        return
 
-    # Сначала ищем сессию в БД по message_id — это корректно при групповой загрузке,
-    # когда каждое видео имеет своё сообщение-меню. ctx.user_data содержит данные
-    # только последнего видео и ведёт к ошибке при выборе качества для предыдущих.
-    info: VideoInfo = None
-    url: str = None
-    session = db.get_session(query.message.chat_id, query.message.message_id)
-    if session:
-        try:
-            info = _deserialize_video_info(session["video_info_json"])
-            url = session["url"]
-        except Exception as e:
-            logger.warning("restore_session failed: %s", e)
-    # Фолбэк на user_data (одиночная ссылка или отсутствие сессии в БД)
-    if not info or not url:
-        info = ctx.user_data.get(KEY_VIDEO_INFO)
-        url = ctx.user_data.get(KEY_PENDING_URL)
+    sem: asyncio.Semaphore = ctx.bot_data.get("_download_sem")
+    if sem is None:
+        sem = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
+        ctx.bot_data["_download_sem"] = sem
+
+    # Restore session: DB first (correct for multi-URL), fallback to user_data.
+    user = query.from_user
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=user.id)
     if not info or not url:
         await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
         return
-    # Обновляем user_data для совместимости с остальным кодом
-    ctx.user_data[KEY_VIDEO_INFO] = info
-    ctx.user_data[KEY_PENDING_URL] = url
 
     # Сохраняем до возможного удаления сообщения (при фото-меню)
     _session_chat_id = query.message.chat_id
@@ -1144,7 +1470,6 @@ async def _handle_download_callback(query, ctx, data: str):
     # сбрасываем ключ, чтобы следующий URL не пытался удалить уже изменившееся сообщение.
     ctx.user_data.pop(KEY_QUALITY_MSG, None)
 
-    user = query.from_user
     dl_id = db.add_download(user.id, url)
     ctx.user_data[KEY_DOWNLOAD_ID] = dl_id
 
@@ -1163,6 +1488,11 @@ async def _handle_download_callback(query, ctx, data: str):
     audio_format = "opus" if dl_type == "ao" else "wav" if dl_type == "aw" else "mp3"
     subtitle_lang = format_id if dl_type == "s" else None
     if dl_type == "s":
+        # SEC: validate subtitle_lang (callback_data is user-controllable)
+        if not subtitle_lang or not re.match(r'^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)?$', subtitle_lang):
+            logger.warning("Invalid subtitle_lang %r from user %s", subtitle_lang, query.from_user.id)
+            await query.answer("\u274c \u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 \u044f\u0437\u044b\u043a \u0441\u0443\u0431\u0442\u0438\u0442\u0440\u043e\u0432.", show_alert=True)
+            return
         format_id = "best"
 
     if dl_type == "a":
@@ -1293,7 +1623,7 @@ async def _handle_download_callback(query, ctx, data: str):
 
     # Перепривязываем сессию к текущему сообщению (если меню было фото и удалено)
     try:
-        db.save_session(status_msg.chat_id, status_msg.message_id, url, _serialize_video_info(info))
+        db.save_session(status_msg.chat_id, status_msg.message_id, url, _serialize_video_info(info), user_id=user.id)
         if _session_msg_id != status_msg.message_id:
             db.delete_session(_session_chat_id, _session_msg_id)
     except Exception as e:
@@ -1308,8 +1638,7 @@ async def _handle_download_callback(query, ctx, data: str):
         await query.answer("❌ Внутренняя ошибка.", show_alert=True)
         return
     # Если все слоты заняты — уведомляем пользователя и ждём в очереди.
-    _sem = sem or asyncio.Semaphore(1)
-    _need_queue = sem is not None and getattr(sem, '_value', 1) == 0
+    _need_queue = sem.locked()
     if _need_queue:
         try:
             await status_msg.edit_text(
@@ -1322,7 +1651,7 @@ async def _handle_download_callback(query, ctx, data: str):
             pass
 
     try:
-        async with _sem:
+        async with sem:
             # Если ждали в очереди — восстанавливаем статус "загружаю"
             if _need_queue:
                 try:
@@ -1383,6 +1712,15 @@ async def _handle_download_callback(query, ctx, data: str):
 
                 db.update_download(dl_id, status="done", file_size=result.file_size)
 
+                # Re-auth: проверяем, не забанили ли пользователя во время загрузки
+                if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
+                    logger.info("User %s was banned/revoked during download %d — file not delivered", user.id, dl_id)
+                    try:
+                        await status_msg.edit_text("🚫 Ваш доступ был отозван. Файл не будет доставлен.")
+                    except TelegramError:
+                        pass
+                    return
+
                 _has_fileserver = config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL
                 if _has_fileserver:
                     # Файловый сервер включён — предлагаем выбор доставки
@@ -1390,7 +1728,10 @@ async def _handle_download_callback(query, ctx, data: str):
                         fs_token = fileserver.move_and_register(
                             result.file_path, config.FILE_TTL_SECONDS
                         )
-                        ctx.user_data["_pending_delivery"] = {
+                        # Привязываем delivery к dl_id (не к глобальному user_data),
+                        # чтобы параллельные загрузки не перезаписывали друг друга.
+                        deliveries = ctx.user_data.setdefault("_deliveries", {})
+                        deliveries[dl_id] = {
                             "token": fs_token,
                             "dl_id": dl_id,
                             "info": info,
@@ -1402,23 +1743,23 @@ async def _handle_download_callback(query, ctx, data: str):
                         deliver_buttons = [[
                             InlineKeyboardButton(
                                 "📤 Отправить в Telegram",
-                                callback_data="deliver:tg",
+                                callback_data=f"deliver:{dl_id}:tg",
                             ),
                         ]]
                         if config.PUBLIC_BASE_URL:
                             deliver_buttons.append([InlineKeyboardButton(
                                 f"🔗 Ссылка через Cloudflare ({ttl_h}ч)",
-                                callback_data="deliver:link",
+                                callback_data=f"deliver:{dl_id}:link",
                             )])
                         if config.DIRECT_BASE_URL:
                             deliver_buttons.append([InlineKeyboardButton(
                                 f"🌐 Прямая ссылка с сервера ({ttl_h}ч)",
-                                callback_data="deliver:direct",
+                                callback_data=f"deliver:{dl_id}:direct",
                             )])
                         if config.RELAY_BASE_URL:
                             deliver_buttons.append([InlineKeyboardButton(
                                 f"🔄 Relay-ссылка ({ttl_h}ч)",
-                                callback_data="deliver:relay",
+                                callback_data=f"deliver:{dl_id}:relay",
                             )])
                         await status_msg.edit_text(
                             f"✅ <b>{_esc(result.title or info.title)}</b>\n"
@@ -1466,6 +1807,7 @@ async def _handle_download_callback(query, ctx, data: str):
                         db.save_session(
                             status_msg.chat_id, status_msg.message_id,
                             url, _serialize_video_info(info),
+                            user_id=user.id,
                         )
                     except Exception:
                         pass
@@ -1509,7 +1851,7 @@ async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str,
             await bot.send_message(
                 chat_id,
                 f"⏰ <b>Ссылка истекает через 10 минут:</b>\n"
-                f"<a href='{info_url}'>{_esc(title[:60])}</a>\n\n"
+                f"<a href='{_esc(info_url)}'>{_esc(title[:60])}</a>\n\n"
                 "Успейте скачать!",
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
@@ -1520,8 +1862,28 @@ async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str,
 
 async def _handle_deliver_callback(query, ctx, data: str):
     """Обрабатывает выбор способа доставки файла: Telegram, ссылка Cloudflare, прямая с сервера или relay."""
-    action = data.split(":", 1)[1]  # "tg", "link", "direct" или "relay"
-    pd = ctx.user_data.get("_pending_delivery")
+    # callback_data format: "deliver:<dl_id>:<action>"
+    parts = data.split(":", 2)
+    if len(parts) < 3:
+        await query.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+    try:
+        cb_dl_id = int(parts[1])
+    except ValueError:
+        await query.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+    action = parts[2]  # "tg", "link", "direct" или "relay"
+    if action not in ("tg", "link", "direct", "relay"):
+        await query.answer("❌ Некорректный запрос.", show_alert=True)
+        return
+
+    # Re-auth: проверяем, не забанили ли пользователя
+    if not (db.is_super_admin(query.from_user.id) or db.is_authorized(query.from_user.id)):
+        await query.answer("🚫 Ваш доступ был отозван.", show_alert=True)
+        return
+
+    deliveries = ctx.user_data.get("_deliveries", {})
+    pd = deliveries.get(cb_dl_id)
 
     if not pd:
         await query.answer(
@@ -1547,10 +1909,10 @@ async def _handle_deliver_callback(query, ctx, data: str):
         # ── Доставка через ссылку файлового сервера ──────────────────────────────
         if not entry:
             await query.answer("❌ Файл недоступен (истёк TTL). Скачайте заново.", show_alert=True)
-            ctx.user_data.pop("_pending_delivery", None)
+            deliveries.pop(cb_dl_id, None)
             return
 
-        ctx.user_data.pop("_pending_delivery", None)
+        deliveries.pop(cb_dl_id, None)
 
         base = (
             config.DIRECT_BASE_URL if action == "direct" else
@@ -1566,14 +1928,15 @@ async def _handle_deliver_callback(query, ctx, data: str):
         # Планируем уведомление за 10 мин до истечения TTL
         notify_delay = config.FILE_TTL_SECONDS - 600
         if notify_delay > 60:
-            asyncio.create_task(_notify_link_expiry(
-                ctx.bot, query.message.chat_id, title, info_url, token, notify_delay
-            ))
+            asyncio.create_task(
+                _notify_link_expiry(ctx.bot, query.message.chat_id, title, info_url, token, notify_delay),
+                name=f"link_expiry_{query.message.chat_id}",
+            )
 
         try:
             await query.edit_message_text(
                 f"🔗 <b>Ссылка для скачивания ({via_label}):</b>\n"
-                f"<a href='{info_url}'>{info_url}</a>\n\n"
+                f"<a href='{_esc(info_url)}'>{_esc(info_url)}</a>\n\n"
                 f"📦 {_human_size(file_size)}\n"
                 f"⏱ Действует <b>{ttl_h} ч</b> (удаляется после первого скачивания)\n\n"
                 + _caption,
@@ -1589,6 +1952,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
                 db.save_session(
                     query.message.chat_id, query.message.message_id,
                     url, _serialize_video_info(info),
+                    user_id=query.from_user.id,
                 )
             except Exception:
                 pass
@@ -1598,12 +1962,12 @@ async def _handle_deliver_callback(query, ctx, data: str):
         # ── Доставка через Telegram ──────────────────────────────────────────────
         if not entry or not entry.path.exists():
             await query.answer("❌ Файл недоступен (истёк TTL). Скачайте заново.", show_alert=True)
-            ctx.user_data.pop("_pending_delivery", None)
+            deliveries.pop(cb_dl_id, None)
             return
 
         # Снимаем с учёта файлового сервера ДО отправки (чтобы TTL-cleanup не удалил файл)
         fileserver.unregister(token, delete_file=False)
-        ctx.user_data.pop("_pending_delivery", None)
+        deliveries.pop(cb_dl_id, None)
 
         result = DownloadResult(
             success=True,
@@ -1621,7 +1985,17 @@ async def _handle_deliver_callback(query, ctx, data: str):
             pass
 
         await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
-        await _deliver_file_with_progress(query.message.chat_id, result, ctx.bot, query.message)
+        try:
+            await _deliver_file_with_progress(query.message.chat_id, result, ctx.bot, query.message)
+        except Exception as e:
+            logger.error("Telegram delivery failed, cleaning up: %s", e)
+            entry.path.unlink(missing_ok=True)
+            try:
+                entry.path.parent.rmdir()
+            except OSError:
+                pass
+            await query.answer("❌ Не удалось отправить файл. Скачайте заново.", show_alert=True)
+            return
 
         # Удаляем директорию файлового сервера (файл удалён _deliver_file)
         try:
@@ -1645,6 +2019,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
                 db.save_session(
                     query.message.chat_id, query.message.message_id,
                     url, _serialize_video_info(info),
+                    user_id=query.from_user.id,
                 )
             except Exception:
                 pass
@@ -1659,15 +2034,15 @@ async def _handle_playlist_callback(query, ctx, data: str):
     except (IndexError, ValueError):
         await query.answer("❌ Некорректный запрос.", show_alert=True)
         return
+    # SEC: callback_data is user-controllable, clamp max_items
+    max_items = max(1, min(max_items, config.MAX_PLAYLIST_ITEMS))
     audio_only = quality == "audio"
 
-    info: VideoInfo = ctx.user_data.get(KEY_VIDEO_INFO)
-    url = ctx.user_data.get(KEY_PENDING_URL)
+    user = query.from_user
+    info, url = _restore_session(ctx, query.message.chat_id, query.message.message_id, user_id=user.id)
     if not info or not url:
         await query.edit_message_text("❌ Сессия истекла.")
         return
-
-    user = query.from_user
     dl_id = db.add_download(user.id, url)
 
     await query.edit_message_text(
@@ -1686,6 +2061,15 @@ async def _handle_playlist_callback(query, ctx, data: str):
             max_items=max_items,
         )
 
+        # Re-auth: проверяем, не забанили ли пользователя во время загрузки плейлиста
+        if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
+            logger.info("User %s was banned/revoked during playlist download %d", user.id, dl_id)
+            await ctx.bot.send_message(
+                query.message.chat_id,
+                "🚫 Ваш доступ был отозван. Файлы не будут доставлены.",
+            )
+            return
+
         sent = 0
         skipped = 0
         fs_links: list[tuple[str, str, str]] = []  # (title, size_str, url)
@@ -1697,16 +2081,22 @@ async def _handle_playlist_callback(query, ctx, data: str):
                         # Файловый сервер включён — регистрируем файл и собираем ссылки.
                         # move_and_register перемещает файл из tmp_dir → папку fileserver,
                         # поэтому shutil.rmtree в finally не затронет его.
-                        _pl_base = config.DIRECT_BASE_URL or config.PUBLIC_BASE_URL
                         try:
                             token = fileserver.move_and_register(
                                 r.file_path, config.FILE_TTL_SECONDS
                             )
-                            info_url = f"{_pl_base}/info/{token}"
+                            # Собираем ссылки через все доступные каналы
+                            item_links: dict[str, str] = {}
+                            if config.DIRECT_BASE_URL:
+                                item_links["server"] = f"{config.DIRECT_BASE_URL}/info/{token}"
+                            if config.PUBLIC_BASE_URL:
+                                item_links["cf"] = f"{config.PUBLIC_BASE_URL}/info/{token}"
+                            if config.RELAY_BASE_URL:
+                                item_links["relay"] = f"{config.RELAY_BASE_URL}/info/{token}"
                             fs_links.append((
                                 r.title or r.file_path.stem,
                                 _human_size(r.file_size),
-                                info_url,
+                                item_links,
                             ))
                         except Exception as fs_err:
                             logger.warning("fileserver playlist item failed: %s — fallback to TG", fs_err)
@@ -1722,8 +2112,20 @@ async def _handle_playlist_callback(query, ctx, data: str):
         if fs_links:
             ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
             lines = [f"🔗 <b>Ссылки для скачивания</b> (действуют {ttl_h} ч):\n"]
-            for i, (title, size_str, link_url) in enumerate(fs_links, 1):
-                lines.append(f"{i}. <a href='{link_url}'>{_esc(title[:60])}</a>  {size_str}")
+            for i, (title, size_str, item_links) in enumerate(fs_links, 1):
+                # Основная ссылка (первая доступная)
+                primary_url = next(iter(item_links.values()))
+                lines.append(f"{i}. <a href='{primary_url}'>{_esc(title[:60])}</a>  {size_str}")
+                # Дополнительные каналы доставки
+                alt_parts: list[str] = []
+                if "server" in item_links:
+                    alt_parts.append(f"<a href='{item_links['server']}'>сервер</a>")
+                if "cf" in item_links:
+                    alt_parts.append(f"<a href='{item_links['cf']}'>CF</a>")
+                if "relay" in item_links:
+                    alt_parts.append(f"<a href='{item_links['relay']}'>relay</a>")
+                if len(alt_parts) > 1:
+                    lines.append(f"   └ {' | '.join(alt_parts)}")
             await ctx.bot.send_message(
                 query.message.chat_id,
                 "\n".join(lines),
@@ -1785,10 +2187,14 @@ async def _deliver_file(chat_id: int, result: DownloadResult, bot: Bot, keep_fil
                 fp.unlink(missing_ok=True)
             return
         except TelegramError as exc:
-            if "stat" not in str(exc).lower() and "bad request" not in str(exc).lower():
+            exc_lower = str(exc).lower()
+            # Если ошибка связана с доступом к файлу (stat, path, bad request) —
+            # fallback на прямую загрузку через multipart (бот читает файл сам).
+            # Иначе пробрасываем (ошибка сети, невалидный токен и т.д.)
+            if not any(kw in exc_lower for kw in ("stat", "bad request", "find", "path", "file")):
                 raise
             logger.warning(
-                "_deliver_file: local API stat() failed (%s), falling back to direct upload", exc
+                "_deliver_file: local API can't access file (%s), falling back to direct upload", exc
             )
             # Продолжаем ниже — читаем файл и шлём как multipart
 
@@ -1855,13 +2261,13 @@ async def _deliver_file_with_progress(
 
 @require_admin
 async def cmd_pending(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    rows = db.pending_users()
+    rows = db.get_pending_users()
     if not rows:
         await update.message.reply_text("✅ Заявок на доступ нет.")
         return
 
     for row in rows:
-        uname = f"@{row['username']}" if row['username'] else "(нет username)"
+        uname = f"@{_esc(row['username'])}" if row['username'] else "(нет username)"
         text = (
             f"👤 <b>{_esc(row['full_name'])}</b> {uname}\n"
             f"🆔 <code>{row['user_id']}</code>\n"
@@ -1883,8 +2289,8 @@ async def cmd_users(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = [f"👥 <b>Одобренные пользователи ({len(rows)}):</b>\n"]
     for r in rows:
-        uname = f"@{r['username']}" if r['username'] else _esc(r['full_name'])  # LOW-4
-        admin_tag = " 👑" if r['is_admin'] else ""
+        uname = f"@{_esc(r['username'])}" if r['username'] else _esc(r['full_name'])
+        admin_tag = " 👑" if r['user_id'] in config.ADMIN_IDS else ""
         lines.append(f"• {uname} <code>{r['user_id']}</code>{admin_tag}")
 
     await update.message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
@@ -1910,11 +2316,6 @@ async def cmd_unban(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _admin_user_action(update, ctx, "unban")
 
 
-@require_admin
-async def cmd_addadmin(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _admin_user_action(update, ctx, "addadmin")
-
-
 async def _admin_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, action: str):
     args = ctx.args
     if not args:
@@ -1925,6 +2326,11 @@ async def _admin_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, act
         target_id = int(args[0])
     except ValueError:
         await update.message.reply_text("Некорректный user ID.")
+        return
+
+    # Защита суперадминов: нельзя банить/отклонять/разбанивать суперадмина
+    if action in ("ban", "deny", "unban") and target_id in config.ADMIN_IDS:
+        await update.message.reply_text("🚫 Нельзя выполнить это действие над суперадминистратором.")
         return
 
     if action == "approve":
@@ -1944,9 +2350,6 @@ async def _admin_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, act
     elif action == "unban":
         ok = db.unban_user(target_id)
         msg = f"✅ Пользователь {target_id} разблокирован." if ok else "Пользователь не найден."
-    elif action == "addadmin":
-        ok = db.set_admin(target_id, True)
-        msg = f"👑 Пользователь {target_id} назначен администратором." if ok else "Пользователь не найден."
     else:
         msg = "Неизвестное действие."
 
@@ -2024,18 +2427,20 @@ def _schedule_delete(bot, chat_id: int, message_id: int, delay: int = 0) -> None
         except TelegramError:
             pass  # уже удалено или нет прав
 
-    asyncio.create_task(_do_delete())
+    asyncio.create_task(_do_delete(), name=f"auto_delete_{chat_id}_{message_id}")
 
 
 def _human_size(n) -> str:
     if not n:
         return "0 Б"
-    n = int(n)
+    size = float(int(n))
     for unit in ("Б", "КБ", "МБ", "ГБ", "ТБ"):
-        if n < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} ПБ"
+        if size < 1024:
+            if unit == "Б":
+                return f"{int(size)} Б"
+            return f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} ПБ"
 
 
 def _fmt_num(n: int) -> str:
@@ -2143,9 +2548,11 @@ async def _post_shutdown(application) -> None:
 
 
 async def _cleanup_job() -> None:
-    """Каждый час: удаляет файлы и данные старше 2 часов."""
-    removed_dirs = 0
-    cutoff_ts = datetime.now().timestamp() - 7200  # 2 часа
+    """Каждый час: удаляет файлы старше FILE_TTL и данные."""
+    removed = 0
+    # Используем TTL из конфига (минимум 2 часа, чтобы не удалять активные загрузки)
+    ttl = max(config.FILE_TTL_SECONDS, 7200)
+    cutoff_ts = datetime.now().timestamp() - ttl
 
     if config.DOWNLOAD_DIR.exists():
         for item in config.DOWNLOAD_DIR.iterdir():
@@ -2158,17 +2565,25 @@ async def _cleanup_job() -> None:
                         shutil.rmtree(item, ignore_errors=True)
                     else:
                         item.unlink(missing_ok=True)
-                    removed_dirs += 1
+                    removed += 1
             except Exception:
                 pass
+        # Удаляем пустые user_* директории
+        for item in config.DOWNLOAD_DIR.iterdir():
+            if item.name.startswith("user_") and item.is_dir():
+                try:
+                    item.rmdir()  # rmdir only succeeds if empty
+                except OSError:
+                    pass
 
-    old_sessions = db.cleanup_old_sessions(max_age_hours=2)
+    ttl_hours = max(1, ttl // 3600)
+    old_sessions = db.cleanup_old_sessions(max_age_hours=ttl_hours)
     old_history  = db.cleanup_old_history(max_age_days=30)
 
-    if removed_dirs or old_sessions or old_history:
+    if removed or old_sessions or old_history:
         logger.info(
             "Очистка: файлов/папок=%d, сессий=%d, истории=%d",
-            removed_dirs, old_sessions, old_history,
+            removed, old_sessions, old_history,
         )
 
 
@@ -2182,12 +2597,31 @@ def main():
 
     # Маскируем токен в логах — должно быть первым делом
     _mask = _TokenMaskFilter(config.BOT_TOKEN)
+    _fmt = _TokenMaskFormatter(
+        config.BOT_TOKEN,
+        fmt="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
     logging.root.addFilter(_mask)
     for _h in logging.root.handlers:
         _h.addFilter(_mask)
+        _h.setFormatter(_fmt)
+    # httpx (используется python-telegram-bot) логирует URL с токеном —
+    # добавляем фильтр напрямую на его логгер и все дочерние
+    for _name in ("httpx", "httpcore", "telegram"):
+        _lg = logging.getLogger(_name)
+        _lg.addFilter(_mask)
+        for _h2 in _lg.handlers:
+            _h2.addFilter(_mask)
+            _h2.setFormatter(_fmt)
 
     db.init_db()
     config.DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Сбрасываем зависшие загрузки (pending/downloading) от прошлого запуска
+    stale = db.cleanup_stale_downloads()
+    if stale:
+        logger.info("Сброшено зависших загрузок: %d", stale)
 
     # Синхронизируем права администраторов с текущим ADMIN_IDS в .env
     # Если кто-то убран из ADMIN_IDS — теряет флаг is_admin в БД
@@ -2258,7 +2692,6 @@ def main():
     app.add_handler(CommandHandler("deny", cmd_deny))
     app.add_handler(CommandHandler("ban", cmd_ban))
     app.add_handler(CommandHandler("unban", cmd_unban))
-    app.add_handler(CommandHandler("addadmin", cmd_addadmin))
     app.add_handler(CommandHandler("stats", cmd_stats))
 
     # URL-сообщения

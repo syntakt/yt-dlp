@@ -8,7 +8,8 @@ set -e
 umask 0022
 
 # ── Права на смонтированных томах (нужны root-права, только здесь) ────────────
-chown -R botuser:botuser /downloads /data 2>/dev/null || true
+# chown только корневые директории (без -R): на большом /downloads -R медленный
+chown botuser:botuser /downloads /data 2>/dev/null || true
 
 # ── Quick Tunnel: подставляем URL если PUBLIC_BASE_URL не задан вручную ────────
 # Схема: cf-entrypoint.sh пишет URL в /cf-url/public_url после старта тоннеля.

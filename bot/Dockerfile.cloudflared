@@ -8,7 +8,7 @@ FROM alpine:latest
 RUN apk add --no-cache ca-certificates
 
 COPY --from=cloudflared-src /usr/local/bin/cloudflared /usr/local/bin/cloudflared
-COPY cf-entrypoint.sh /cf-entrypoint.sh
+COPY bot/cf-entrypoint.sh /cf-entrypoint.sh
 RUN chmod +x /cf-entrypoint.sh
 
 ENTRYPOINT ["/bin/sh", "/cf-entrypoint.sh"]

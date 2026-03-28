@@ -34,9 +34,9 @@ services:
     build:
       # Локальная сборка из локального исходного кода.
       # yt-dlp устанавливается из репозитория (yt_dlp/ + pyproject.toml), НЕ из PyPI.
-      # Обновление: git pull && docker compose build && docker compose up -d
-      context: .
-      dockerfile: Dockerfile
+      # Обновление: git pull && cd bot && ./deploy.sh
+      context: ..
+      dockerfile: bot/Dockerfile
       args:
         # Опционально: точный коммит бота. Без этого — RELEASE_GIT_HEAD из yt_dlp/version.py.
         GIT_COMMIT: "${GIT_COMMIT:-}"
@@ -129,8 +129,8 @@ services:
     # Собираем свой: берём бинарник из scratch-образа, кладём в alpine + наш скрипт.
     # Dockerfile.cloudflared использует multi-stage build.
     build:
-      context: .
-      dockerfile: Dockerfile.cloudflared
+      context: ..
+      dockerfile: bot/Dockerfile.cloudflared
     image: yt-dlp-cloudflared   # кэшируем под именем, чтобы не пересобирать каждый раз
     container_name: cloudflared
     restart: unless-stopped
@@ -202,8 +202,8 @@ services:
   nginx-ssl:
     profiles: ["ssl"]
     build:
-      context: .
-      dockerfile: Dockerfile.nginx
+      context: ..
+      dockerfile: bot/Dockerfile.nginx
     image: yt-dlp-nginx-ssl
     container_name: nginx-ssl
     restart: unless-stopped
@@ -239,6 +239,7 @@ services:
 
 networks:
   botnet:
+    name: ytdlp-botnet
     driver: bridge
     ipam:
       config:
@@ -249,7 +250,11 @@ volumes:
   # Quick tunnel: cf-entrypoint.sh пишет URL → entrypoint.sh читает и экспортирует.
   # Named tunnel: том примонтирован, но не используется (PUBLIC_BASE_URL из .env).
   cf-url:
+    name: ytdlp-cf-url
   # nginx-ssl: TLS-сертификаты и Let's Encrypt данные
   nginx-ssl-certs:
+    name: ytdlp-nginx-ssl-certs
   nginx-le-data:
+    name: ytdlp-nginx-le-data
   nginx-webroot:
+    name: ytdlp-nginx-webroot
