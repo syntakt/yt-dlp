@@ -4,7 +4,7 @@ import logging
 import os
 import re
 import socket
-import tempfile
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -449,9 +449,15 @@ async def download_video(
                         filename = Path(ydl.prepare_filename(info))
                 result_holder["file_path"] = Path(filename)
         except _DownloadCancelled:
-            # Отмена пользователем — не логируем как ошибку
+            # Отмена пользователем — не логируем как ошибку.
+            # Safety net: _DownloadCancelled is a BaseException and must
+            # never escape into the executor / event-loop machinery.
             result_holder["error"] = "CANCELLED"
         except Exception as e:
+            result_holder["error"] = str(e)
+        except BaseException as e:
+            # Safety net: catch any other BaseException (e.g. KeyboardInterrupt)
+            # so it doesn't leak out of the executor thread.
             result_holder["error"] = str(e)
 
     try:
@@ -470,10 +476,14 @@ async def download_video(
     if cancel_flag and cancel_flag[0]:
         return DownloadResult(success=False, error="CANCELLED")
 
+    _MEDIA_EXTS = {".mp4", ".mp3", ".opus", ".wav", ".webm", ".mkv", ".m4a", ".flac", ".ogg", ".avi", ".mov", ".aac"}
+
     file_path: Path = result_holder.get("file_path")
     if not file_path or not file_path.exists():
-        # Try to find the downloaded file
-        candidates = sorted(output_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        # Try to find the downloaded file, preferring known media extensions
+        all_candidates = sorted(output_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        media_candidates = [p for p in all_candidates if p.suffix.lower() in _MEDIA_EXTS]
+        candidates = media_candidates if media_candidates else all_candidates
         if candidates:
             file_path = candidates[0]
         else:
@@ -542,7 +552,14 @@ async def download_playlist(
         except Exception as e:
             error_holder["error"] = str(e)
 
-    await loop.run_in_executor(None, _download)
+    timeout = DOWNLOAD_TIMEOUT * max(1, max_items)
+    try:
+        await asyncio.wait_for(
+            loop.run_in_executor(None, _download),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        return [DownloadResult(success=False, error="Playlist download timed out")]
 
     # Если плейлист не скачал ни одного файла и была ошибка — пробрасываем
     if error_holder.get("error") and not any(output_dir.iterdir()):
@@ -577,6 +594,7 @@ def _height_from_fid(format_id: str) -> int:
     return int(m.group(1)) if m else 9999
 
 
+_EXTRACTORS_LOCK = threading.Lock()
 _EXTRACTORS: list | None = None
 
 
@@ -622,7 +640,9 @@ def is_supported_url(url: str) -> bool:
         logger.warning("Blocked SSRF attempt: %s", url)
         return False
     if _EXTRACTORS is None:
-        _EXTRACTORS = list(yt_dlp.extractor.gen_extractors())
+        with _EXTRACTORS_LOCK:
+            if _EXTRACTORS is None:
+                _EXTRACTORS = list(yt_dlp.extractor.gen_extractors())
     for e in _EXTRACTORS:
         if e.suitable(url) and e.IE_NAME != "generic":
             return True

@@ -32,7 +32,7 @@ def init_db() -> None:
     with get_connection() as conn:
         # WAL: читатели не блокируют писателей при параллельных загрузках
         conn.execute("PRAGMA journal_mode=WAL")
-        conn.executescript("""
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id     INTEGER PRIMARY KEY,
                 username    TEXT,
@@ -44,8 +44,10 @@ def init_db() -> None:
                 approved_at TEXT,
                 approved_by INTEGER,
                 notes       TEXT
-            );
+            )
+        """)
 
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS download_history (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id     INTEGER NOT NULL,
@@ -59,17 +61,21 @@ def init_db() -> None:
                 created_at  TEXT NOT NULL,
                 finished_at TEXT,
                 FOREIGN KEY (user_id) REFERENCES users(user_id)
-            );
+            )
+        """)
 
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS stats (
                 key   TEXT PRIMARY KEY,
                 value TEXT NOT NULL
-            );
+            )
+        """)
 
-            CREATE INDEX IF NOT EXISTS idx_history_user ON download_history(user_id);
-            CREATE INDEX IF NOT EXISTS idx_history_status ON download_history(status);
-            CREATE INDEX IF NOT EXISTS idx_history_created ON download_history(created_at);
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_user ON download_history(user_id)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_status ON download_history(status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_history_created ON download_history(created_at)")
 
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS sessions (
                 chat_id         INTEGER NOT NULL,
                 message_id      INTEGER NOT NULL,
@@ -78,10 +84,11 @@ def init_db() -> None:
                 video_info_json TEXT NOT NULL,
                 created_at      TEXT,
                 PRIMARY KEY (chat_id, message_id)
-            );
-
-            CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at);
+            )
         """)
+
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
         # Миграция: добавляем user_id в sessions если его нет (существующие БД)
         cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
         if "user_id" not in cols:
@@ -272,18 +279,12 @@ def save_session(chat_id: int, message_id: int, url: str, video_info_json: str, 
         """, (chat_id, message_id, user_id, url, video_info_json, datetime.now(timezone.utc).isoformat()))
 
 
-def get_session(chat_id: int, message_id: int, user_id: int = 0) -> Optional[dict]:
+def get_session(chat_id: int, message_id: int, user_id: int) -> Optional[dict]:
     with get_connection() as conn:
-        if user_id:
-            row = conn.execute(
-                "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=? AND user_id=?",
-                (chat_id, message_id, user_id)
-            ).fetchone()
-        else:
-            row = conn.execute(
-                "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=?",
-                (chat_id, message_id)
-            ).fetchone()
+        row = conn.execute(
+            "SELECT url, video_info_json FROM sessions WHERE chat_id=? AND message_id=? AND user_id=?",
+            (chat_id, message_id, user_id)
+        ).fetchone()
         return dict(row) if row else None
 
 

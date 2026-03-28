@@ -10,7 +10,6 @@ import os
 import re
 import shutil
 import sqlite3
-import tempfile
 import time
 import traceback
 from dataclasses import asdict
@@ -296,7 +295,7 @@ def _get_bot_version() -> str:
     commit = os.environ.get("GIT_COMMIT", "")
     if not commit or commit == "dev":
         try:
-            commit = open(os.path.join(os.path.dirname(__file__) or ".", ".git_commit")).read().strip()
+            commit = Path(os.path.dirname(__file__) or ".").joinpath(".git_commit").read_text().strip()
         except Exception:
             pass
     if not commit or commit == "dev":
@@ -342,6 +341,8 @@ def _build_main_menu(user_obj) -> tuple[str, InlineKeyboardMarkup]:
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_message:
+        return
     user = update.effective_user
     db.upsert_user(user.id, user.username, user.full_name)
 
@@ -354,7 +355,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except TelegramError:
                 pass
         text, keyboard = _build_main_menu(user)
-        sent = await update.message.reply_text(
+        sent = await update.effective_message.reply_text(
             text,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
@@ -363,7 +364,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
         # Удаляем само сообщение /start чтобы не засорять чат
         try:
-            await update.message.delete()
+            await update.effective_message.delete()
         except TelegramError:
             pass
     else:
@@ -1450,10 +1451,7 @@ async def _handle_download_callback(query, ctx, data: str):
         await query.answer("❌ Некорректный тип загрузки.", show_alert=True)
         return
 
-    sem: asyncio.Semaphore = ctx.bot_data.get("_download_sem")
-    if sem is None:
-        sem = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
-        ctx.bot_data["_download_sem"] = sem
+    sem: asyncio.Semaphore = ctx.bot_data["_download_sem"]
 
     # Restore session: DB first (correct for multi-URL), fallback to user_data.
     user = query.from_user
@@ -1851,7 +1849,7 @@ async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str,
             await bot.send_message(
                 chat_id,
                 f"⏰ <b>Ссылка истекает через 10 минут:</b>\n"
-                f"<a href='{_esc(info_url)}'>{_esc(title[:60])}</a>\n\n"
+                f'<a href="{_html.escape(info_url, quote=True)}">{_esc(title[:60])}</a>\n\n'
                 "Успейте скачать!",
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
@@ -1936,7 +1934,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
         try:
             await query.edit_message_text(
                 f"🔗 <b>Ссылка для скачивания ({via_label}):</b>\n"
-                f"<a href='{_esc(info_url)}'>{_esc(info_url)}</a>\n\n"
+                f'<a href="{_html.escape(info_url, quote=True)}">{_esc(info_url)}</a>\n\n'
                 f"📦 {_human_size(file_size)}\n"
                 f"⏱ Действует <b>{ttl_h} ч</b> (удаляется после первого скачивания)\n\n"
                 + _caption,
@@ -2115,15 +2113,15 @@ async def _handle_playlist_callback(query, ctx, data: str):
             for i, (title, size_str, item_links) in enumerate(fs_links, 1):
                 # Основная ссылка (первая доступная)
                 primary_url = next(iter(item_links.values()))
-                lines.append(f"{i}. <a href='{primary_url}'>{_esc(title[:60])}</a>  {size_str}")
+                lines.append(f'{i}. <a href="{_html.escape(primary_url, quote=True)}">{_esc(title[:60])}</a>  {size_str}')
                 # Дополнительные каналы доставки
                 alt_parts: list[str] = []
                 if "server" in item_links:
-                    alt_parts.append(f"<a href='{item_links['server']}'>сервер</a>")
+                    alt_parts.append(f'<a href="{_html.escape(item_links["server"], quote=True)}">сервер</a>')
                 if "cf" in item_links:
-                    alt_parts.append(f"<a href='{item_links['cf']}'>CF</a>")
+                    alt_parts.append(f'<a href="{_html.escape(item_links["cf"], quote=True)}">CF</a>')
                 if "relay" in item_links:
-                    alt_parts.append(f"<a href='{item_links['relay']}'>relay</a>")
+                    alt_parts.append(f'<a href="{_html.escape(item_links["relay"], quote=True)}">relay</a>')
                 if len(alt_parts) > 1:
                     lines.append(f"   └ {' | '.join(alt_parts)}")
             await ctx.bot.send_message(
@@ -2380,7 +2378,7 @@ async def error_handler(update: object, ctx: ContextTypes.DEFAULT_TYPE):
 # ── Утилиты ──────────────────────────────────────────────────────────────────────
 
 def _esc(text: str) -> str:
-    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+    return _html.escape(str(text))
 
 
 _LOGIN_REQUIRED_HINTS = (
@@ -2552,7 +2550,7 @@ async def _cleanup_job() -> None:
     removed = 0
     # Используем TTL из конфига (минимум 2 часа, чтобы не удалять активные загрузки)
     ttl = max(config.FILE_TTL_SECONDS, 7200)
-    cutoff_ts = datetime.now().timestamp() - ttl
+    cutoff_ts = time.time() - ttl
 
     if config.DOWNLOAD_DIR.exists():
         for item in config.DOWNLOAD_DIR.iterdir():

@@ -30,8 +30,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+from urllib.parse import quote as _urlquote
 
 from aiohttp import web
+
+from config import SERVER_SECRET as _SERVER_SECRET_STR
 
 logger = logging.getLogger(__name__)
 
@@ -39,7 +42,7 @@ logger = logging.getLogger(__name__)
 
 # Секрет для HMAC-подписи токенов (задаётся в .env как SERVER_SECRET).
 # Если не задан — токены без подписи (UUID4 = 122 бит энтропии, всё ещё безопасно).
-_SERVER_SECRET: bytes = os.environ.get("SERVER_SECRET", "").encode()
+_SERVER_SECRET: bytes = _SERVER_SECRET_STR.encode()
 
 # Максимум запросов с одного IP в минуту (защита от сканирования)
 _RATE_LIMIT: int = int(os.environ.get("FS_RATE_LIMIT", "30"))
@@ -97,7 +100,9 @@ def _verify_token(token: str) -> Optional[str]:
         if len(token) != 32:
             return None
         # Только hex-символы
-        if not all(c in "0123456789abcdef" for c in token):
+        try:
+            int(token, 16)
+        except ValueError:
             return None
         return token
 
@@ -106,11 +111,13 @@ def _verify_token(token: str) -> Optional[str]:
 
 def register_file(path: Path, ttl_seconds: int = 3600) -> str:
     """Регистрирует уже существующий файл. Возвращает full_token."""
+    if not path.exists():
+        raise FileNotFoundError(f"Cannot register non-existent file: {path}")
     uuid_key, full_token = _make_token()
     _registry[uuid_key] = FileEntry(
         path=path,
         filename=path.name,
-        file_size=path.stat().st_size if path.exists() else 0,
+        file_size=path.stat().st_size,
         expires_at=time.time() + ttl_seconds,
     )
     logger.info("Зарегистрирован '%s' → %s… (TTL=%ds)", path.name, uuid_key[:8], ttl_seconds)
@@ -257,6 +264,7 @@ _SEC_HEADERS = {
     "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store, no-cache, must-revalidate",
     "X-Robots-Tag": "noindex, nofollow",
+    "Content-Security-Policy": "default-src 'none'; style-src 'unsafe-inline'",
 }
 
 # ── HTML info page ───────────────────────────────────────────────────────────────
@@ -406,7 +414,6 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
     _clean = _sanitize_header_value(entry.filename)
     ascii_name = _clean.encode("ascii", errors="replace").decode().replace('"', "_")
     utf8_name = _clean.replace("\\", "").replace('"', "")
-    from urllib.parse import quote as _urlquote
     content_disposition = (
         f'attachment; filename="{ascii_name}"; '
         f"filename*=UTF-8''{_urlquote(utf8_name, safe='')}"
@@ -422,6 +429,7 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
     )
     await response.prepare(request)
 
+    real_path = entry.path
     downloaded_ok = False
     try:
         with entry.path.open("rb") as fh:
@@ -432,22 +440,35 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
                 await response.write(chunk)
         await response.write_eof()
         downloaded_ok = True
-    except (ConnectionResetError, asyncio.CancelledError):
+    except ConnectionResetError:
         logger.warning("Соединение прервано при отдаче '%s' клиенту %s", entry.filename, ip)
+        try:
+            real_path.unlink(missing_ok=True)
+            real_path.parent.rmdir()
+        except OSError:
+            pass
+        return response
+    except asyncio.CancelledError:
+        logger.warning("Запрос отменён при отдаче '%s' клиенту %s", entry.filename, ip)
+        try:
+            real_path.unlink(missing_ok=True)
+            real_path.parent.rmdir()
+        except OSError:
+            pass
         return response
     except Exception as e:
         logger.error("Ошибка при отдаче '%s': %s", entry.filename, e)
+        try:
+            real_path.unlink(missing_ok=True)
+            real_path.parent.rmdir()
+        except OSError:
+            pass
         return response
 
-    # Удаляем файл с диска после стриминга (из реестра уже вынули в начале).
-    # Если соединение прервалось — файл всё равно удаляется: токен уже недействителен,
-    # пользователь должен запросить новую ссылку в боте.
+    # Удаляем файл с диска после успешного стриминга (из реестра уже вынули в начале).
     entry.path.unlink(missing_ok=True)
     _rmdir_safe(entry.path.parent)
-    if downloaded_ok:
-        logger.info("Файл '%s' успешно отдан клиенту %s и удалён", entry.filename, ip)
-    else:
-        logger.warning("Файл '%s' удалён (соединение прервано клиентом %s)", entry.filename, ip)
+    logger.info("Файл '%s' успешно отдан клиенту %s и удалён", entry.filename, ip)
 
     return response
 
