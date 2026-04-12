@@ -33,7 +33,12 @@ http {
     # ── Rate limiting: per IP (совпадает с fileserver) ────────────────────────
     limit_req_zone $binary_remote_addr zone=info:10m rate=30r/m;
     limit_req_zone $binary_remote_addr zone=dl:10m   rate=30r/m;
+    limit_req_zone $binary_remote_addr zone=health:1m rate=10r/m;
     limit_req_status 429;
+
+    # ── Connection limiting: защита от Slowloris ─────────────────────────────
+    limit_conn_zone $binary_remote_addr zone=perip:10m;
+    limit_conn_status 429;
 
     # ── Upstream ──────────────────────────────────────────────────────────────
     upstream fileserver {
@@ -103,10 +108,15 @@ http {
         add_header Referrer-Policy          "no-referrer" always;
         add_header X-Robots-Tag             "noindex, nofollow" always;
         add_header Content-Security-Policy  "default-src 'none'; style-src 'unsafe-inline'" always;
+        add_header Permissions-Policy      "camera=(), microphone=(), geolocation=(), payment=()" always;
+
+        # Скрыть заголовки upstream, раскрывающие стек
+        proxy_hide_header X-Powered-By;
 
         # ── /info/ — страница с кнопкой скачивания (rate limited) ─────────
         location /info/ {
-            limit_req zone=info burst=10 nodelay;
+            limit_req  zone=info burst=10 nodelay;
+            limit_conn perip 10;
 
             proxy_pass         http://fileserver;
             proxy_http_version 1.1;
@@ -119,7 +129,8 @@ http {
 
         # ── /dl/ — стриминг файла (одноразовый токен + rate limit от сканирования)
         location /dl/ {
-            limit_req zone=dl burst=10 nodelay;
+            limit_req  zone=dl burst=10 nodelay;
+            limit_conn perip 5;
 
             proxy_pass         http://fileserver;
             proxy_http_version 1.1;
@@ -136,8 +147,11 @@ http {
             proxy_send_timeout      300s;
         }
 
-        # ── Health check ──────────────────────────────────────────────────
+        # ── Health check (rate limited, без раскрытия стека) ────────────
         location = /health {
+            limit_req  zone=health burst=5 nodelay;
+            limit_conn perip 5;
+
             proxy_pass         http://fileserver;
             proxy_http_version 1.1;
         }

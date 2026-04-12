@@ -33,16 +33,18 @@ if [ -z "$DOMAIN" ]; then
     exit 1
 fi
 
-# Защита от частой ошибки: порт в SSLIP_DOMAIN (должен быть только домен)
+# Строгая валидация DOMAIN: только буквы, цифры, точки, дефисы.
+# Предотвращает инъекцию директив nginx через envsubst и инъекцию
+# shell-команд через openssl -subj / certbot deploy-hook.
 case "$DOMAIN" in
-    *:*)
-        echo "[nginx-ssl] FATAL: SSLIP_DOMAIN содержит порт ('$DOMAIN')"
-        echo "[nginx-ssl] Укажите только домен: SSLIP_DOMAIN=150-241-90-145.sslip.io"
-        echo "[nginx-ssl] Порт задаётся отдельно через HTTPS_PORT=${HTTPS_PORT}"
+    *[!a-zA-Z0-9.-]*)
+        echo "[nginx-ssl] FATAL: SSLIP_DOMAIN содержит недопустимые символы ('$DOMAIN')"
+        echo "[nginx-ssl] Допустимы только буквы, цифры, точки и дефисы"
+        echo "[nginx-ssl] Пример: SSLIP_DOMAIN=150-241-90-145.sslip.io"
         exit 1
         ;;
-    */*|*..)
-        echo "[nginx-ssl] FATAL: SSLIP_DOMAIN содержит недопустимые символы ('$DOMAIN')"
+    .* | *. | *..*)
+        echo "[nginx-ssl] FATAL: SSLIP_DOMAIN имеет некорректный формат ('$DOMAIN')"
         exit 1
         ;;
 esac
@@ -60,6 +62,7 @@ echo "[nginx-ssl] Конфигурация: https://${DOMAIN}:${HTTPS_PORT} → 
 if [ -f "$LE_DIR/fullchain.pem" ] && [ -f "$LE_DIR/privkey.pem" ]; then
     cp -f "$LE_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem"
     cp -f "$LE_DIR/privkey.pem"   "$CERT_DIR/privkey.pem"
+    chmod 600 "$CERT_DIR/privkey.pem"
     echo "[nginx-ssl] Let's Encrypt сертификат загружен из volume"
     HAVE_LE=1
 elif [ ! -f "$CERT_DIR/fullchain.pem" ]; then
@@ -69,6 +72,7 @@ elif [ ! -f "$CERT_DIR/fullchain.pem" ]; then
         -keyout "$CERT_DIR/privkey.pem" \
         -out    "$CERT_DIR/fullchain.pem" \
         -subj   "/CN=${DOMAIN}" 2>/dev/null
+    chmod 600 "$CERT_DIR/privkey.pem"
     HAVE_LE=0
     echo "[nginx-ssl] Self-signed cert готов (EC P-256)"
 else
@@ -86,13 +90,6 @@ fi
 # Если порт 80 НЕ маршрутизирован — certbot gracefully fail, бот работает
 # с self-signed сертификатом (шифрование есть, верификация — нет).
 if [ "$ENABLE_CERTBOT" = "true" ]; then
-    # Формируем аргументы certbot
-    if [ -n "$CERTBOT_EMAIL" ]; then
-        CERTBOT_AUTH="--email $CERTBOT_EMAIL --agree-tos --non-interactive"
-    else
-        CERTBOT_AUTH="--agree-tos --register-unsafely-without-email --non-interactive"
-    fi
-
     (
         # Ждём пока nginx стартует
         sleep 5
@@ -100,24 +97,32 @@ if [ "$ENABLE_CERTBOT" = "true" ]; then
         if [ "$HAVE_LE" = "0" ]; then
             echo "[nginx-ssl] Запрашиваю Let's Encrypt сертификат для ${DOMAIN}..."
             echo "[nginx-ssl] (нужен nftables DNAT: порт 80 → 10.10.2.5:80)"
+
+            # Формируем команду certbot без word splitting
             if [ -n "$CERTBOT_EMAIL" ]; then
                 echo "[nginx-ssl] Email: ${CERTBOT_EMAIL}"
+                CERTBOT_RESULT=0
+                certbot certonly --webroot -w "$WEBROOT" \
+                    -d "$DOMAIN" \
+                    --email "$CERTBOT_EMAIL" --agree-tos --non-interactive \
+                    --preferred-challenges http 2>&1 || CERTBOT_RESULT=$?
             else
                 echo "[nginx-ssl] Email: не задан (--register-unsafely-without-email)"
+                CERTBOT_RESULT=0
+                certbot certonly --webroot -w "$WEBROOT" \
+                    -d "$DOMAIN" \
+                    --agree-tos --register-unsafely-without-email --non-interactive \
+                    --preferred-challenges http 2>&1 || CERTBOT_RESULT=$?
             fi
-            if certbot certonly --webroot -w "$WEBROOT" \
-                -d "$DOMAIN" \
-                $CERTBOT_AUTH \
-                --preferred-challenges http 2>&1; then
 
-                if [ -f "$LE_DIR/fullchain.pem" ]; then
-                    cp -f "$LE_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem"
-                    cp -f "$LE_DIR/privkey.pem"   "$CERT_DIR/privkey.pem"
-                    nginx -s reload
-                    echo "[nginx-ssl] ✓ Let's Encrypt сертификат установлен!"
-                    openssl x509 -in "$CERT_DIR/fullchain.pem" -noout \
-                        -subject -issuer -dates 2>/dev/null | sed 's/^/[nginx-ssl]   /'
-                fi
+            if [ "$CERTBOT_RESULT" = "0" ] && [ -f "$LE_DIR/fullchain.pem" ]; then
+                cp -f "$LE_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem"
+                cp -f "$LE_DIR/privkey.pem"   "$CERT_DIR/privkey.pem"
+                chmod 600 "$CERT_DIR/privkey.pem"
+                nginx -s reload
+                echo "[nginx-ssl] ✓ Let's Encrypt сертификат установлен!"
+                openssl x509 -in "$CERT_DIR/fullchain.pem" -noout \
+                    -subject -issuer -dates 2>/dev/null | sed 's/^/[nginx-ssl]   /'
             else
                 echo ""
                 echo "[nginx-ssl] ⚠ certbot не смог получить сертификат"
@@ -137,6 +142,7 @@ if [ "$ENABLE_CERTBOT" = "true" ]; then
             certbot renew --quiet \
                 --deploy-hook "cp -f ${LE_DIR}/fullchain.pem ${CERT_DIR}/fullchain.pem && \
                                cp -f ${LE_DIR}/privkey.pem   ${CERT_DIR}/privkey.pem && \
+                               chmod 600 ${CERT_DIR}/privkey.pem && \
                                nginx -s reload && \
                                echo '[nginx-ssl] Сертификат обновлён'" \
                 2>/dev/null || true
