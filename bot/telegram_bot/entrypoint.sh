@@ -18,7 +18,23 @@ chown botuser:botuser /downloads /data 2>/dev/null || true
 # ждать не нужно.
 CF_URL_FILE="/cf-url/public_url"
 
-if [ -z "$PUBLIC_BASE_URL" ]; then
+cloudflared_enabled() {
+    case "${ENABLE_CLOUDFLARED:-false}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+quick_tunnel_enabled() {
+    case "${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-false}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+if ! cloudflared_enabled; then
+    echo "[entrypoint] ENABLE_CLOUDFLARED=false — Cloudflare Tunnel отключён, Quick Tunnel не используется"
+elif [ -z "$PUBLIC_BASE_URL" ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ] && quick_tunnel_enabled; then
     echo "[entrypoint] PUBLIC_BASE_URL не задан — проверяю Quick Tunnel..."
     # Запоминаем stale URL (если есть), чтобы не принять его за новый
     STALE_URL=""
@@ -71,8 +87,10 @@ if [ -z "$PUBLIC_BASE_URL" ]; then
             echo "[entrypoint] Quick Tunnel URL не найден за 3 мин — файловый сервер отключён (режим Telegram API)"
         fi
     fi
-else
+elif [ -n "$PUBLIC_BASE_URL" ]; then
     echo "[entrypoint] PUBLIC_BASE_URL задан вручную: $PUBLIC_BASE_URL"
+else
+    echo "[entrypoint] PUBLIC_BASE_URL не задан и Quick Tunnel отключён — Cloudflare-ссылки не будут предлагаться"
 fi
 
 if [ -n "$DIRECT_BASE_URL" ]; then

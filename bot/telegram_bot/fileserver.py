@@ -21,6 +21,7 @@
 import asyncio
 import hashlib
 import hmac as _hmac_mod
+import ipaddress
 import logging
 import os
 import shutil
@@ -46,6 +47,23 @@ _SERVER_SECRET: bytes = _SERVER_SECRET_STR.encode()
 
 # Максимум запросов с одного IP в минуту (защита от сканирования)
 _RATE_LIMIT: int = int(os.environ.get("FS_RATE_LIMIT", "30"))
+
+
+def _parse_trusted_proxy_cidrs() -> list[ipaddress._BaseNetwork]:
+    raw = os.environ.get("FS_TRUSTED_PROXY_CIDRS", "10.10.2.0/24,127.0.0.1/32,::1/128")
+    networks: list[ipaddress._BaseNetwork] = []
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            networks.append(ipaddress.ip_network(item, strict=False))
+        except ValueError:
+            logger.warning("Ignoring invalid FS_TRUSTED_PROXY_CIDRS entry: %s", item)
+    return networks
+
+
+_TRUSTED_PROXY_CIDRS = _parse_trusted_proxy_cidrs()
 
 # ── Реестр файлов ────────────────────────────────────────────────────────────────
 
@@ -228,6 +246,28 @@ def _check_rate_limit(ip: str) -> bool:
     return True
 
 
+def _client_ip(request: web.Request) -> str:
+    """Return real client IP; trust forwarded headers only from configured proxies."""
+    remote = request.remote or "unknown"
+    try:
+        remote_ip = ipaddress.ip_address(remote)
+    except ValueError:
+        return remote
+
+    if any(remote_ip in network for network in _TRUSTED_PROXY_CIDRS):
+        forwarded = request.headers.get("X-Real-IP")
+        if not forwarded:
+            forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+        if forwarded:
+            try:
+                ipaddress.ip_address(forwarded)
+                return forwarded
+            except ValueError:
+                logger.warning("Ignoring invalid forwarded client IP: %s", forwarded)
+
+    return remote
+
+
 def _sanitize_header_value(name: str) -> str:
     """Удаляет символы которые могут инжектировать дополнительные HTTP-заголовки.
 
@@ -318,10 +358,7 @@ _INFO_TEMPLATE = """\
 async def _handle_info(request: web.Request) -> web.Response:
     """HTML-страница с информацией о файле и кнопкой «Скачать»."""
     token = request.match_info["token"]
-    # SECURITY: за nginx request.remote — это IP контейнера, а не реального клиента.
-    # Nginx выставляет X-Real-IP = $remote_addr; читаем его для корректного rate-limit.
-    # Поскольку fileserver слушает только внутри Docker-сети, этому заголовку можно доверять.
-    ip = request.headers.get("X-Real-IP") or request.remote or "unknown"
+    ip = _client_ip(request)
 
     if not _check_rate_limit(ip):
         logger.warning("Rate limit exceeded: %s /info/%s…", ip, token[:8])
@@ -370,8 +407,7 @@ async def _handle_info(request: web.Request) -> web.Response:
 async def _handle_download(request: web.Request) -> web.StreamResponse:
     """Стриминг файла клиенту с последующим удалением."""
     token = request.match_info["token"]
-    # SECURITY: используем X-Real-IP от nginx, а не IP Docker-контейнера.
-    ip = request.headers.get("X-Real-IP") or request.remote or "unknown"
+    ip = _client_ip(request)
 
     if not _check_rate_limit(ip):
         logger.warning("Rate limit exceeded: %s /dl/%s…", ip, token[:8])
@@ -427,11 +463,10 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
             **_SEC_HEADERS,
         }
     )
-    await response.prepare(request)
-
     real_path = entry.path
     downloaded_ok = False
     try:
+        await response.prepare(request)
         with entry.path.open("rb") as fh:
             while True:
                 chunk = fh.read(524288)  # 512 KB chunks
@@ -442,33 +477,20 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
         downloaded_ok = True
     except ConnectionResetError:
         logger.warning("Соединение прервано при отдаче '%s' клиенту %s", entry.filename, ip)
-        try:
-            real_path.unlink(missing_ok=True)
-            real_path.parent.rmdir()
-        except OSError:
-            pass
-        return response
     except asyncio.CancelledError:
         logger.warning("Запрос отменён при отдаче '%s' клиенту %s", entry.filename, ip)
-        try:
-            real_path.unlink(missing_ok=True)
-            real_path.parent.rmdir()
-        except OSError:
-            pass
-        return response
     except Exception as e:
         logger.error("Ошибка при отдаче '%s': %s", entry.filename, e)
-        try:
-            real_path.unlink(missing_ok=True)
-            real_path.parent.rmdir()
-        except OSError:
-            pass
-        return response
+    finally:
+        # Токен одноразовый и уже извлечён из реестра. Удаляем файл после любой
+        # первой попытки /dl, включая обрыв соединения и ошибки prepare/write.
+        real_path.unlink(missing_ok=True)
+        _rmdir_safe(real_path.parent)
 
-    # Удаляем файл с диска после успешного стриминга (из реестра уже вынули в начале).
-    entry.path.unlink(missing_ok=True)
-    _rmdir_safe(entry.path.parent)
-    logger.info("Файл '%s' успешно отдан клиенту %s и удалён", entry.filename, ip)
+    if downloaded_ok:
+        logger.info("Файл '%s' успешно отдан клиенту %s и удалён", entry.filename, ip)
+    else:
+        logger.warning("Файл '%s' удалён после неуспешной попытки скачивания клиентом %s", entry.filename, ip)
 
     return response
 

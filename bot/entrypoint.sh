@@ -8,11 +8,27 @@
 
 CF_URL_FILE="/cf-url/public_url"
 
+cloudflared_enabled() {
+    case "${ENABLE_CLOUDFLARED:-false}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+quick_tunnel_enabled() {
+    case "${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-false}" in
+        1|true|TRUE|yes|YES|on|ON) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
 # Автозаполнение PUBLIC_BASE_URL только в quick tunnel режиме:
 # - PUBLIC_BASE_URL пустой (не задан в .env)
 # - CLOUDFLARE_TUNNEL_TOKEN тоже пустой (иначе это named tunnel — URL задаётся вручную)
 # - том /cf-url примонтирован (значит cloudflared используется)
-if [ -z "$PUBLIC_BASE_URL" ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ] && [ -d "/cf-url" ]; then
+if ! cloudflared_enabled; then
+    echo "[bot] ENABLE_CLOUDFLARED=false — Cloudflare Tunnel отключён"
+elif [ -z "$PUBLIC_BASE_URL" ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ] && quick_tunnel_enabled && [ -d "/cf-url" ]; then
     echo "[bot] Quick tunnel mode: ждём URL от cloudflared (max 3 мин)..."
     # Запоминаем stale URL от предыдущего запуска
     STALE_URL=""

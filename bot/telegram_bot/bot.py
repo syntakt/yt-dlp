@@ -530,8 +530,8 @@ def _build_status_text(user_id: int, verbose: bool = True) -> str:
             _channels.append("CF")
         if config.DIRECT_BASE_URL:
             _channels.append("Direct")
-        if config.RELAY_BASE_URL:
-            _channels.append("Relay")
+        if config.RELAY_BASE_URLS:
+            _channels.append(f"Relay x{len(config.RELAY_BASE_URLS)}")
         text += f"• Каналы доставки: {', '.join(_channels) if _channels else 'только Telegram'}\n"
         text += f"• HMAC подпись: {'✓' if config.SERVER_SECRET else '✗'}\n"
         text += f"• Версия: <code>v{BOT_VERSION}</code>"
@@ -694,6 +694,18 @@ def _strip_playlist_param(url: str) -> str:
     params.pop("start_radio", None)
     new_query = urlencode([(k, val) for k, vals in params.items() for val in vals])
     return urlunparse(parsed._replace(query=new_query))
+
+
+def _redact_url_for_storage(url: str) -> str:
+    """Keep history useful without storing credentials, query tokens or fragments."""
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunparse(parsed._replace(netloc=netloc, query="", fragment=""))
+    except Exception:
+        return "<invalid-url>"
 
 
 def _is_youtube_mixed_url(url: str) -> bool:
@@ -1468,7 +1480,7 @@ async def _handle_download_callback(query, ctx, data: str):
     # сбрасываем ключ, чтобы следующий URL не пытался удалить уже изменившееся сообщение.
     ctx.user_data.pop(KEY_QUALITY_MSG, None)
 
-    dl_id = db.add_download(user.id, url)
+    dl_id = db.add_download(user.id, _redact_url_for_storage(url))
     ctx.user_data[KEY_DOWNLOAD_ID] = dl_id
 
     # CRITICAL-3: validate format_id against known formats (allowlist)
@@ -1719,7 +1731,11 @@ async def _handle_download_callback(query, ctx, data: str):
                         pass
                     return
 
-                _has_fileserver = config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL
+                _has_fileserver = (
+                    config.PUBLIC_BASE_URL
+                    or config.DIRECT_BASE_URL
+                    or config.RELAY_BASE_URLS
+                )
                 if _has_fileserver:
                     # Файловый сервер включён — предлагаем выбор доставки
                     try:
@@ -1754,10 +1770,16 @@ async def _handle_download_callback(query, ctx, data: str):
                                 f"🌐 Прямая ссылка с сервера ({ttl_h}ч)",
                                 callback_data=f"deliver:{dl_id}:direct",
                             )])
-                        if config.RELAY_BASE_URL:
+                        for relay_idx, relay_url in enumerate(config.RELAY_BASE_URLS):
+                            relay_host = urlparse(relay_url).netloc or f"relay {relay_idx + 1}"
+                            label = (
+                                f"🔄 Relay-ссылка ({ttl_h}ч)"
+                                if len(config.RELAY_BASE_URLS) == 1
+                                else f"🔄 Relay {relay_idx + 1}: {relay_host[:24]} ({ttl_h}ч)"
+                            )
                             deliver_buttons.append([InlineKeyboardButton(
-                                f"🔄 Relay-ссылка ({ttl_h}ч)",
-                                callback_data=f"deliver:{dl_id}:relay",
+                                label,
+                                callback_data=f"deliver:{dl_id}:relay{relay_idx}",
                             )])
                         await status_msg.edit_text(
                             f"✅ <b>{_esc(result.title or info.title)}</b>\n"
@@ -1870,8 +1892,17 @@ async def _handle_deliver_callback(query, ctx, data: str):
     except ValueError:
         await query.answer("❌ Некорректный запрос.", show_alert=True)
         return
-    action = parts[2]  # "tg", "link", "direct" или "relay"
-    if action not in ("tg", "link", "direct", "relay"):
+    action = parts[2]  # "tg", "link", "direct" или "relay<N>"
+    relay_index: int | None = None
+    if action.startswith("relay"):
+        try:
+            relay_index = int(action.removeprefix("relay") or "0")
+        except ValueError:
+            relay_index = None
+        if relay_index is None or not (0 <= relay_index < len(config.RELAY_BASE_URLS)):
+            await query.answer("❌ Relay-сервер недоступен.", show_alert=True)
+            return
+    elif action not in ("tg", "link", "direct"):
         await query.answer("❌ Некорректный запрос.", show_alert=True)
         return
 
@@ -1903,7 +1934,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
 
     entry = fileserver.get_entry(token)
 
-    if action in ("link", "direct", "relay"):
+    if action in ("link", "direct") or relay_index is not None:
         # ── Доставка через ссылку файлового сервера ──────────────────────────────
         if not entry:
             await query.answer("❌ Файл недоступен (истёк TTL). Скачайте заново.", show_alert=True)
@@ -1914,14 +1945,19 @@ async def _handle_deliver_callback(query, ctx, data: str):
 
         base = (
             config.DIRECT_BASE_URL if action == "direct" else
-            config.RELAY_BASE_URL  if action == "relay"  else
+            config.RELAY_BASE_URLS[relay_index] if relay_index is not None else
             config.PUBLIC_BASE_URL
         )
         info_url = f"{base}/info/{token}"
         ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
         _caption, _keyboard = _build_quality_menu(info)
 
-        via_label = "сервер" if action == "direct" else "relay" if action == "relay" else "Cloudflare"
+        via_label = (
+            "сервер" if action == "direct" else
+            f"relay {relay_index + 1}" if relay_index is not None and len(config.RELAY_BASE_URLS) > 1 else
+            "relay" if relay_index is not None else
+            "Cloudflare"
+        )
 
         # Планируем уведомление за 10 мин до истечения TTL
         notify_delay = config.FILE_TTL_SECONDS - 600
@@ -2041,7 +2077,7 @@ async def _handle_playlist_callback(query, ctx, data: str):
     if not info or not url:
         await query.edit_message_text("❌ Сессия истекла.")
         return
-    dl_id = db.add_download(user.id, url)
+    dl_id = db.add_download(user.id, _redact_url_for_storage(url))
 
     await query.edit_message_text(
         f"⬇️ Загружаю плейлист: <b>{_esc(info.title)}</b>\n"
@@ -2051,13 +2087,22 @@ async def _handle_playlist_callback(query, ctx, data: str):
 
     tmp_dir = config.DOWNLOAD_DIR / f"user_{user.id}" / f"pl_{dl_id}"
     try:
-        from downloader import download_playlist
-        results = await download_playlist(
-            url=url,
-            format_id="bestaudio" if audio_only else "best",
-            output_dir=tmp_dir,
-            max_items=max_items,
-        )
+        sem: asyncio.Semaphore = ctx.bot_data["_download_sem"]
+        if sem.locked():
+            await query.edit_message_text(
+                f"⏳ <b>Плейлист в очереди загрузок</b>\n"
+                f"{_esc(info.title)}\n\n"
+                f"Все {config.MAX_CONCURRENT_DOWNLOADS} слота заняты — загрузка начнётся автоматически.",
+                parse_mode=ParseMode.HTML,
+            )
+        async with sem:
+            from downloader import download_playlist
+            results = await download_playlist(
+                url=url,
+                format_id="bestaudio" if audio_only else "best",
+                output_dir=tmp_dir,
+                max_items=max_items,
+            )
 
         # Re-auth: проверяем, не забанили ли пользователя во время загрузки плейлиста
         if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
@@ -2070,12 +2115,12 @@ async def _handle_playlist_callback(query, ctx, data: str):
 
         sent = 0
         skipped = 0
-        fs_links: list[tuple[str, str, str]] = []  # (title, size_str, url)
+        fs_links: list[tuple[str, str, dict[str, str]]] = []  # (title, size_str, channel -> url)
 
         for r in results:
             if r.success and r.file_path and r.file_path.exists():
                 if r.file_size <= config.MAX_FILE_SIZE_BYTES:
-                    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL:
+                    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS:
                         # Файловый сервер включён — регистрируем файл и собираем ссылки.
                         # move_and_register перемещает файл из tmp_dir → папку fileserver,
                         # поэтому shutil.rmtree в finally не затронет его.
@@ -2089,8 +2134,8 @@ async def _handle_playlist_callback(query, ctx, data: str):
                                 item_links["server"] = f"{config.DIRECT_BASE_URL}/info/{token}"
                             if config.PUBLIC_BASE_URL:
                                 item_links["cf"] = f"{config.PUBLIC_BASE_URL}/info/{token}"
-                            if config.RELAY_BASE_URL:
-                                item_links["relay"] = f"{config.RELAY_BASE_URL}/info/{token}"
+                            for relay_idx, relay_url in enumerate(config.RELAY_BASE_URLS, 1):
+                                item_links[f"relay{relay_idx}"] = f"{relay_url}/info/{token}"
                             fs_links.append((
                                 r.title or r.file_path.stem,
                                 _human_size(r.file_size),
@@ -2120,8 +2165,12 @@ async def _handle_playlist_callback(query, ctx, data: str):
                     alt_parts.append(f'<a href="{_html.escape(item_links["server"], quote=True)}">сервер</a>')
                 if "cf" in item_links:
                     alt_parts.append(f'<a href="{_html.escape(item_links["cf"], quote=True)}">CF</a>')
-                if "relay" in item_links:
-                    alt_parts.append(f'<a href="{_html.escape(item_links["relay"], quote=True)}">relay</a>')
+                relay_keys = sorted(
+                    (k for k in item_links if k.startswith("relay")),
+                    key=lambda k: int(k.removeprefix("relay") or "0"),
+                )
+                for relay_key in relay_keys:
+                    alt_parts.append(f'<a href="{_html.escape(item_links[relay_key], quote=True)}">{relay_key}</a>')
                 if len(alt_parts) > 1:
                     lines.append(f"   └ {' | '.join(alt_parts)}")
             await ctx.bot.send_message(
@@ -2500,8 +2549,8 @@ async def _post_init(application) -> None:
     task = asyncio.create_task(_cleanup_loop(application.bot))
     application.bot_data["_cleanup_task"] = task
 
-    # Файловый HTTP-сервер: запускается если задан PUBLIC_BASE_URL или DIRECT_BASE_URL
-    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL:
+    # Файловый HTTP-сервер: запускается если задан любой внешний URL раздачи.
+    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS:
         try:
             await fileserver.start(port=config.HTTP_PORT)
             urls = []
@@ -2509,6 +2558,8 @@ async def _post_init(application) -> None:
                 urls.append(f"туннель: {config.PUBLIC_BASE_URL}")
             if config.DIRECT_BASE_URL:
                 urls.append(f"прямой IP: {config.DIRECT_BASE_URL}")
+            for relay_idx, relay_url in enumerate(config.RELAY_BASE_URLS, 1):
+                urls.append(f"relay {relay_idx}: {relay_url}")
             logger.info(
                 "Файловый сервер запущен: порт %d | %s",
                 config.HTTP_PORT, " | ".join(urls),
@@ -2516,7 +2567,7 @@ async def _post_init(application) -> None:
         except Exception as e:
             logger.error("Не удалось запустить файловый сервер: %s", e)
     else:
-        logger.info("PUBLIC_BASE_URL и DIRECT_BASE_URL не заданы — файловый сервер отключён")
+        logger.info("URL раздачи файлов не заданы — файловый сервер отключён")
 
     # Устанавливаем список команд (видны при вводе "/" в Telegram)
     try:
@@ -2541,7 +2592,7 @@ async def _post_shutdown(application) -> None:
         except asyncio.CancelledError:
             pass
     # Останавливаем файловый сервер
-    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL:
+    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS:
         await fileserver.stop()
 
 

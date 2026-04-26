@@ -49,6 +49,26 @@ case "$DOMAIN" in
         ;;
 esac
 
+case "$HTTPS_PORT" in
+    ''|*[!0-9]*)
+        echo "[nginx-ssl] FATAL: HTTPS_PORT должен быть числом ('$HTTPS_PORT')"
+        exit 1
+        ;;
+esac
+if [ "$HTTPS_PORT" -lt 1 ] || [ "$HTTPS_PORT" -gt 65535 ]; then
+    echo "[nginx-ssl] FATAL: HTTPS_PORT вне диапазона 1-65535 ('$HTTPS_PORT')"
+    exit 1
+fi
+
+if [ -n "${CERTBOT_EMAIL:-}" ]; then
+    case "$CERTBOT_EMAIL" in
+        *[!a-zA-Z0-9._%+@-]*|*@*@*|@*|*@)
+            echo "[nginx-ssl] FATAL: CERTBOT_EMAIL содержит недопустимые символы ('$CERTBOT_EMAIL')"
+            exit 1
+            ;;
+    esac
+fi
+
 # ── Генерация nginx.conf из шаблона ──────────────────────────────────────────
 envsubst '${SSLIP_DOMAIN} ${HTTPS_PORT}' \
     < /etc/nginx/templates/nginx.conf.template \
@@ -139,13 +159,14 @@ if [ "$ENABLE_CERTBOT" = "true" ]; then
         # deploy-hook вызывается ТОЛЬКО при фактическом обновлении.
         while true; do
             sleep 43200
-            certbot renew --quiet \
+            if ! certbot renew --quiet \
                 --deploy-hook "cp -f ${LE_DIR}/fullchain.pem ${CERT_DIR}/fullchain.pem && \
                                cp -f ${LE_DIR}/privkey.pem   ${CERT_DIR}/privkey.pem && \
                                chmod 600 ${CERT_DIR}/privkey.pem && \
                                nginx -s reload && \
-                               echo '[nginx-ssl] Сертификат обновлён'" \
-                2>/dev/null || true
+                               echo '[nginx-ssl] Сертификат обновлён'"; then
+                echo "[nginx-ssl] WARN: certbot renew завершился с ошибкой"
+            fi
         done
     ) &
     echo "[nginx-ssl] Certbot запущен в фоне (renewal каждые 12ч)"

@@ -1,6 +1,7 @@
 import logging as _log
 import os
 from pathlib import Path
+from urllib.parse import urlparse
 
 
 def _parse_int_list(env_var: str) -> list[int]:
@@ -13,6 +14,22 @@ def _parse_int_list(env_var: str) -> list[int]:
             except ValueError:
                 pass
     return result
+
+
+def _parse_base_url_list(env_var: str) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for raw in os.environ.get(env_var, "").split(","):
+        url = raw.strip().rstrip("/")
+        if not url or url in seen:
+            continue
+        result.append(url)
+        seen.add(url)
+    return result
+
+
+def _is_true(env_var: str, default: str = "false") -> bool:
+    return os.environ.get(env_var, default).strip().lower() in ("1", "true", "yes", "on")
 
 
 # Bot configuration
@@ -48,9 +65,13 @@ PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 # Если задан — добавляется кнопка «Прямая ссылка (IP)» в меню доставки.
 DIRECT_BASE_URL = os.environ.get("DIRECT_BASE_URL", "").rstrip("/")
 # Relay-сервер — резервный путь для пользователей с заблокированным Cloudflare/IP.
-# Второй сервер проксирует /info/ и /dl/ на основной бот-сервер.
-# Пример: https://1-2-3-4.sslip.io:5443
-RELAY_BASE_URL = os.environ.get("RELAY_BASE_URL", "").rstrip("/")
+# Можно задать несколько через RELAY_BASE_URLS через запятую. Старый RELAY_BASE_URL
+# поддерживается как первый relay для обратной совместимости.
+RELAY_BASE_URLS = _parse_base_url_list("RELAY_BASE_URLS")
+_legacy_relay_url = os.environ.get("RELAY_BASE_URL", "").strip().rstrip("/")
+if _legacy_relay_url and _legacy_relay_url not in RELAY_BASE_URLS:
+    RELAY_BASE_URLS.insert(0, _legacy_relay_url)
+RELAY_BASE_URL = RELAY_BASE_URLS[0] if RELAY_BASE_URLS else ""
 HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 # TTL ссылки: по умолчанию 1 час (файл удаляется после скачивания ИЛИ по истечении TTL)
 FILE_TTL_SECONDS = max(300, int(float(os.environ.get("FILE_TTL_HOURS", "1")) * 3600))
@@ -75,6 +96,10 @@ ALLOW_WAV = os.environ.get("ALLOW_WAV", "false").lower() == "true"
 USE_ARIA2C = os.environ.get("USE_ARIA2C", "true").lower() == "true"
 # SponsorBlock: убирать рекламные вставки из YouTube-видео
 USE_SPONSORBLOCK = os.environ.get("USE_SPONSORBLOCK", "false").lower() == "true"
+
+# Generic extractor accepts arbitrary public HTTP(S) pages. Keep disabled by
+# default to reduce SSRF surface; enable only for trusted/private deployments.
+ALLOW_GENERIC_URLS = _is_true("ALLOW_GENERIC_URLS")
 
 # Proxy (optional)
 PROXY_URL = os.environ.get("PROXY_URL", "")
@@ -137,6 +162,18 @@ def validate_config() -> None:
             DOWNLOAD_TIMEOUT,
         )
         DOWNLOAD_TIMEOUT = 60
+
+    for name, values in {
+        "PUBLIC_BASE_URL": [PUBLIC_BASE_URL] if PUBLIC_BASE_URL else [],
+        "DIRECT_BASE_URL": [DIRECT_BASE_URL] if DIRECT_BASE_URL else [],
+        "RELAY_BASE_URLS": RELAY_BASE_URLS,
+    }.items():
+        for url in values:
+            parsed = urlparse(url)
+            if parsed.scheme not in ("http", "https") or not parsed.netloc:
+                _logger.warning("%s contains invalid URL and may not work: %s", name, url)
+            elif parsed.scheme != "https":
+                _logger.warning("%s uses plain HTTP; download tokens should be exposed only over HTTPS: %s", name, url)
 
 
 validate_config()

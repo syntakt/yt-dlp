@@ -17,7 +17,7 @@ other sites — all via a clean inline-button interface.
 | 📄 Subtitles | Download video with embedded subtitles |
 | 📜 History | Per-user download history |
 | 👑 Admin panel | Approve/ban users, view stats |
-| 🐳 Docker | Single `docker compose up -d` deploy |
+| 🐳 Docker | Single `cd bot && ./deploy.sh` deploy |
 | 💾 SQLite | Zero-config persistent storage |
 | 🔔 Admin notifications | Instant approval-request alerts |
 
@@ -116,6 +116,12 @@ All settings are in `.env` (see `.env.example`):
 | `ALLOW_SUBTITLES` | `true` | Enable subtitle download |
 | `PROXY_URL` | — | HTTP/SOCKS5 proxy URL |
 | `COOKIES_FILE` | — | Path to Netscape cookies file |
+| `ENABLE_CLOUDFLARED` | `false` | Start Cloudflare Tunnel container via `deploy.sh`; keep `false` to skip cloudflared entirely |
+| `ENABLE_CLOUDFLARE_QUICK_TUNNEL` | `false` | Allow temporary Cloudflare Quick Tunnel when no tunnel token is set |
+| `PUBLIC_BASE_URL` | — | Cloudflare/public file-server URL |
+| `DIRECT_BASE_URL` | — | Direct HTTPS URL, usually served by manually configured nginx |
+| `RELAY_BASE_URLS` | — | Comma-separated relay HTTPS base URLs |
+| `ALLOW_GENERIC_URLS` | `false` | Allow yt-dlp generic extractor for arbitrary HTTP(S) pages |
 
 ---
 
@@ -181,3 +187,10 @@ bot/                          — all bot infrastructure (separate from yt-dlp c
 ├── cf-entrypoint.sh          — Cloudflared entrypoint
 └── .env.example              — Configuration template
 ```
+
+`cloudflared` is optional and disabled by default. Set
+`ENABLE_CLOUDFLARED=true` only when you need Cloudflare Tunnel. Quick Tunnel is
+a separate opt-in: set `ENABLE_CLOUDFLARE_QUICK_TUNNEL=true` and leave
+`CLOUDFLARE_TUNNEL_TOKEN` empty. If you serve files through manually configured
+nginx/direct HTTPS, keep both flags `false` and use `DIRECT_BASE_URL` or
+`RELAY_BASE_URLS`.

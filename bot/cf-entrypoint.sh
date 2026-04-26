@@ -15,6 +15,14 @@ if [ -n "$TUNNEL_TOKEN" ]; then
     exec cloudflared tunnel --no-autoupdate --metrics 0.0.0.0:2000 --edge-ip-version 4 run --token "$TUNNEL_TOKEN"
 fi
 
+case "${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-false}" in
+    1|true|TRUE|yes|YES|on|ON) ;;
+    *)
+        echo "[cloudflared] Quick Tunnel отключён: задайте CLOUDFLARE_TUNNEL_TOKEN или ENABLE_CLOUDFLARE_QUICK_TUNNEL=true"
+        exit 1
+        ;;
+esac
+
 # ── Quick Tunnel (без токена, URL меняется при перезапуске) ───────────────────
 echo "[cloudflared] Quick tunnel mode — URL появится ниже (занимает ~10 сек)"
 

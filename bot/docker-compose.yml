@@ -61,6 +61,9 @@ services:
       # Shared с cloudflared: entrypoint.sh читает URL тоннеля отсюда
       # (только в quick tunnel режиме; в named tunnel PUBLIC_BASE_URL берётся из .env)
       - cf-url:/cf-url
+    environment:
+      ENABLE_CLOUDFLARED: ${ENABLE_CLOUDFLARED:-false}
+      ENABLE_CLOUDFLARE_QUICK_TUNNEL: ${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-false}
 
     # ── Лимиты ресурсов ──────────────────────────────────────────────────────
     # memory: файлы не буферизуются в RAM (стриминг при отправке в Telegram),
@@ -83,9 +86,10 @@ services:
 
     # ── Порт файлового HTTP-сервера ──────────────────────────────────────────
     # ports: НЕ используется — Docker iptables отключён (daemon.json: iptables=false).
-    # Проброс порта делается через DNAT в nftables (dockernat.prerouting) на 10.10.2.2:8080.
-    # Один и тот же порт обслуживает и Cloudflare Tunnel, и прямой доступ по IP.
-    # Раскомментировать ТОЛЬКО для отладки без nftables (создаст docker-proxy):
+    # HTTP_PORT должен оставаться внутренним. Не публикуйте 8080 наружу:
+    # токены скачивания окажутся в HTTP URL без TLS.
+    # Для внешнего доступа используйте Cloudflare Tunnel или вручную настроенный nginx HTTPS.
+    # Раскомментировать ТОЛЬКО для локальной отладки без внешнего доступа:
     # ports:
     #   - "${HTTP_PORT:-8080}:8080"
 
@@ -121,10 +125,14 @@ services:
   #   4. .env: PUBLIC_BASE_URL=https://ваш-поддомен.domain.com
   #
   # Режим B — QUICK TUNNEL (тест, URL меняется при каждом рестарте):
+  #   ENABLE_CLOUDFLARED=true и ENABLE_CLOUDFLARE_QUICK_TUNNEL=true.
   #   Оставьте CLOUDFLARE_TUNNEL_TOKEN= пустым в .env.
   #   URL появится в логах: docker compose logs -f cloudflared | grep trycloudflare
   #   Затем: PUBLIC_BASE_URL=https://<random>.trycloudflare.com + restart ytdlp-bot
   cloudflared:
+    # Профиль включается deploy.sh только при ENABLE_CLOUDFLARED=true.
+    # Если запускаете docker compose вручную, добавьте cloudflare в COMPOSE_PROFILES.
+    profiles: ["cloudflare"]
     # cloudflare/cloudflared:latest — scratch-образ, нет /bin/sh.
     # Собираем свой: берём бинарник из scratch-образа, кладём в alpine + наш скрипт.
     # Dockerfile.cloudflared использует multi-stage build.
@@ -139,6 +147,7 @@ services:
     environment:
       TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
       HTTP_PORT: ${HTTP_PORT:-8080}
+      ENABLE_CLOUDFLARE_QUICK_TUNNEL: ${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-false}
     # Запускаем параллельно с ytdlp-bot (оба ждут telegram-bot-api).
     # Убрано depends_on ytdlp-bot — иначе deadlock в quick tunnel режиме
     # (ytdlp-bot ждёт URL от cloudflared, cloudflared ждёт health ytdlp-bot).

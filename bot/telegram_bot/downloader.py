@@ -16,6 +16,7 @@ import yt_dlp
 import shutil
 
 from config import (
+    ALLOW_GENERIC_URLS,
     COOKIES_FILE,
     DOWNLOAD_DIR,
     DOWNLOAD_TIMEOUT,
@@ -156,6 +157,18 @@ def _human_size(n: Optional[int]) -> str:
             return f"{size:.1f} {unit}"
         size /= 1024
     return f"{size:.1f} TB"
+
+
+def _redact_url(url: str) -> str:
+    """Remove credentials, query and fragment before logging user supplied URLs."""
+    try:
+        parsed = urlparse(url)
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return parsed._replace(netloc=netloc, query="", fragment="").geturl()
+    except Exception:
+        return "<invalid-url>"
 
 
 # ── Info extraction ─────────────────────────────────────────────────────────────
@@ -359,6 +372,8 @@ async def download_video(
 
     loop = asyncio.get_running_loop()
     tracker = ProgressTracker(progress_callback, loop)
+    deadline = time.monotonic() + DOWNLOAD_TIMEOUT
+    timed_out = [False]
 
     def _cancel_hook(d: dict) -> None:
         """Вызывается из yt-dlp прогресс-хука.
@@ -368,6 +383,9 @@ async def download_video(
         """
         if cancel_flag and cancel_flag[0]:
             raise _DownloadCancelled("CANCELLED")
+        if time.monotonic() >= deadline:
+            timed_out[0] = True
+            raise _DownloadCancelled("TIMEOUT")
 
     if audio_only:
         if audio_format == "opus":
@@ -448,11 +466,11 @@ async def download_video(
                     if not filename.exists():
                         filename = Path(ydl.prepare_filename(info))
                 result_holder["file_path"] = Path(filename)
-        except _DownloadCancelled:
+        except _DownloadCancelled as e:
             # Отмена пользователем — не логируем как ошибку.
             # Safety net: _DownloadCancelled is a BaseException and must
             # never escape into the executor / event-loop machinery.
-            result_holder["error"] = "CANCELLED"
+            result_holder["error"] = str(e) or "CANCELLED"
         except Exception as e:
             result_holder["error"] = str(e)
         except BaseException as e:
@@ -460,15 +478,11 @@ async def download_video(
             # so it doesn't leak out of the executor thread.
             result_holder["error"] = str(e)
 
-    try:
-        await asyncio.wait_for(
-            loop.run_in_executor(None, _download),
-            timeout=DOWNLOAD_TIMEOUT,
-        )
-    except asyncio.TimeoutError:
-        return DownloadResult(success=False, error="Download timed out")
+    await loop.run_in_executor(None, _download)
 
     if "error" in result_holder:
+        if result_holder["error"] == "TIMEOUT" or timed_out[0]:
+            return DownloadResult(success=False, error="Download timed out")
         if cancel_flag and cancel_flag[0]:
             return DownloadResult(success=False, error="CANCELLED")
         return DownloadResult(success=False, error=result_holder["error"])
@@ -539,26 +553,32 @@ async def download_playlist(
         "max_sleep_interval": 8,
         "sleep_interval_requests": 1,
         "ignoreerrors": True,  # не прерываем плейлист на недоступном видео
+        "max_filesize": MAX_FILE_SIZE_BYTES,
     })
 
     loop = asyncio.get_running_loop()
     results = []
     error_holder: dict = {}
+    timeout = DOWNLOAD_TIMEOUT * max(1, max_items)
+    deadline = time.monotonic() + timeout
+
+    def _deadline_hook(d: dict) -> None:
+        if time.monotonic() >= deadline:
+            raise _DownloadCancelled("TIMEOUT")
+
+    opts["progress_hooks"] = [_deadline_hook]
 
     def _download():
         try:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
+        except _DownloadCancelled as e:
+            error_holder["error"] = str(e) or "CANCELLED"
         except Exception as e:
             error_holder["error"] = str(e)
 
-    timeout = DOWNLOAD_TIMEOUT * max(1, max_items)
-    try:
-        await asyncio.wait_for(
-            loop.run_in_executor(None, _download),
-            timeout=timeout,
-        )
-    except asyncio.TimeoutError:
+    await loop.run_in_executor(None, _download)
+    if error_holder.get("error") == "TIMEOUT":
         return [DownloadResult(success=False, error="Playlist download timed out")]
 
     # Если плейлист не скачал ни одного файла и была ошибка — пробрасываем
@@ -637,7 +657,7 @@ def is_supported_url(url: str) -> bool:
         return False
     # SSRF: блокируем приватные/loopback адреса
     if _is_ssrf_url(url):
-        logger.warning("Blocked SSRF attempt: %s", url)
+        logger.warning("Blocked SSRF attempt: %s", _redact_url(url))
         return False
     if _EXTRACTORS is None:
         with _EXTRACTORS_LOCK:
@@ -646,6 +666,9 @@ def is_supported_url(url: str) -> bool:
     for e in _EXTRACTORS:
         if e.suitable(url) and e.IE_NAME != "generic":
             return True
-    # Публичные http(s) URL допускаем через generic extractor.
-    # SSRF-защита обеспечивается _is_ssrf_url() выше (блокирует private/loopback IP).
-    return True
+    if ALLOW_GENERIC_URLS:
+        # Публичные http(s) URL допускаем через generic extractor только явным opt-in.
+        # Для публичных ботов это расширяет SSRF surface за счёт HLS/DASH/redirect URL.
+        return True
+    logger.warning("Blocked generic URL because ALLOW_GENERIC_URLS=false: %s", _redact_url(url))
+    return False

@@ -102,7 +102,8 @@ http {
         # ssl_stapling on;  ← вызывало warn в логах, функционала не давало.
 
         # ── Security headers ──────────────────────────────────────────────
-        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        # sslip.io/IP-based domains must not be submitted to HSTS preload.
+        add_header Strict-Transport-Security "max-age=31536000" always;
         add_header X-Content-Type-Options   "nosniff" always;
         add_header X-Frame-Options          "DENY" always;
         add_header Referrer-Policy          "no-referrer" always;
@@ -118,11 +119,15 @@ http {
             limit_req  zone=info burst=10 nodelay;
             limit_conn perip 10;
 
+            limit_except GET { deny all; }
+
             proxy_pass         http://fileserver;
+            proxy_redirect     off;
             proxy_http_version 1.1;
             proxy_set_header   Host              $host;
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Host  $host;
             proxy_set_header   X-Forwarded-Proto https;
             proxy_set_header   Connection        "";
         }
@@ -132,11 +137,15 @@ http {
             limit_req  zone=dl burst=10 nodelay;
             limit_conn perip 5;
 
+            limit_except GET { deny all; }
+
             proxy_pass         http://fileserver;
+            proxy_redirect     off;
             proxy_http_version 1.1;
             proxy_set_header   Host              $host;
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Host  $host;
             proxy_set_header   X-Forwarded-Proto https;
             proxy_set_header   Connection        "";
 
@@ -152,8 +161,17 @@ http {
             limit_req  zone=health burst=5 nodelay;
             limit_conn perip 5;
 
+            limit_except GET { deny all; }
+
             proxy_pass         http://fileserver;
+            proxy_redirect     off;
             proxy_http_version 1.1;
+            proxy_set_header   Host              $host;
+            proxy_set_header   X-Real-IP         $remote_addr;
+            proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            proxy_set_header   X-Forwarded-Host  $host;
+            proxy_set_header   X-Forwarded-Proto https;
+            proxy_set_header   Connection        "";
         }
 
         # ── Всё остальное — drop ─────────────────────────────────────────
