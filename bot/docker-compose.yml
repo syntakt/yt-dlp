@@ -4,7 +4,7 @@ services:
   # Снимает лимит 50 МБ на файлы — позволяет отправлять до 2 ГБ.
   # Требует: TELEGRAM_API_ID и TELEGRAM_API_HASH из https://my.telegram.org
   telegram-bot-api:
-    image: aiogram/telegram-bot-api:latest
+    image: aiogram/telegram-bot-api:9.4
     container_name: telegram-bot-api
     restart: unless-stopped
     environment:
@@ -133,7 +133,7 @@ services:
     # Профиль включается deploy.sh только при ENABLE_CLOUDFLARED=true.
     # Если запускаете docker compose вручную, добавьте cloudflare в COMPOSE_PROFILES.
     profiles: ["cloudflare"]
-    # cloudflare/cloudflared:latest — scratch-образ, нет /bin/sh.
+    # cloudflare/cloudflared — scratch-образ, нет /bin/sh.
     # Собираем свой: берём бинарник из scratch-образа, кладём в alpine + наш скрипт.
     # Dockerfile.cloudflared использует multi-stage build.
     build:

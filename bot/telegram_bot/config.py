@@ -1,5 +1,6 @@
 import logging as _log
 import os
+import re
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -162,6 +163,18 @@ def validate_config() -> None:
             DOWNLOAD_TIMEOUT,
         )
         DOWNLOAD_TIMEOUT = 60
+
+    if WEBHOOK_URL:
+        parsed = urlparse(WEBHOOK_URL)
+        if parsed.scheme != "https" or not parsed.netloc:
+            raise RuntimeError("WEBHOOK_URL must be a public HTTPS URL")
+        if (
+            len(WEBHOOK_SECRET_TOKEN) < 32
+            or not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", WEBHOOK_SECRET_TOKEN)
+        ):
+            raise RuntimeError(
+                "WEBHOOK_SECRET_TOKEN must be 32-256 chars: A-Z, a-z, 0-9, '_' or '-'"
+            )
 
     for name, values in {
         "PUBLIC_BASE_URL": [PUBLIC_BASE_URL] if PUBLIC_BASE_URL else [],

@@ -708,6 +708,55 @@ def _redact_url_for_storage(url: str) -> str:
         return "<invalid-url>"
 
 
+_SENSITIVE_QUERY_MARKERS = (
+    "access_token",
+    "auth",
+    "authorization",
+    "credential",
+    "cookie",
+    "jwt",
+    "oauth",
+    "password",
+    "policy",
+    "refresh_token",
+    "secret",
+    "session",
+    "signature",
+    "token",
+)
+
+
+def _session_url_for_storage(url: str) -> Optional[str]:
+    """Return a DB-safe session URL, or None when it likely contains credentials."""
+    try:
+        parsed = urlparse(url)
+        if parsed.username or parsed.password:
+            return None
+
+        for key in parse_qs(parsed.query, keep_blank_values=True):
+            normalized = key.lower().replace("-", "_")
+            if any(marker in normalized for marker in _SENSITIVE_QUERY_MARKERS):
+                return None
+
+        netloc = parsed.hostname or ""
+        if parsed.port:
+            netloc = f"{netloc}:{parsed.port}"
+        return urlunparse(parsed._replace(netloc=netloc, fragment=""))
+    except Exception:
+        return None
+
+
+def _save_session_safe(chat_id: int, message_id: int, url: str, info: VideoInfo, user_id: int = 0) -> None:
+    stored_url = _session_url_for_storage(url)
+    if not stored_url:
+        logger.info(
+            "Session URL for user %s was not persisted because it contains credentials or sensitive query keys",
+            user_id,
+        )
+        return
+    db.save_session(chat_id, message_id, stored_url, _serialize_video_info(info), user_id=user_id)
+
+
 def _is_youtube_mixed_url(url: str) -> bool:
     """True если YouTube URL содержит и v= и list= (видео + плейлист/миксTape)."""
     parsed = urlparse(url)
@@ -867,7 +916,7 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
         await _show_playlist_menu(msg, info, ctx)
         # Сохраняем сессию плейлиста в БД (для корректной работы при нескольких URL)
         try:
-            db.save_session(msg.chat_id, msg.message_id, url, _serialize_video_info(info), user_id=user_id)
+            _save_session_safe(msg.chat_id, msg.message_id, url, info, user_id=user_id)
         except Exception as e:
             logger.warning("save_session (playlist) failed: %s", e)
     else:
@@ -876,7 +925,7 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
             # Запоминаем message_id меню выбора качества — удалим при следующей ссылке.
             ctx.user_data[KEY_QUALITY_MSG] = sent.message_id
             try:
-                db.save_session(sent.chat_id, sent.message_id, url, _serialize_video_info(info), user_id=user_id)
+                _save_session_safe(sent.chat_id, sent.message_id, url, info, user_id=user_id)
             except Exception as e:
                 logger.warning("save_session failed: %s", e)
 
@@ -1285,7 +1334,7 @@ async def _show_info(query, info: VideoInfo, url: str = ""):
     # Сбрасываем таймер 2-часовой очистки при активном использовании
     if url:
         try:
-            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
+            _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
         except Exception:
             pass
 
@@ -1307,7 +1356,7 @@ async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     # Сбрасываем таймер 2-часовой очистки при активном использовании
     if url:
         try:
-            db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
+            _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
         except Exception:
             pass
 
@@ -1361,7 +1410,7 @@ async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Обновляем сессию в БД
     try:
-        db.save_session(query.message.chat_id, query.message.message_id, url, _serialize_video_info(info), user_id=query.from_user.id)
+        _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
     except Exception:
         pass
 
@@ -1633,7 +1682,7 @@ async def _handle_download_callback(query, ctx, data: str):
 
     # Перепривязываем сессию к текущему сообщению (если меню было фото и удалено)
     try:
-        db.save_session(status_msg.chat_id, status_msg.message_id, url, _serialize_video_info(info), user_id=user.id)
+        _save_session_safe(status_msg.chat_id, status_msg.message_id, url, info, user_id=user.id)
         if _session_msg_id != status_msg.message_id:
             db.delete_session(_session_chat_id, _session_msg_id)
     except Exception as e:
@@ -1824,11 +1873,7 @@ async def _handle_download_callback(query, ctx, data: str):
                     except TelegramError:
                         pass
                     try:
-                        db.save_session(
-                            status_msg.chat_id, status_msg.message_id,
-                            url, _serialize_video_info(info),
-                            user_id=user.id,
-                        )
+                        _save_session_safe(status_msg.chat_id, status_msg.message_id, url, info, user_id=user.id)
                     except Exception:
                         pass
 
@@ -1983,11 +2028,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
             pass
         if url:
             try:
-                db.save_session(
-                    query.message.chat_id, query.message.message_id,
-                    url, _serialize_video_info(info),
-                    user_id=query.from_user.id,
-                )
+                _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
             except Exception:
                 pass
         return
@@ -2050,11 +2091,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
             pass
         if url:
             try:
-                db.save_session(
-                    query.message.chat_id, query.message.message_id,
-                    url, _serialize_video_info(info),
-                    user_id=query.from_user.id,
-                )
+                _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
             except Exception:
                 pass
 

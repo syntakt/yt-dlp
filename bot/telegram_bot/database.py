@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import json
 import logging
@@ -11,11 +12,30 @@ from config import DB_PATH, MAX_HISTORY_PER_USER
 logger = logging.getLogger(__name__)
 
 
+def _harden_db_permissions() -> None:
+    """Keep SQLite files private to the bot process owner."""
+    try:
+        DB_PATH.parent.chmod(0o700)
+    except OSError as e:
+        logger.warning("Could not chmod DB directory %s: %s", DB_PATH.parent, e)
+    for path in (DB_PATH, DB_PATH.with_name(DB_PATH.name + "-wal"), DB_PATH.with_name(DB_PATH.name + "-shm")):
+        if path.exists():
+            try:
+                path.chmod(0o600)
+            except OSError as e:
+                logger.warning("Could not chmod DB file %s: %s", path, e)
+
+
 @contextmanager
 def get_connection():
     """Контекстный менеджер: открывает соединение, коммитит/откатывает и ЗАКРЫВАЕТ."""
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    _harden_db_permissions()
+    old_umask = os.umask(0o077)
+    try:
+        conn = sqlite3.connect(str(DB_PATH), timeout=10)
+    finally:
+        os.umask(old_umask)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     try:
@@ -26,6 +46,7 @@ def get_connection():
         raise
     finally:
         conn.close()
+        _harden_db_permissions()
 
 
 def init_db() -> None:
