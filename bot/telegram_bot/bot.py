@@ -192,6 +192,10 @@ def require_auth(func):
     @wraps(func)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
+        # channel_post / анонимные апдейты не имеют пользователя — игнорируем,
+        # иначе AttributeError на user.id
+        if user is None or update.effective_message is None:
+            return
         try:
             db.upsert_user(user.id, user.username, user.full_name)
             if db.is_super_admin(user.id):
@@ -221,6 +225,8 @@ def require_admin(func):
     @wraps(func)
     async def wrapper(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
+        if user is None or update.effective_message is None:
+            return
         try:
             if not db.is_super_admin(user.id):
                 await update.effective_message.reply_text("🚫 Требуется доступ администратора.")
@@ -261,7 +267,12 @@ async def _send_access_request(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "Пожалуйста, ожидайте одобрения."
     )
 
-    # Уведомляем администраторов
+    # Уведомляем администраторов — не чаще раза в 24 ч на пользователя:
+    # без троттлинга неодобренный пользователь мог флудить админам,
+    # повторяя /start (каждый раз всем уходила «Новая заявка»)
+    if not db.mark_access_request_notified(user.id):
+        return
+
     uname = f"@{_esc(user.username)}" if user.username else _esc(user.full_name)
     msg = (
         f"🔔 <b>Новая заявка на доступ</b>\n\n"
@@ -342,7 +353,7 @@ def _build_main_menu(user_obj) -> tuple[str, InlineKeyboardMarkup]:
 
 
 async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    if not update.effective_message:
+    if not update.effective_message or not update.effective_user:
         return
     user = update.effective_user
     db.upsert_user(user.id, user.username, user.full_name)
@@ -1122,7 +1133,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         # Пользователь явно закрывает меню — удаляем сессию из БД
         try:
-            db.delete_session(query.message.chat_id, query.message.message_id)
+            db.delete_session(query.message.chat_id, query.message.message_id, user_id=user.id)
         except Exception:
             pass
         # Сохраняем _deliveries и _cancel_flags — параллельные загрузки могут
@@ -1465,26 +1476,39 @@ async def _handle_admin_approval(query, ctx, data: str):
         await query.answer("🚫 Нельзя отклонить суперадминистратора.", show_alert=True)
         return
 
-    if action == "approve":
-        ok = db.approve_user(target_id, query.from_user.id)
-        if ok:
-            await query.edit_message_text(f"✅ Пользователь {target_id} одобрен.")
-            try:
-                await ctx.bot.send_message(
-                    target_id,
-                    "✅ Ваша заявка одобрена! Отправьте /start для начала."
+    try:
+        if action == "approve":
+            row = db.get_user(target_id)
+            if row and row["is_banned"]:
+                # Устаревшая кнопка «Одобрить» не должна тихо снимать бан,
+                # поставленный позже. Снятие бана — только явный /unban.
+                await query.answer(
+                    f"🚫 Пользователь заблокирован. Сначала: /unban {target_id}",
+                    show_alert=True,
                 )
+                return
+            ok = db.approve_user(target_id, query.from_user.id)
+            if ok:
+                await query.edit_message_text(f"✅ Пользователь {target_id} одобрен.")
+                try:
+                    await ctx.bot.send_message(
+                        target_id,
+                        "✅ Ваша заявка одобрена! Отправьте /start для начала."
+                    )
+                except TelegramError:
+                    pass
+            else:
+                await query.answer("Пользователь не найден.", show_alert=True)
+        else:
+            db.ban_user(target_id)
+            await query.edit_message_text(f"🚫 Пользователь {target_id} отклонён/заблокирован.")
+            try:
+                await ctx.bot.send_message(target_id, "❌ Ваша заявка на доступ отклонена.")
             except TelegramError:
                 pass
-        else:
-            await query.answer("Пользователь не найден.", show_alert=True)
-    else:
-        db.ban_user(target_id)
-        await query.edit_message_text(f"🚫 Пользователь {target_id} отклонён/заблокирован.")
-        try:
-            await ctx.bot.send_message(target_id, "❌ Ваша заявка на доступ отклонена.")
-        except TelegramError:
-            pass
+    except sqlite3.Error as e:
+        logger.error("DB error in admin approval: %s", e)
+        await query.answer("⚠️ Временная ошибка БД. Попробуйте позже.", show_alert=True)
 
 
 def _estimate_download_size(fmt_obj: Optional[FormatInfo], duration: int, audio_only: bool) -> Optional[int]:
@@ -1711,7 +1735,7 @@ async def _handle_download_callback(query, ctx, data: str):
     try:
         _save_session_safe(status_msg.chat_id, status_msg.message_id, url, info, user_id=user.id)
         if _session_msg_id != status_msg.message_id:
-            db.delete_session(_session_chat_id, _session_msg_id)
+            db.delete_session(_session_chat_id, _session_msg_id, user_id=user.id)
     except Exception as e:
         logger.warning("re-key session failed: %s", e)
 
@@ -2452,6 +2476,12 @@ async def _admin_user_action(update: Update, ctx: ContextTypes.DEFAULT_TYPE, act
         return
 
     if action == "approve":
+        row = db.get_user(target_id)
+        if row and row["is_banned"]:
+            await update.message.reply_text(
+                f"🚫 Пользователь {target_id} заблокирован. Сначала разблокируйте: /unban {target_id}"
+            )
+            return
         ok = db.approve_user(target_id, update.effective_user.id)
         msg = f"✅ Пользователь {target_id} одобрен." if ok else "Пользователь не найден."
         if ok:
@@ -2765,6 +2795,9 @@ def main():
         if row is None:
             db.upsert_user(admin_id, "", "Admin")
         db.approve_user(admin_id, admin_id)
+        # approve_user намеренно не трогает is_banned — для админов из .env
+        # снимаем бан явно (ADMIN_IDS — источник истины при старте)
+        db.unban_user(admin_id)
         db.set_admin(admin_id, True)
 
     from telegram.request import HTTPXRequest

@@ -114,6 +114,10 @@ def init_db() -> None:
         cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
         if "user_id" not in cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+        # Миграция: request_notified_at — троттлинг уведомлений админам о заявке
+        user_cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
+        if "request_notified_at" not in user_cols:
+            conn.execute("ALTER TABLE users ADD COLUMN request_notified_at TEXT")
     logger.info("Database initialized at %s", DB_PATH)
 
 
@@ -138,11 +142,13 @@ def upsert_user(user_id: int, username: str, full_name: str) -> None:
 
 
 def approve_user(user_id: int, approved_by: int) -> bool:
+    """Одобряет пользователя. Бан НЕ снимает: снятие бана — только явный
+    unban_user()/(/unban). Иначе устаревшая кнопка «Одобрить» в старом
+    сообщении заявки тихо разбанивала бы пользователя, забаненного позже."""
     with get_connection() as conn:
         cur = conn.execute("""
             UPDATE users
                SET is_approved = 1,
-                   is_banned   = 0,
                    approved_at = ?,
                    approved_by = ?
              WHERE user_id = ?
@@ -223,6 +229,24 @@ def is_super_admin(user_id: int) -> bool:
         if row and row["is_banned"]:
             return False
     return True
+
+
+def mark_access_request_notified(user_id: int, cooldown_hours: int = 24) -> bool:
+    """True если админам нужно отправить уведомление о заявке (и помечает отправку).
+
+    Атомарно: UPDATE проходит только если с прошлого уведомления прошло больше
+    cooldown_hours (или его не было). Повторные /start неодобренного пользователя
+    не флудят администраторам."""
+    now = datetime.now(timezone.utc)
+    cutoff = (now - timedelta(hours=cooldown_hours)).isoformat()
+    with get_connection() as conn:
+        cur = conn.execute("""
+            UPDATE users
+               SET request_notified_at = ?
+             WHERE user_id = ?
+               AND (request_notified_at IS NULL OR request_notified_at < ?)
+        """, (now.isoformat(), user_id, cutoff))
+        return cur.rowcount > 0
 
 
 # ── Download history ───────────────────────────────────────────────────────────
@@ -309,12 +333,20 @@ def get_session(chat_id: int, message_id: int, user_id: int) -> Optional[dict]:
         return dict(row) if row else None
 
 
-def delete_session(chat_id: int, message_id: int) -> None:
+def delete_session(chat_id: int, message_id: int, user_id: Optional[int] = None) -> None:
+    """Удаляет сессию. user_id задан → удаляется только сессия этого владельца
+    (в групповом чате чужая «Отмена» не должна стирать чужую сессию)."""
     with get_connection() as conn:
-        conn.execute(
-            "DELETE FROM sessions WHERE chat_id=? AND message_id=?",
-            (chat_id, message_id)
-        )
+        if user_id is None:
+            conn.execute(
+                "DELETE FROM sessions WHERE chat_id=? AND message_id=?",
+                (chat_id, message_id)
+            )
+        else:
+            conn.execute(
+                "DELETE FROM sessions WHERE chat_id=? AND message_id=? AND user_id=?",
+                (chat_id, message_id, user_id)
+            )
 
 
 # ── Cleanup ────────────────────────────────────────────────────────────────────
