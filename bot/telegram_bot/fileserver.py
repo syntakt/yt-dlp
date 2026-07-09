@@ -464,6 +464,22 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
             headers=_SEC_HEADERS,
         )
 
+    # Defense-in-depth: реестр наполняется только внутренним кодом, но перед
+    # отдачей проверяем, что путь реально внутри fileserver-каталога и это не
+    # симлинк наружу (страховка от будущего бага/повреждённого реестра).
+    from config import DOWNLOAD_DIR
+    _fs_root = (DOWNLOAD_DIR / "fileserver").resolve()
+    try:
+        _real = entry.path.resolve(strict=True)
+        _real.relative_to(_fs_root)
+        if entry.path.is_symlink():
+            raise ValueError("symlink")
+    except (ValueError, OSError):
+        logger.error("Отклонена отдача файла вне fileserver-каталога: %s", entry.path)
+        entry.path.unlink(missing_ok=True)
+        _rmdir_safe(entry.path.parent)
+        raise web.HTTPNotFound(headers=_SEC_HEADERS)
+
     file_size = entry.path.stat().st_size
     # RFC 5987: для ASCII-имён используем filename=, для Unicode добавляем filename*=
     # SECURITY: сначала удаляем \r\n\x00 (HTTP response splitting), затем " (разрыв кавычек)
@@ -588,6 +604,11 @@ def _restore_registry() -> None:
             continue
 
         f = files[0]
+        # В норме в serve_dir ровно один файл. Если их несколько (сбой/повреждение),
+        # лишние не попадут в реестр и не будут удалены по /dl → чистим их сейчас,
+        # чтобы не текла квота диска.
+        for extra in files[1:]:
+            extra.unlink(missing_ok=True)
         # TTL отсчитываем от момента записи файла на диск (mtime)
         expires_at = f.stat().st_mtime + FILE_TTL_SECONDS
 
@@ -632,8 +653,14 @@ async def start(host: str = "0.0.0.0", port: int = 8080) -> web.AppRunner:
     _restore_registry()
 
     app = web.Application()
-    app.router.add_get("/info/{token}", _handle_info)
-    app.router.add_get("/dl/{token}", _handle_download)
+    # allow_head=False: aiohttp по умолчанию вешает и HEAD на add_get. Для /dl/
+    # это критично — HEAD запустил бы _handle_download, который извлекает токен
+    # из реестра и удаляет файл в finally, НЕ отдав тело. Тогда превью ссылки
+    # мессенджером/антивирусом/сканером (HEAD или GET) сжигало бы одноразовую
+    # ссылку. nginx режет HEAD через limit_except, но Cloudflare-туннель и прямой
+    # DNAT на :8080 идут мимо nginx — защищаемся на уровне приложения.
+    app.router.add_get("/info/{token}", _handle_info, allow_head=False)
+    app.router.add_get("/dl/{token}", _handle_download, allow_head=False)
     app.router.add_get("/health", _handle_health)
 
     _runner = web.AppRunner(app, access_log=None)
