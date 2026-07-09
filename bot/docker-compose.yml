@@ -25,7 +25,7 @@ services:
       # so we accept codes 0 and 8 ONLY (any HTTP response = healthy).
       # NB: `[ $? -le 8 ]` было бы ошибкой — коды 1-7 (DNS failure, connection
       # refused) означают недоступный сервер, но тоже проходили бы проверку.
-      test: ["CMD-SHELL", "wget -q --timeout=5 -O /dev/null http://localhost:8081; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 8 ]"]
+      test: ["CMD-SHELL", "wget -q --timeout=5 -O /dev/null http://localhost:8081 || [ $? -eq 8 ]"]
       interval: 30s
       timeout: 10s
       retries: 10
