@@ -21,11 +21,12 @@ services:
       botnet:
         ipv4_address: 10.10.2.3   # фиксированный IP для ограничения исходящего трафика в nftables
     healthcheck:
-      # 404 at root is normal — the server is up. wget exits 8 on HTTP errors,
-      # so we accept codes 0 and 8 ONLY (any HTTP response = healthy).
-      # NB: `[ $? -le 8 ]` было бы ошибкой — коды 1-7 (DNS failure, connection
-      # refused) означают недоступный сервер, но тоже проходили бы проверку.
-      test: ["CMD-SHELL", "wget -q --timeout=5 -O /dev/null http://localhost:8081 || [ $? -eq 8 ]"]
+      # 404 at root is normal — the server is up. Образ на Alpine: wget = busybox,
+      # который возвращает 1 и для HTTP-ошибки, и для connection refused — по коду
+      # выхода их не различить (GNU-коды 8/4 тут неприменимы). Поэтому проверяем
+      # наличие HTTP-ответа: -S печатает статусную строку сервера в stderr;
+      # есть "HTTP/" → сервер жив (healthy), conn refused → строки нет (unhealthy).
+      test: ["CMD-SHELL", "wget -S -T 5 -O /dev/null http://localhost:8081 2>&1 | grep -q 'HTTP/'"]
       interval: 30s
       timeout: 10s
       retries: 10
