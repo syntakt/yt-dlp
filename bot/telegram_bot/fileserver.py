@@ -235,9 +235,19 @@ _MAX_RATE_KEYS = 10_000  # Лимит уникальных IP в словаре 
 def _check_rate_limit(ip: str) -> bool:
     """True если IP ещё не исчерпал лимит запросов."""
     now = time.time()
-    # Защита от переполнения: если слишком много ключей — сбрасываем
+    # Защита от переполнения. НЕ используем clear(): полный сброс позволял бы
+    # атакующему обнулять лимиты, заполняя словарь фиктивными IP.
     if len(_rate_counters) > _MAX_RATE_KEYS:
-        _rate_counters.clear()
+        cutoff = now - 60
+        for k in list(_rate_counters.keys()):
+            fresh = [h for h in _rate_counters[k] if h > cutoff]
+            if fresh:
+                _rate_counters[k] = fresh
+            else:
+                del _rate_counters[k]
+        # Всё ещё переполнен (распределённая атака) — вытесняем старейшие ключи
+        while len(_rate_counters) > _MAX_RATE_KEYS:
+            _rate_counters.pop(next(iter(_rate_counters)), None)
     hits = _rate_counters[ip]
     _rate_counters[ip] = [h for h in hits if now - h < 60]
     if len(_rate_counters[ip]) >= _RATE_LIMIT:
@@ -255,9 +265,19 @@ def _client_ip(request: web.Request) -> str:
         return remote
 
     if any(remote_ip in network for network in _TRUSTED_PROXY_CIDRS):
-        forwarded = request.headers.get("X-Real-IP")
+        # Порядок важен: CF-Connecting-IP выставляет Cloudflare на edge —
+        # клиент его подделать не может. X-Real-IP через Cloudflare Tunnel
+        # проходит от клиента НАСКВОЗЬ (cloudflared не вырезает), поэтому
+        # проверяем его вторым; nginx затирает CF-Connecting-IP и выставляет
+        # X-Real-IP=$remote_addr сам (см. nginx.conf.template).
+        forwarded = (
+            request.headers.get("CF-Connecting-IP")
+            or request.headers.get("X-Real-IP")
+        )
         if not forwarded:
-            forwarded = (request.headers.get("X-Forwarded-For") or "").split(",", 1)[0].strip()
+            # Последний элемент XFF дописан ближайшим доверенным прокси;
+            # первый элемент контролируется клиентом (спуф rate-limit ключа).
+            forwarded = (request.headers.get("X-Forwarded-For") or "").rsplit(",", 1)[-1].strip()
         if forwarded:
             try:
                 ipaddress.ip_address(forwarded)

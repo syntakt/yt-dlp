@@ -127,6 +127,10 @@ http {
             proxy_set_header   Host              $host;
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            # Затираем CF-Connecting-IP: fileserver доверяет ему в первую
+            # очередь (для cloudflared-пути), клиент через nginx не должен
+            # иметь возможность подставить свой
+            proxy_set_header   CF-Connecting-IP  "";
             proxy_set_header   X-Forwarded-Host  $host;
             proxy_set_header   X-Forwarded-Proto https;
             proxy_set_header   Connection        "";
@@ -145,6 +149,10 @@ http {
             proxy_set_header   Host              $host;
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            # Затираем CF-Connecting-IP: fileserver доверяет ему в первую
+            # очередь (для cloudflared-пути), клиент через nginx не должен
+            # иметь возможность подставить свой
+            proxy_set_header   CF-Connecting-IP  "";
             proxy_set_header   X-Forwarded-Host  $host;
             proxy_set_header   X-Forwarded-Proto https;
             proxy_set_header   Connection        "";
@@ -169,6 +177,10 @@ http {
             proxy_set_header   Host              $host;
             proxy_set_header   X-Real-IP         $remote_addr;
             proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+            # Затираем CF-Connecting-IP: fileserver доверяет ему в первую
+            # очередь (для cloudflared-пути), клиент через nginx не должен
+            # иметь возможность подставить свой
+            proxy_set_header   CF-Connecting-IP  "";
             proxy_set_header   X-Forwarded-Host  $host;
             proxy_set_header   X-Forwarded-Proto https;
             proxy_set_header   Connection        "";

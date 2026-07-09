@@ -26,6 +26,7 @@ from telegram import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     InlineQueryResultArticle,
+    InlineQueryResultsButton,
     InputFile,
     InputTextMessageContent,
     Message,
@@ -605,8 +606,8 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 @require_auth
 async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    cancel_flag = ctx.user_data.get("cancel_flag")
-    if cancel_flag is not None:
+    # Взводим флаги отмены всех активных загрузок пользователя
+    for cancel_flag in (ctx.user_data.get("_cancel_flags") or {}).values():
         cancel_flag[0] = True
     # Удаляем команду пользователя
     try:
@@ -760,7 +761,13 @@ def _save_session_safe(chat_id: int, message_id: int, url: str, info: VideoInfo,
 def _is_youtube_mixed_url(url: str) -> bool:
     """True если YouTube URL содержит и v= и list= (видео + плейлист/миксTape)."""
     parsed = urlparse(url)
-    if "youtube.com" not in parsed.netloc and "youtu.be" not in parsed.netloc:
+    # Строгая проверка хоста: подстрочный поиск матчил бы "youtube.com.evil.tld"
+    host = (parsed.hostname or "").lower()
+    is_yt = (
+        host == "youtube.com" or host.endswith(".youtube.com")
+        or host == "youtu.be"
+    )
+    if not is_yt:
         return False
     params = parse_qs(parsed.query)
     return "v" in params and "list" in params
@@ -850,11 +857,15 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     user = update.effective_user
 
     # Проверяем авторизацию (inline не проходит через require_auth)
+    # NB: switch_pm_text/switch_pm_parameter удалены из PTB v21 (Bot API 6.7) —
+    # используем button=InlineQueryResultsButton.
     if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
         await query.answer(
             results=[],
-            switch_pm_text="🔐 Требуется доступ — нажмите для регистрации",
-            switch_pm_parameter="start",
+            button=InlineQueryResultsButton(
+                text="🔐 Требуется доступ — нажмите для регистрации",
+                start_parameter="start",
+            ),
             cache_time=5,
         )
         return
@@ -863,8 +874,10 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if not raw:
         await query.answer(
             results=[],
-            switch_pm_text="📥 Введите ссылку на видео после @botname",
-            switch_pm_parameter="start",
+            button=InlineQueryResultsButton(
+                text="📥 Введите ссылку на видео после @botname",
+                start_parameter="start",
+            ),
             cache_time=5,
         )
         return
@@ -874,8 +887,10 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
     if not valid:
         await query.answer(
             results=[],
-            switch_pm_text="❓ Ссылка не поддерживается",
-            switch_pm_parameter="start",
+            button=InlineQueryResultsButton(
+                text="❓ Ссылка не поддерживается",
+                start_parameter="start",
+            ),
             cache_time=5,
         )
         return
@@ -1050,6 +1065,9 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
     data = query.data
+    if not data:
+        # callback без data (например, game callback) — нечего обрабатывать
+        return
 
     # Кнопки одобрения/отклонения — обрабатываются отдельно (до auth-проверки),
     # т.к. приходят от администраторов (их авторизацию проверяет сам handler)
@@ -1077,7 +1095,10 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "cancel":
-        cancel_flag = ctx.user_data.get("cancel_flag")
+        # Флаг отмены ищем по message_id сообщения с кнопкой — при параллельных
+        # загрузках у каждой свой флаг (один общий cancel_flag отменял бы не ту).
+        _flags: dict = ctx.user_data.get("_cancel_flags") or {}
+        cancel_flag = _flags.get(query.message.message_id)
         if cancel_flag is not None:
             # Загрузка активна: сигнализируем через cancel_flag.
             # _cancel_hook в progress_hook yt-dlp поднимает _DownloadCancelled
@@ -1104,11 +1125,15 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             db.delete_session(query.message.chat_id, query.message.message_id)
         except Exception:
             pass
-        # Сохраняем _deliveries — параллельные загрузки могут ожидать доставки
+        # Сохраняем _deliveries и _cancel_flags — параллельные загрузки могут
+        # ожидать доставки или всё ещё выполняться (их кнопки должны работать)
         saved_deliveries = ctx.user_data.get("_deliveries")
+        saved_flags = ctx.user_data.get("_cancel_flags")
         ctx.user_data.clear()
         if saved_deliveries:
             ctx.user_data["_deliveries"] = saved_deliveries
+        if saved_flags:
+            ctx.user_data["_cancel_flags"] = saved_flags
         # Возвращаем пользователя на главное меню вместо тупика "Отменено"
         main_text, main_kb = _build_main_menu(user)
         try:
@@ -1540,6 +1565,7 @@ async def _handle_download_callback(query, ctx, data: str):
                 "Invalid format_id %r from user %s (not in offered formats)",
                 format_id, query.from_user.id,
             )
+            db.update_download(dl_id, status="error", error="invalid format_id")
             await query.answer("❌ Неверный формат. Отправьте ссылку заново.", show_alert=True)
             return
 
@@ -1550,7 +1576,8 @@ async def _handle_download_callback(query, ctx, data: str):
         # SEC: validate subtitle_lang (callback_data is user-controllable)
         if not subtitle_lang or not re.match(r'^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)?$', subtitle_lang):
             logger.warning("Invalid subtitle_lang %r from user %s", subtitle_lang, query.from_user.id)
-            await query.answer("\u274c \u041d\u0435\u043a\u043e\u0440\u0440\u0435\u043a\u0442\u043d\u044b\u0439 \u044f\u0437\u044b\u043a \u0441\u0443\u0431\u0442\u0438\u0442\u0440\u043e\u0432.", show_alert=True)
+            db.update_download(dl_id, status="error", error="invalid subtitle lang")
+            await query.answer("❌ Некорректный язык субтитров.", show_alert=True)
             return
         format_id = "best"
 
@@ -1598,10 +1625,6 @@ async def _handle_download_callback(query, ctx, data: str):
     db.update_download(dl_id, title=info.title, format_id=format_id, quality=quality_label, status="downloading")
 
     cancel_flag = [False]
-    ctx.user_data["cancel_flag"] = cancel_flag
-    # Сохраняем текущую задачу — нужно для надёжной отмены через task.cancel()
-    # (при aria2c progress_hook вызывается редко, поэтому cancel_flag недостаточно)
-    ctx.user_data["_download_task"] = asyncio.current_task()
     cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]])
 
     try:
@@ -1626,6 +1649,10 @@ async def _handle_download_callback(query, ctx, data: str):
             parse_mode=ParseMode.HTML,
             reply_markup=cancel_kb,
         )
+
+    # Регистрируем флаг отмены по message_id статусного сообщения — у каждой
+    # параллельной загрузки свой флаг, кнопка «Отменить» останавливает именно её.
+    ctx.user_data.setdefault("_cancel_flags", {})[status_msg.message_id] = cancel_flag
 
     async def _on_progress(tracker: ProgressTracker) -> None:
         if cancel_flag[0]:
@@ -1694,6 +1721,8 @@ async def _handle_download_callback(query, ctx, data: str):
         tmp_dir.resolve().relative_to(config.DOWNLOAD_DIR.resolve())
     except ValueError:
         logger.error("Download dir path traversal: %s is outside %s", tmp_dir, config.DOWNLOAD_DIR)
+        db.update_download(dl_id, status="error", error="download dir validation failed")
+        ctx.user_data.get("_cancel_flags", {}).pop(status_msg.message_id, None)
         await query.answer("❌ Внутренняя ошибка.", show_alert=True)
         return
     # Если все слоты заняты — уведомляем пользователя и ждём в очереди.
@@ -1735,8 +1764,7 @@ async def _handle_download_callback(query, ctx, data: str):
                     cancel_flag=cancel_flag,
                 )
 
-                ctx.user_data.pop("cancel_flag", None)
-                ctx.user_data.pop("_download_task", None)
+                ctx.user_data.get("_cancel_flags", {}).pop(status_msg.message_id, None)
 
                 if not result.success:
                     _caption, _keyboard = _build_quality_menu(info)
@@ -1794,6 +1822,13 @@ async def _handle_download_callback(query, ctx, data: str):
                         # Привязываем delivery к dl_id (не к глобальному user_data),
                         # чтобы параллельные загрузки не перезаписывали друг друга.
                         deliveries = ctx.user_data.setdefault("_deliveries", {})
+                        # Чистим записи, чей файл уже удалён по TTL — иначе словарь
+                        # растёт неограниченно, если кнопку доставки так и не нажали
+                        for _stale_id in [
+                            k for k, v in deliveries.items()
+                            if not fileserver.get_entry(v["token"])
+                        ]:
+                            deliveries.pop(_stale_id, None)
                         deliveries[dl_id] = {
                             "token": fs_token,
                             "dl_id": dl_id,
@@ -1894,8 +1929,7 @@ async def _handle_download_callback(query, ctx, data: str):
                     pass
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
-                ctx.user_data.pop("cancel_flag", None)
-                ctx.user_data.pop("_download_task", None)
+                ctx.user_data.get("_cancel_flags", {}).pop(status_msg.message_id, None)
                 # KEY_VIDEO_INFO и KEY_PENDING_URL не очищаем — пользователь может
                 # скачать другой формат без повторной отправки ссылки.
                 # Сессия удаляется только при явной отмене (❌ Отмена).
@@ -2007,7 +2041,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
         # Планируем уведомление за 10 мин до истечения TTL
         notify_delay = config.FILE_TTL_SECONDS - 600
         if notify_delay > 60:
-            asyncio.create_task(
+            _spawn_bg(
                 _notify_link_expiry(ctx.bot, query.message.chat_id, title, info_url, token, notify_delay),
                 name=f"link_expiry_{query.message.chat_id}",
             )
@@ -2254,7 +2288,7 @@ async def _deliver_file(chat_id: int, result: DownloadResult, bot: Bot, keep_fil
     """
     fp = result.file_path
     caption = f"📁 {fp.stem[:200]}  ({_human_size(result.file_size)})"
-    is_audio = fp.suffix in (".mp3", ".ogg", ".m4a", ".flac", ".wav", ".opus")
+    is_audio = fp.suffix.lower() in (".mp3", ".ogg", ".m4a", ".flac", ".wav", ".opus", ".aac")
 
     if config.LOCAL_API_SERVER:
         # local_mode=True: передаём абсолютный путь — локальный Bot API сервер
@@ -2498,6 +2532,18 @@ def _login_required_text(err: str) -> str | None:
     )
 
 
+# Сильные ссылки на фоновые задачи: event loop хранит только слабую ссылку,
+# без своей ссылки задача может быть собрана GC до выполнения (см. docs create_task).
+_bg_tasks: set = set()
+
+
+def _spawn_bg(coro, name: str) -> None:
+    """create_task + удержание сильной ссылки до завершения задачи."""
+    task = asyncio.create_task(coro, name=name)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
+
+
 def _schedule_delete(bot, chat_id: int, message_id: int, delay: int = 0) -> None:
     """Планирует удаление сообщения через delay секунд (если AUTO_DELETE_SECONDS > 0)."""
     secs = delay or config.AUTO_DELETE_SECONDS
@@ -2511,7 +2557,7 @@ def _schedule_delete(bot, chat_id: int, message_id: int, delay: int = 0) -> None
         except TelegramError:
             pass  # уже удалено или нет прав
 
-    asyncio.create_task(_do_delete(), name=f"auto_delete_{chat_id}_{message_id}")
+    _spawn_bg(_do_delete(), name=f"auto_delete_{chat_id}_{message_id}")
 
 
 def _human_size(n) -> str:

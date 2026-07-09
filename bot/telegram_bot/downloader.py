@@ -311,6 +311,15 @@ def get_audio_formats(formats: list[FormatInfo]) -> list[FormatInfo]:
     return [f for f in formats if f.is_audio_only][:5]
 
 
+# Расширения медиа-файлов, которые бот считает результатом загрузки.
+# Используется и в download_video (поиск файла), и в download_playlist (сбор
+# результатов): аудио-режим плейлиста без постпроцессора даёт .m4a/.opus/.webm.
+_MEDIA_EXTS = {
+    ".mp4", ".webm", ".mkv", ".avi", ".mov",
+    ".mp3", ".m4a", ".opus", ".ogg", ".flac", ".wav", ".aac",
+}
+
+
 # ── Download ────────────────────────────────────────────────────────────────────
 
 class ProgressTracker:
@@ -490,8 +499,6 @@ async def download_video(
     if cancel_flag and cancel_flag[0]:
         return DownloadResult(success=False, error="CANCELLED")
 
-    _MEDIA_EXTS = {".mp4", ".mp3", ".opus", ".wav", ".webm", ".mkv", ".m4a", ".flac", ".ogg", ".avi", ".mov", ".aac"}
-
     file_path: Path = result_holder.get("file_path")
     if not file_path or not file_path.exists():
         # Try to find the downloaded file, preferring known media extensions
@@ -591,7 +598,9 @@ async def download_playlist(
         if f.is_symlink():
             logger.warning("Skipping symlink in playlist output: %s", f)
             continue
-        if not f.is_file() or f.suffix not in (".mp4", ".webm", ".mkv", ".mp3"):
+        # _MEDIA_EXTS вместо жёсткого списка: аудио-режим (bestaudio без
+        # постпроцессора) даёт .m4a/.opus/.webm — раньше такие файлы терялись
+        if not f.is_file() or f.suffix.lower() not in _MEDIA_EXTS:
             continue
         try:
             f.resolve().relative_to(base_resolved)
@@ -619,7 +628,13 @@ _EXTRACTORS: list | None = None
 
 
 def _is_ssrf_url(url: str) -> bool:
-    """Возвращает True, если URL ведёт на приватный/loopback адрес (SSRF-защита)."""
+    """Возвращает True, если URL ведёт на приватный/loopback адрес (SSRF-защита).
+
+    Известное ограничение: проверка резолвит имя в момент вызова, а yt-dlp
+    резолвит его повторно при загрузке — DNS rebinding (TOCTOU) полностью
+    не закрывается. Здесь отсекаем очевидные попытки достучаться до
+    внутренней сети; сетевая изоляция контейнера — вторая линия защиты.
+    """
     try:
         parsed = urlparse(url)
         hostname = parsed.hostname
@@ -636,14 +651,10 @@ def _is_ssrf_url(url: str) -> bool:
                 ip = ipaddress.ip_address(ip_str)
             except ValueError:
                 return True
-            if (
-                ip.is_loopback
-                or ip.is_private
-                or ip.is_link_local
-                or ip.is_multicast
-                or ip.is_reserved
-                or ip.is_unspecified
-            ):
+            # not is_global покрывает loopback/private/link-local/multicast/
+            # reserved/unspecified, а также CGNAT 100.64.0.0/10 и 6to4-релеи,
+            # которые перечисление отдельных флагов пропускало.
+            if not ip.is_global:
                 return True
         return False
     except Exception:

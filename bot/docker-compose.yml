@@ -22,8 +22,10 @@ services:
         ipv4_address: 10.10.2.3   # фиксированный IP для ограничения исходящего трафика в nftables
     healthcheck:
       # 404 at root is normal — the server is up. wget exits 8 on HTTP errors,
-      # so we accept codes 0 and 8 (any HTTP response = healthy).
-      test: ["CMD-SHELL", "wget -q --timeout=5 http://localhost:8081; [ $? -le 8 ]"]
+      # so we accept codes 0 and 8 ONLY (any HTTP response = healthy).
+      # NB: `[ $? -le 8 ]` было бы ошибкой — коды 1-7 (DNS failure, connection
+      # refused) означают недоступный сервер, но тоже проходили бы проверку.
+      test: ["CMD-SHELL", "wget -q --timeout=5 -O /dev/null http://localhost:8081; rc=$?; [ $rc -eq 0 ] || [ $rc -eq 8 ]"]
       interval: 30s
       timeout: 10s
       retries: 10
