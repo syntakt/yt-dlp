@@ -49,7 +49,7 @@ tail -f "$CF_LOG" &
 
 # Ищем URL в логах (cloudflared печатает его в первые ~15 сек)
 FOUND=0
-for i in $(seq 1 90); do
+for _ in $(seq 1 90); do
     URL=$(grep -oE 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' "$CF_LOG" 2>/dev/null | head -1)
     if [ -n "$URL" ]; then
         # Атомарная запись: write→rename, чтобы бот не прочитал частично записанный файл

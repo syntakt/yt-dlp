@@ -108,9 +108,13 @@ All settings are in `.env` (see `.env.example`):
 | `BOT_TOKEN` | — | **Required.** Telegram bot token |
 | `ADMIN_IDS` | — | **Required.** Comma-separated admin user IDs |
 | `REGISTRATION_MODE` | `closed` | `closed` = admin approves; `open` = anyone |
-| `MAX_FILE_SIZE_MB` | `50` | Max upload size (Telegram limit: 50 MB) |
-| `DOWNLOAD_TIMEOUT` | `600` | Per-download timeout (seconds) |
+| `MAX_FILE_SIZE_MB` | `10240` | Max downloaded file size; file-server links support the full configured limit |
+| `DOWNLOAD_TIMEOUT` | `3600` | Per-download timeout (seconds) |
+| `INFO_TIMEOUT` | `120` | Metadata extraction timeout (seconds) |
 | `MAX_CONCURRENT_DOWNLOADS` | `3` | Parallel download limit |
+| `MAX_CONCURRENT_DOWNLOADS_PER_USER` | `1` | Active download limit per user |
+| `MAX_PLAYLIST_TOTAL_MB` | `10240` | Aggregate size limit for one playlist |
+| `MIN_FREE_DISK_MB` | `1024` | Disk space that downloads must leave free |
 | `ALLOW_PLAYLISTS` | `true` | Enable playlist downloads |
 | `ALLOW_AUDIO` | `true` | Enable audio-only (MP3) |
 | `ALLOW_SUBTITLES` | `true` | Enable subtitle download |
@@ -122,6 +126,8 @@ All settings are in `.env` (see `.env.example`):
 | `DIRECT_BASE_URL` | — | Direct HTTPS URL, usually served by manually configured nginx |
 | `RELAY_BASE_URLS` | — | Comma-separated relay HTTPS base URLs |
 | `ALLOW_GENERIC_URLS` | `false` | Allow yt-dlp generic extractor for arbitrary HTTP(S) pages |
+| `SSRF_PROTECTION` | `true` | Reject non-public DNS results on every yt-dlp connection |
+| `TRUST_PROXY_FOR_SSRF` | `false` | Opt in only for a proxy that filters private destinations itself |
 
 ---
 
@@ -145,12 +151,15 @@ cd bot && ./deploy.sh
 
 ## File size limits
 
-Telegram bots can send files up to **50 MB**. For larger downloads, the bot
-will inform you that the file is too big. You can work around this by:
+The configured download limit is **10 GB** by default. Files delivered through
+the built-in signed-link file server can use that full limit. Direct Telegram
+delivery through the local Bot API is limited by Telegram to **2 GB**.
+
+For files that do not fit the selected delivery channel:
 
 - Choosing a lower quality
 - Using audio-only mode
-- Increasing `MAX_FILE_SIZE_MB` — note this won't bypass Telegram's hard cap
+- Configure `PUBLIC_BASE_URL`, `DIRECT_BASE_URL`, or `RELAY_BASE_URLS` for signed links
 
 ---
 
@@ -160,6 +169,8 @@ will inform you that the file is too big. You can work around this by:
   (`.gitignore` already excludes `.env`)
 - The bot runs as a non-root user inside Docker
 - Only approved users can trigger downloads
+- Generic extraction is disabled and DNS answers are checked again on each
+  connection to prevent redirects or DNS rebinding into private networks
 
 ---
 

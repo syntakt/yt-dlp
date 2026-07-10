@@ -1,10 +1,8 @@
 import os
 import sqlite3
-import json
 import logging
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from typing import Optional
 
 from config import DB_PATH, MAX_HISTORY_PER_USER
@@ -291,7 +289,7 @@ def update_download(
         if val is not None:
             fields.append(f"{col} = ?")
             values.append(val)
-    if status in ("done", "error"):
+    if status in ("done", "error", "cancelled", "partial"):
         fields.append("finished_at = ?")
         values.append(datetime.now(timezone.utc).isoformat())
     if not fields:

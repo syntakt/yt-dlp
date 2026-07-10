@@ -11,7 +11,6 @@ import re
 import shutil
 import sqlite3
 import time
-import traceback
 from dataclasses import asdict
 from datetime import datetime
 import html as _html
@@ -48,12 +47,13 @@ import config
 import database as db
 import fileserver
 from downloader import (
+    DownloadCancelledError,
     DownloadResult,
     FormatInfo,
     ProgressTracker,
     VideoInfo,
+    disk_has_capacity,
     download_video,
-    get_audio_formats,
     get_best_video_formats,
     get_video_info,
     is_supported_url,
@@ -125,12 +125,26 @@ class _TokenMaskFormatter(logging.Formatter):
         return output
 
 # ── Session state keys ───────────────────────────────────────────────────────────
-KEY_VIDEO_INFO  = "video_info"
-KEY_DOWNLOAD_ID = "download_id"
-KEY_PENDING_URL = "pending_url"
-KEY_ORIG_URL    = "original_url"   # сохраняем оригинальный URL (с list=) для плейлиста
 KEY_MAIN_MENU_MSG = "main_menu_msg_id"  # message_id последнего сообщения главного меню
 KEY_QUALITY_MSG   = "quality_menu_msg_id"  # message_id меню выбора качества (для удаления при новой ссылке)
+KEY_BOUND_SESSIONS = "_bound_sessions"
+KEY_RESOLVE_SESSIONS = "_resolve_sessions"
+
+
+def _session_key(chat_id: int, message_id: int) -> tuple[int, int]:
+    return chat_id, message_id
+
+
+def _remember_bound_session(ctx, chat_id: int, message_id: int, url: str, info: VideoInfo) -> None:
+    sessions = ctx.user_data.setdefault(KEY_BOUND_SESSIONS, {})
+    sessions[_session_key(chat_id, message_id)] = (info, url)
+    while len(sessions) > 50:
+        sessions.pop(next(iter(sessions)))
+
+
+def _forget_bound_session(ctx, chat_id: int, message_id: int) -> None:
+    sessions = ctx.user_data.get(KEY_BOUND_SESSIONS) or {}
+    sessions.pop(_session_key(chat_id, message_id), None)
 
 
 
@@ -144,7 +158,11 @@ def _restore_session(ctx, chat_id: int, message_id: int, user_id: int = 0):
     Returns (info, url) or (None, None).
     """
     # DB first — keyed by message_id + user_id, correct even with multiple videos
-    session = db.get_session(chat_id, message_id, user_id=user_id)
+    try:
+        session = db.get_session(chat_id, message_id, user_id=user_id)
+    except sqlite3.Error as e:
+        logger.warning("DB session lookup failed: %s", e)
+        session = None
     if session:
         try:
             info = _deserialize_video_info(session["video_info_json"])
@@ -152,11 +170,11 @@ def _restore_session(ctx, chat_id: int, message_id: int, user_id: int = 0):
             return info, url
         except Exception as e:
             logger.warning("restore_session failed: %s", e)
-    # Fallback to user_data (single-URL flow, or DB unavailable)
-    info = ctx.user_data.get(KEY_VIDEO_INFO)
-    url = ctx.user_data.get(KEY_PENDING_URL)
-    if info and url:
-        return info, url
+    fallback = (ctx.user_data.get(KEY_BOUND_SESSIONS) or {}).get(
+        _session_key(chat_id, message_id)
+    )
+    if fallback:
+        return fallback
     return None, None
 
 
@@ -473,7 +491,10 @@ async def cmd_history(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     lines = ["📜 <b>Последние загрузки:</b>\n"]
     for i, row in enumerate(rows, 1):
-        status_icon = {"done": "✅", "error": "❌", "pending": "⏳"}.get(row["status"], "•")
+        status_icon = {
+            "done": "✅", "partial": "⚠️", "cancelled": "🛑",
+            "error": "❌", "ready": "📦", "pending": "⏳", "downloading": "⏳",
+        }.get(row["status"], "•")
         title = _esc((row["title"] or row["url"])[:50])  # MEDIUM-3: escape HTML
         lines.append(f"{i}. {status_icon} {title}")
         if row["quality"]:
@@ -577,7 +598,7 @@ def _build_status_text(user_id: int, verbose: bool = True) -> str:
                     text += f"   📥 Загрузок: {dl_count} ({dl_size})\n"
                     text += f"   🕐 Последняя: {last_dl}\n"
                 else:
-                    text += f"   📥 Загрузок: 0\n"
+                    text += "   📥 Загрузок: 0\n"
 
         # Ожидающие одобрения (отдельным блоком если есть)
         if stats['pending_requests']:
@@ -632,7 +653,14 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             await ctx.bot.delete_message(chat_id=update.effective_chat.id, message_id=prev_msg_id)
         except TelegramError:
             pass
-    ctx.user_data.clear()
+    for chat_id, message_id in list((ctx.user_data.get(KEY_BOUND_SESSIONS) or {}).keys()):
+        try:
+            db.delete_session(chat_id, message_id, user_id=update.effective_user.id)
+        except sqlite3.Error as e:
+            logger.warning("Could not delete cancelled session: %s", e)
+    ctx.user_data.pop(KEY_BOUND_SESSIONS, None)
+    ctx.user_data.pop(KEY_RESOLVE_SESSIONS, None)
+    ctx.user_data.pop(KEY_QUALITY_MSG, None)
     # Показываем главное меню вместо тупика "Отменено"
     user = update.effective_user
     text, keyboard = _build_main_menu(user)
@@ -697,6 +725,14 @@ def _extract_urls(text: str) -> list[str]:
     return [u[:2048] for u in urls]
 
 
+async def _filter_supported_urls(urls: list[str], limit: int = 5) -> list[str]:
+    candidates = urls[:limit]
+    checks = await asyncio.gather(*(
+        asyncio.to_thread(is_supported_url, url) for url in candidates
+    ))
+    return [url for url, supported in zip(candidates, checks) if supported]
+
+
 def _strip_playlist_param(url: str) -> str:
     """Убирает параметры list= и index= из YouTube URL."""
     parsed = urlparse(url)
@@ -718,6 +754,14 @@ def _redact_url_for_storage(url: str) -> str:
         return urlunparse(parsed._replace(netloc=netloc, query="", fragment=""))
     except Exception:
         return "<invalid-url>"
+
+
+def _safe_error_text(error: object) -> str:
+    """Remove bot credentials and user-supplied URLs from persisted errors."""
+    text = str(error)
+    if config.BOT_TOKEN:
+        text = text.replace(config.BOT_TOKEN, "<TOKEN>")
+    return re.sub(r'https?://[^\s<>"\']+', "<URL>", text)
 
 
 _SENSITIVE_QUERY_MARKERS = (
@@ -758,7 +802,17 @@ def _session_url_for_storage(url: str) -> Optional[str]:
         return None
 
 
-def _save_session_safe(chat_id: int, message_id: int, url: str, info: VideoInfo, user_id: int = 0) -> None:
+def _save_session_safe(
+    chat_id: int,
+    message_id: int,
+    url: str,
+    info: VideoInfo,
+    user_id: int = 0,
+    *,
+    ctx=None,
+) -> None:
+    if ctx is not None:
+        _remember_bound_session(ctx, chat_id, message_id, url, info)
     stored_url = _session_url_for_storage(url)
     if not stored_url:
         logger.info(
@@ -792,7 +846,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Ищем все URL в сообщении
     urls = _extract_urls(text)
-    valid_urls = [u for u in urls if is_supported_url(u)]
+    valid_urls = await _filter_supported_urls(urls)
 
     if not valid_urls:
         await update.message.reply_text(
@@ -824,21 +878,29 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         url = valid_urls[0]
         if _is_youtube_mixed_url(url):
             clean_url = _strip_playlist_param(url)
-            ctx.user_data[KEY_PENDING_URL] = clean_url
-            ctx.user_data[KEY_ORIG_URL] = url
             keyboard = InlineKeyboardMarkup([
                 [InlineKeyboardButton("📹 Скачать это видео", callback_data="resolve:video")],
                 [InlineKeyboardButton("📋 Скачать плейлист целиком", callback_data="resolve:playlist")],
                 [InlineKeyboardButton("❌ Отмена", callback_data="cancel")],
             ])
-            await update.effective_chat.send_message(
+            prompt = await update.effective_chat.send_message(
                 "🔗 Ссылка содержит и видео, и плейлист.\n"
                 "Что вы хотите скачать?",
                 reply_markup=keyboard,
             )
+            choices = ctx.user_data.setdefault(KEY_RESOLVE_SESSIONS, {})
+            choices[_session_key(prompt.chat_id, prompt.message_id)] = {
+                "video": clean_url,
+                "playlist": url,
+            }
             return
         msg = await update.effective_chat.send_message("🔍 Получаю информацию о видео…")
-        await _fetch_and_show_menu(url, msg, ctx, user_id=update.effective_user.id)
+        _spawn_update_task(
+            update,
+            ctx,
+            _fetch_and_show_menu(url, msg, ctx, user_id=update.effective_user.id),
+            name=f"metadata_{update.effective_user.id}_{msg.message_id}",
+        )
         return
 
     # Несколько ссылок — отправляем все статусы сразу, затем получаем инфо параллельно.
@@ -852,10 +914,13 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         msgs.append(msg)
     _uid = update.effective_user.id
-    await asyncio.gather(*(
-        _fetch_and_show_menu(url, msg, ctx, user_id=_uid)
-        for url, msg in zip(batch, msgs)
-    ))
+    for url, msg in zip(batch, msgs):
+        _spawn_update_task(
+            update,
+            ctx,
+            _fetch_and_show_menu(url, msg, ctx, user_id=_uid),
+            name=f"metadata_{_uid}_{msg.message_id}",
+        )
 
 
 async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -894,7 +959,7 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
         return
 
     urls = _extract_urls(raw)
-    valid = [u for u in urls if is_supported_url(u)]
+    valid = await _filter_supported_urls(urls)
     if not valid:
         await query.answer(
             results=[],
@@ -921,10 +986,11 @@ async def handle_inline_query(update: Update, ctx: ContextTypes.DEFAULT_TYPE) ->
 async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, user_id: int = 0):
     """Получает информацию о видео и показывает меню выбора качества."""
     try:
-        info: VideoInfo = await get_video_info(url)
+        async with ctx.bot_data["_metadata_sem"]:
+            info: VideoInfo = await get_video_info(url)
     except Exception as e:
-        logger.error("get_video_info error: %s", e)
-        err_str = str(e)
+        err_str = _safe_error_text(e)
+        logger.error("get_video_info error: %s", err_str)
         friendly = _login_required_text(err_str)
         if friendly:
             await msg.edit_text(friendly, parse_mode=ParseMode.HTML)
@@ -935,14 +1001,11 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
             )
         return
 
-    ctx.user_data[KEY_VIDEO_INFO] = info
-    ctx.user_data[KEY_PENDING_URL] = url
-
     if info.is_playlist:
         await _show_playlist_menu(msg, info, ctx)
         # Сохраняем сессию плейлиста в БД (для корректной работы при нескольких URL)
         try:
-            _save_session_safe(msg.chat_id, msg.message_id, url, info, user_id=user_id)
+            _save_session_safe(msg.chat_id, msg.message_id, url, info, user_id=user_id, ctx=ctx)
         except Exception as e:
             logger.warning("save_session (playlist) failed: %s", e)
     else:
@@ -951,7 +1014,7 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
             # Запоминаем message_id меню выбора качества — удалим при следующей ссылке.
             ctx.user_data[KEY_QUALITY_MSG] = sent.message_id
             try:
-                _save_session_safe(sent.chat_id, sent.message_id, url, info, user_id=user_id)
+                _save_session_safe(sent.chat_id, sent.message_id, url, info, user_id=user_id, ctx=ctx)
             except Exception as e:
                 logger.warning("save_session failed: %s", e)
 
@@ -1065,6 +1128,37 @@ async def _show_playlist_menu(msg: Message, info: VideoInfo, ctx: ContextTypes.D
 
 # ── Callback-обработчик ──────────────────────────────────────────────────────────
 
+def _claim_download(ctx, user_id: int, chat_id: int, message_id: int) -> str | None:
+    active_by_user = ctx.bot_data.setdefault("_active_downloads_by_user", {})
+    active_messages = ctx.bot_data.setdefault("_active_download_messages", set())
+    key = (user_id, chat_id, message_id)
+    if key in active_messages:
+        return "Эта загрузка уже запущена."
+    if active_by_user.get(user_id, 0) >= config.MAX_CONCURRENT_DOWNLOADS_PER_USER:
+        return (
+            f"Достигнут лимит активных загрузок: "
+            f"{config.MAX_CONCURRENT_DOWNLOADS_PER_USER}."
+        )
+    active_messages.add(key)
+    active_by_user[user_id] = active_by_user.get(user_id, 0) + 1
+    return None
+
+
+def _release_download(ctx, user_id: int, chat_id: int, message_id: int) -> None:
+    active_by_user = ctx.bot_data.get("_active_downloads_by_user") or {}
+    active_messages = ctx.bot_data.get("_active_download_messages") or set()
+    active_messages.discard((user_id, chat_id, message_id))
+    remaining = active_by_user.get(user_id, 0) - 1
+    if remaining > 0:
+        active_by_user[user_id] = remaining
+    else:
+        active_by_user.pop(user_id, None)
+
+
+def _spawn_update_task(update: Update, ctx, coro, name: str) -> None:
+    ctx.application.create_task(coro, update=update, name=name)
+
+
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = update.effective_user
@@ -1136,15 +1230,11 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             db.delete_session(query.message.chat_id, query.message.message_id, user_id=user.id)
         except Exception:
             pass
-        # Сохраняем _deliveries и _cancel_flags — параллельные загрузки могут
-        # ожидать доставки или всё ещё выполняться (их кнопки должны работать)
-        saved_deliveries = ctx.user_data.get("_deliveries")
-        saved_flags = ctx.user_data.get("_cancel_flags")
-        ctx.user_data.clear()
-        if saved_deliveries:
-            ctx.user_data["_deliveries"] = saved_deliveries
-        if saved_flags:
-            ctx.user_data["_cancel_flags"] = saved_flags
+        _forget_bound_session(ctx, query.message.chat_id, query.message.message_id)
+        resolve_sessions = ctx.user_data.get(KEY_RESOLVE_SESSIONS) or {}
+        resolve_sessions.pop(
+            _session_key(query.message.chat_id, query.message.message_id), None
+        )
         # Возвращаем пользователя на главное меню вместо тупика "Отменено"
         main_text, main_kb = _build_main_menu(user)
         try:
@@ -1175,7 +1265,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not info:
             await query.answer("❌ Сессия истекла. Отправьте ссылку заново.", show_alert=True)
             return
-        await _show_info(query, info, url=url or "")
+        await _show_info(query, info, ctx, url=url or "")
         return
 
     if data == "back_to_quality":
@@ -1183,12 +1273,22 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data == "refresh":
-        await _handle_refresh_quality(query, ctx)
+        _spawn_update_task(
+            update,
+            ctx,
+            _handle_refresh_quality(query, ctx),
+            name=f"refresh_{query.from_user.id}_{query.message.message_id}",
+        )
         return
 
     # Выбор: видео или плейлист для смешанного URL
     if data.startswith("resolve:"):
-        await _handle_resolve_callback(query, ctx, data)
+        _spawn_update_task(
+            update,
+            ctx,
+            _handle_resolve_callback(query, ctx, data),
+            name=f"resolve_{query.from_user.id}_{query.message.message_id}",
+        )
         return
 
     if data == "clear_history":
@@ -1208,11 +1308,56 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if data.startswith("deliver:"):
-        await _handle_deliver_callback(query, ctx, data)
+        _spawn_update_task(
+            update,
+            ctx,
+            _handle_deliver_callback(query, ctx, data),
+            name=f"deliver_{user.id}_{query.message.message_id}",
+        )
     elif data.startswith("dl:"):
-        await _handle_download_callback(query, ctx, data)
+        claim_error = _claim_download(
+            ctx, user.id, query.message.chat_id, query.message.message_id
+        )
+        if claim_error:
+            await query.message.reply_text(f"⚠️ {claim_error}")
+            return
+
+        async def _run_download():
+            try:
+                await _handle_download_callback(query, ctx, data)
+            finally:
+                _release_download(
+                    ctx, user.id, query.message.chat_id, query.message.message_id
+                )
+
+        _spawn_update_task(
+            update,
+            ctx,
+            _run_download(),
+            name=f"download_{user.id}_{query.message.message_id}",
+        )
     elif data.startswith("pl:"):
-        await _handle_playlist_callback(query, ctx, data)
+        claim_error = _claim_download(
+            ctx, user.id, query.message.chat_id, query.message.message_id
+        )
+        if claim_error:
+            await query.message.reply_text(f"⚠️ {claim_error}")
+            return
+
+        async def _run_playlist():
+            try:
+                await _handle_playlist_callback(query, ctx, data)
+            finally:
+                _release_download(
+                    ctx, user.id, query.message.chat_id, query.message.message_id
+                )
+
+        _spawn_update_task(
+            update,
+            ctx,
+            _run_playlist(),
+            name=f"playlist_{user.id}_{query.message.message_id}",
+        )
 
 
 async def _handle_menu_callback(query, ctx, data: str):
@@ -1239,7 +1384,10 @@ async def _handle_menu_callback(query, ctx, data: str):
         else:
             lines = ["📜 <b>Последние загрузки:</b>\n"]
             for i, row in enumerate(rows, 1):
-                icon = {"done": "✅", "error": "❌", "pending": "⏳"}.get(row["status"], "•")
+                icon = {
+                    "done": "✅", "partial": "⚠️", "cancelled": "🛑",
+                    "error": "❌", "ready": "📦", "pending": "⏳", "downloading": "⏳",
+                }.get(row["status"], "•")
                 title = _esc((row["title"] or row["url"])[:50])  # MEDIUM-3: escape HTML
                 lines.append(f"{i}. {icon} {title}")
             text = "\n".join(lines)
@@ -1333,14 +1481,12 @@ async def _handle_menu_callback(query, ctx, data: str):
 async def _handle_resolve_callback(query, ctx, data: str):
     """Обрабатывает выбор 'видео' или 'плейлист' для смешанного URL."""
     choice = data.split(":", 1)[1]
-
-    if choice == "video":
-        url = ctx.user_data.get(KEY_PENDING_URL)  # clean URL (без list=)
-    else:
-        url = ctx.user_data.get(KEY_ORIG_URL)  # оригинальный URL (с list=)
-
-    # Очищаем временный оригинальный URL — он больше не нужен
-    ctx.user_data.pop(KEY_ORIG_URL, None)
+    if choice not in {"video", "playlist"}:
+        await query.edit_message_text("❌ Некорректный выбор.")
+        return
+    choices = ctx.user_data.get(KEY_RESOLVE_SESSIONS) or {}
+    urls = choices.pop(_session_key(query.message.chat_id, query.message.message_id), None)
+    url = urls.get(choice) if urls else None
 
     if not url:
         await query.edit_message_text("❌ Сессия истекла. Отправьте ссылку заново.")
@@ -1350,7 +1496,7 @@ async def _handle_resolve_callback(query, ctx, data: str):
     await _fetch_and_show_menu(url, query.message, ctx, user_id=query.from_user.id)
 
 
-async def _show_info(query, info: VideoInfo, url: str = ""):
+async def _show_info(query, info: VideoInfo, ctx, url: str = ""):
     text = (
         f"ℹ️ <b>{_esc(info.title)}</b>\n\n"
         f"👤 Автор: {_esc(info.uploader or '—')}\n"
@@ -1370,7 +1516,10 @@ async def _show_info(query, info: VideoInfo, url: str = ""):
     # Сбрасываем таймер 2-часовой очистки при активном использовании
     if url:
         try:
-            _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
+            _save_session_safe(
+                query.message.chat_id, query.message.message_id, url, info,
+                user_id=query.from_user.id, ctx=ctx,
+            )
         except Exception:
             pass
 
@@ -1392,7 +1541,10 @@ async def _handle_back_to_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
     # Сбрасываем таймер 2-часовой очистки при активном использовании
     if url:
         try:
-            _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
+            _save_session_safe(
+                query.message.chat_id, query.message.message_id, url, info,
+                user_id=query.from_user.id, ctx=ctx,
+            )
         except Exception:
             pass
 
@@ -1416,9 +1568,11 @@ async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Повторная экстракция форматов
     try:
-        info: VideoInfo = await get_video_info(url)
+        async with ctx.bot_data["_metadata_sem"]:
+            info: VideoInfo = await get_video_info(url)
     except Exception as e:
-        logger.error("refresh get_video_info error: %s", e)
+        safe_error = _safe_error_text(e)
+        logger.error("refresh get_video_info error: %s", safe_error)
         # Восстанавливаем старое меню при ошибке
         if old_info:
             caption, keyboard = _build_quality_menu(old_info)
@@ -1429,7 +1583,7 @@ async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
                     await query.edit_message_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
                 except TelegramError:
                     pass
-        await query.answer(f"❌ Ошибка обновления: {str(e)[:100]}", show_alert=True)
+        await query.answer(f"❌ Ошибка обновления: {safe_error[:100]}", show_alert=True)
         return
 
     old_count = len(get_best_video_formats(old_info.formats)) if old_info else 0
@@ -1446,7 +1600,10 @@ async def _handle_refresh_quality(query, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Обновляем сессию в БД
     try:
-        _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
+        _save_session_safe(
+            query.message.chat_id, query.message.message_id, url, info,
+            user_id=query.from_user.id, ctx=ctx,
+        )
     except Exception:
         pass
 
@@ -1547,6 +1704,34 @@ def _estimate_download_size(fmt_obj: Optional[FormatInfo], duration: int, audio_
 _VALID_DL_TYPES = {"v", "a", "ao", "aw", "s"}
 
 
+def _build_delivery_buttons(dl_id: int) -> list[list[InlineKeyboardButton]]:
+    ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
+    buttons = [[InlineKeyboardButton(
+        "📤 Отправить в Telegram", callback_data=f"deliver:{dl_id}:tg"
+    )]]
+    if config.PUBLIC_BASE_URL:
+        buttons.append([InlineKeyboardButton(
+            f"🔗 Ссылка через Cloudflare ({ttl_h}ч)",
+            callback_data=f"deliver:{dl_id}:link",
+        )])
+    if config.DIRECT_BASE_URL:
+        buttons.append([InlineKeyboardButton(
+            f"🌐 Прямая ссылка с сервера ({ttl_h}ч)",
+            callback_data=f"deliver:{dl_id}:direct",
+        )])
+    for relay_idx, relay_url in enumerate(config.RELAY_BASE_URLS):
+        relay_host = urlparse(relay_url).netloc or f"relay {relay_idx + 1}"
+        label = (
+            f"🔄 Relay-ссылка ({ttl_h}ч)"
+            if len(config.RELAY_BASE_URLS) == 1
+            else f"🔄 Relay {relay_idx + 1}: {relay_host[:24]} ({ttl_h}ч)"
+        )
+        buttons.append([InlineKeyboardButton(
+            label, callback_data=f"deliver:{dl_id}:relay{relay_idx}"
+        )])
+    return buttons
+
+
 async def _handle_download_callback(query, ctx, data: str):
     # data: dl:<type>:<format_id>   type: v=video, a=audio, s=subtitle
     parts = data.split(":", 2)
@@ -1579,8 +1764,6 @@ async def _handle_download_callback(query, ctx, data: str):
     ctx.user_data.pop(KEY_QUALITY_MSG, None)
 
     dl_id = db.add_download(user.id, _redact_url_for_storage(url))
-    ctx.user_data[KEY_DOWNLOAD_ID] = dl_id
-
     # CRITICAL-3: validate format_id against known formats (allowlist)
     if dl_type == "v" and format_id not in ("best",):
         valid_fids = {f.format_id for f in info.formats}
@@ -1644,6 +1827,17 @@ async def _handle_download_callback(query, ctx, data: str):
         except TelegramError:
             pass
         db.update_download(dl_id, status="error", error=f"pre-check: too large ~{_est_size}")
+        return
+
+    if not disk_has_capacity(config.DOWNLOAD_DIR, _est_size or 0):
+        db.update_download(dl_id, status="error", error="insufficient free disk space")
+        _caption, _keyboard = _build_quality_menu(info)
+        await query.edit_message_text(
+            "⚠️ Недостаточно свободного места для этой загрузки. "
+            "Попробуйте выбрать меньший формат позже.\n\n" + _caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=_keyboard,
+        )
         return
 
     db.update_download(dl_id, title=info.title, format_id=format_id, quality=quality_label, status="downloading")
@@ -1733,9 +1927,13 @@ async def _handle_download_callback(query, ctx, data: str):
 
     # Перепривязываем сессию к текущему сообщению (если меню было фото и удалено)
     try:
-        _save_session_safe(status_msg.chat_id, status_msg.message_id, url, info, user_id=user.id)
+        _save_session_safe(
+            status_msg.chat_id, status_msg.message_id, url, info,
+            user_id=user.id, ctx=ctx,
+        )
         if _session_msg_id != status_msg.message_id:
             db.delete_session(_session_chat_id, _session_msg_id, user_id=user.id)
+            _forget_bound_session(ctx, _session_chat_id, _session_msg_id)
     except Exception as e:
         logger.warning("re-key session failed: %s", e)
 
@@ -1758,12 +1956,23 @@ async def _handle_download_callback(query, ctx, data: str):
                 f"{_esc(info.title)}\n\n"
                 f"Все {config.MAX_CONCURRENT_DOWNLOADS} слота заняты — загрузка начнётся автоматически.",
                 parse_mode=ParseMode.HTML,
+                reply_markup=cancel_kb,
             )
         except TelegramError:
             pass
 
     try:
         async with sem:
+            if cancel_flag[0]:
+                db.update_download(dl_id, status="cancelled", error="CANCELLED")
+                _caption, _keyboard = _build_quality_menu(info)
+                try:
+                    await status_msg.edit_text(
+                        _caption, parse_mode=ParseMode.HTML, reply_markup=_keyboard
+                    )
+                except TelegramError:
+                    pass
+                return
             # Если ждали в очереди — восстанавливаем статус "загружаю"
             if _need_queue:
                 try:
@@ -1794,12 +2003,16 @@ async def _handle_download_callback(query, ctx, data: str):
                     _caption, _keyboard = _build_quality_menu(info)
                     if result.error == "CANCELLED":
                         # Отмена через _cancel_hook — возвращаем меню качества
+                        db.update_download(
+                            dl_id, status="cancelled", error="CANCELLED"
+                        )
                         try:
                             await status_msg.edit_text(_caption, parse_mode=ParseMode.HTML, reply_markup=_keyboard)
                         except TelegramError:
                             pass
                         return
-                    db.update_download(dl_id, status="error", error=result.error)
+                    safe_error = _safe_error_text(result.error)
+                    db.update_download(dl_id, status="error", error=safe_error)
                     # Специальное сообщение для превышения лимита размера файла
                     if result.error and result.error.startswith("File too large"):
                         # Парсим "File too large: 12.3 GB (max 10.0 GB)" → берём размер
@@ -1813,7 +2026,7 @@ async def _handle_download_callback(query, ctx, data: str):
                     elif result.error and _login_required_text(result.error):
                         err_text = _login_required_text(result.error)
                     else:
-                        err_text = f"❌ Ошибка: <code>{_esc(result.error[:300])}</code>\n\n{_caption}"
+                        err_text = f"❌ Ошибка: <code>{_esc(safe_error[:300])}</code>\n\n{_caption}"
                     try:
                         await status_msg.edit_text(err_text, parse_mode=ParseMode.HTML, reply_markup=_keyboard)
                         _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
@@ -1821,11 +2034,12 @@ async def _handle_download_callback(query, ctx, data: str):
                         pass
                     return
 
-                db.update_download(dl_id, status="done", file_size=result.file_size)
-
                 # Re-auth: проверяем, не забанили ли пользователя во время загрузки
                 if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
                     logger.info("User %s was banned/revoked during download %d — file not delivered", user.id, dl_id)
+                    db.update_download(
+                        dl_id, status="error", error="access revoked before delivery"
+                    )
                     try:
                         await status_msg.edit_text("🚫 Ваш доступ был отозван. Файл не будет доставлен.")
                     except TelegramError:
@@ -1839,9 +2053,12 @@ async def _handle_download_callback(query, ctx, data: str):
                 )
                 if _has_fileserver:
                     # Файловый сервер включён — предлагаем выбор доставки
+                    fs_token = None
                     try:
                         fs_token = fileserver.move_and_register(
-                            result.file_path, config.FILE_TTL_SECONDS
+                            result.file_path,
+                            config.FILE_TTL_SECONDS,
+                            download_id=dl_id,
                         )
                         # Привязываем delivery к dl_id (не к глобальному user_data),
                         # чтобы параллельные загрузки не перезаписывали друг друга.
@@ -1861,34 +2078,7 @@ async def _handle_download_callback(query, ctx, data: str):
                             "file_size": result.file_size,
                             "title": result.title or info.title,
                         }
-                        ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
-                        deliver_buttons = [[
-                            InlineKeyboardButton(
-                                "📤 Отправить в Telegram",
-                                callback_data=f"deliver:{dl_id}:tg",
-                            ),
-                        ]]
-                        if config.PUBLIC_BASE_URL:
-                            deliver_buttons.append([InlineKeyboardButton(
-                                f"🔗 Ссылка через Cloudflare ({ttl_h}ч)",
-                                callback_data=f"deliver:{dl_id}:link",
-                            )])
-                        if config.DIRECT_BASE_URL:
-                            deliver_buttons.append([InlineKeyboardButton(
-                                f"🌐 Прямая ссылка с сервера ({ttl_h}ч)",
-                                callback_data=f"deliver:{dl_id}:direct",
-                            )])
-                        for relay_idx, relay_url in enumerate(config.RELAY_BASE_URLS):
-                            relay_host = urlparse(relay_url).netloc or f"relay {relay_idx + 1}"
-                            label = (
-                                f"🔄 Relay-ссылка ({ttl_h}ч)"
-                                if len(config.RELAY_BASE_URLS) == 1
-                                else f"🔄 Relay {relay_idx + 1}: {relay_host[:24]} ({ttl_h}ч)"
-                            )
-                            deliver_buttons.append([InlineKeyboardButton(
-                                label,
-                                callback_data=f"deliver:{dl_id}:relay{relay_idx}",
-                            )])
+                        deliver_buttons = _build_delivery_buttons(dl_id)
                         await status_msg.edit_text(
                             f"✅ <b>{_esc(result.title or info.title)}</b>\n"
                             f"📦 {_human_size(result.file_size)}\n\n"
@@ -1896,7 +2086,14 @@ async def _handle_download_callback(query, ctx, data: str):
                             parse_mode=ParseMode.HTML,
                             reply_markup=InlineKeyboardMarkup(deliver_buttons),
                         )
+                        db.update_download(
+                            dl_id, status="ready", file_size=result.file_size
+                        )
                     except Exception as e:
+                        if fs_token is not None:
+                            (ctx.user_data.get("_deliveries") or {}).pop(dl_id, None)
+                            fileserver.unregister(fs_token, delete_file=True)
+                            raise
                         logger.error("fileserver.move_and_register failed: %s", e)
                         # Фолбэк: отправляем через Telegram напрямую
                         await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
@@ -1914,6 +2111,9 @@ async def _handle_download_callback(query, ctx, data: str):
                             _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
                         except TelegramError:
                             pass
+                        db.update_download(
+                            dl_id, status="done", file_size=result.file_size
+                        )
                 else:
                     # Прямая отправка в Telegram
                     await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
@@ -1931,8 +2131,14 @@ async def _handle_download_callback(query, ctx, data: str):
                         _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
                     except TelegramError:
                         pass
+                    db.update_download(
+                        dl_id, status="done", file_size=result.file_size
+                    )
                     try:
-                        _save_session_safe(status_msg.chat_id, status_msg.message_id, url, info, user_id=user.id)
+                        _save_session_safe(
+                            status_msg.chat_id, status_msg.message_id, url, info,
+                            user_id=user.id, ctx=ctx,
+                        )
                     except Exception:
                         pass
 
@@ -1940,12 +2146,13 @@ async def _handle_download_callback(query, ctx, data: str):
                 raise  # Поднимаем наверх — будет поймано во внешнем try
 
             except Exception as e:
-                logger.error("Download error: %s\n%s", e, traceback.format_exc())
-                db.update_download(dl_id, status="error", error=str(e))
+                safe_error = _safe_error_text(e)
+                logger.error("Download error: %s", safe_error)
+                db.update_download(dl_id, status="error", error=safe_error)
                 _caption, _keyboard = _build_quality_menu(info)
                 try:
                     await status_msg.edit_text(
-                        f"❌ Неожиданная ошибка:\n<code>{_esc(str(e)[:200])}</code>\n\n{_caption}",
+                        f"❌ Неожиданная ошибка:\n<code>{_esc(safe_error[:200])}</code>\n\n{_caption}",
                         parse_mode=ParseMode.HTML,
                         reply_markup=_keyboard,
                     )
@@ -1954,14 +2161,13 @@ async def _handle_download_callback(query, ctx, data: str):
             finally:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 ctx.user_data.get("_cancel_flags", {}).pop(status_msg.message_id, None)
-                # KEY_VIDEO_INFO и KEY_PENDING_URL не очищаем — пользователь может
-                # скачать другой формат без повторной отправки ссылки.
-                # Сессия удаляется только при явной отмене (❌ Отмена).
+                # Сессия меню остаётся привязана к этому сообщению,
+                # чтобы можно было выбрать другой формат.
 
     except asyncio.CancelledError:
         # Не должно возникать при нормальной работе (task.cancel() больше не вызывается).
         # Оставляем как safety-net на случай внешней отмены задачи (например, shutdown бота).
-        db.update_download(dl_id, status="error", error="CANCELLED")
+        db.update_download(dl_id, status="cancelled", error="CANCELLED")
         raise
 
 
@@ -2044,8 +2250,6 @@ async def _handle_deliver_callback(query, ctx, data: str):
             deliveries.pop(cb_dl_id, None)
             return
 
-        deliveries.pop(cb_dl_id, None)
-
         base = (
             config.DIRECT_BASE_URL if action == "direct" else
             config.RELAY_BASE_URLS[relay_index] if relay_index is not None else
@@ -2062,31 +2266,45 @@ async def _handle_deliver_callback(query, ctx, data: str):
             "Cloudflare"
         )
 
-        # Планируем уведомление за 10 мин до истечения TTL
-        notify_delay = config.FILE_TTL_SECONDS - 600
-        if notify_delay > 60:
-            _spawn_bg(
-                _notify_link_expiry(ctx.bot, query.message.chat_id, title, info_url, token, notify_delay),
-                name=f"link_expiry_{query.message.chat_id}",
-            )
-
+        link_text = (
+            f"🔗 <b>Ссылка для скачивания ({via_label}):</b>\n"
+            f'<a href="{_html.escape(info_url, quote=True)}">{_esc(info_url)}</a>\n\n'
+            f"📦 {_human_size(file_size)}\n"
+            f"⏱ Действует <b>{ttl_h} ч</b> (удаляется после первого скачивания)\n\n"
+            + _caption
+        )
+        delivery_message = query.message
         try:
             await query.edit_message_text(
-                f"🔗 <b>Ссылка для скачивания ({via_label}):</b>\n"
-                f'<a href="{_html.escape(info_url, quote=True)}">{_esc(info_url)}</a>\n\n'
-                f"📦 {_human_size(file_size)}\n"
-                f"⏱ Действует <b>{ttl_h} ч</b> (удаляется после первого скачивания)\n\n"
-                + _caption,
+                link_text,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
                 reply_markup=_keyboard,
             )
             _schedule_delete(ctx.bot, query.message.chat_id, query.message.message_id)
         except TelegramError:
-            pass
+            delivery_message = await ctx.bot.send_message(
+                query.message.chat_id,
+                link_text,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True,
+                reply_markup=_keyboard,
+            )
+        deliveries.pop(cb_dl_id, None)
+        notify_delay = config.FILE_TTL_SECONDS - 600
+        if notify_delay > 60:
+            _spawn_bg(
+                _notify_link_expiry(
+                    ctx.bot, delivery_message.chat_id, title, info_url, token, notify_delay
+                ),
+                name=f"link_expiry_{delivery_message.chat_id}_{dl_id}",
+            )
         if url:
             try:
-                _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
+                _save_session_safe(
+                    delivery_message.chat_id, delivery_message.message_id, url, info,
+                    user_id=query.from_user.id, ctx=ctx,
+                )
             except Exception:
                 pass
         return
@@ -2121,7 +2339,9 @@ async def _handle_deliver_callback(query, ctx, data: str):
         try:
             await _deliver_file_with_progress(query.message.chat_id, result, ctx.bot, query.message)
         except Exception as e:
-            logger.error("Telegram delivery failed, cleaning up: %s", e)
+            safe_error = _safe_error_text(e)
+            logger.error("Telegram delivery failed, cleaning up: %s", safe_error)
+            db.update_download(dl_id, status="error", error=safe_error)
             entry.path.unlink(missing_ok=True)
             try:
                 entry.path.parent.rmdir()
@@ -2149,7 +2369,10 @@ async def _handle_deliver_callback(query, ctx, data: str):
             pass
         if url:
             try:
-                _save_session_safe(query.message.chat_id, query.message.message_id, url, info, user_id=query.from_user.id)
+                _save_session_safe(
+                    query.message.chat_id, query.message.message_id, url, info,
+                    user_id=query.from_user.id, ctx=ctx,
+                )
             except Exception:
                 pass
 
@@ -2173,35 +2396,63 @@ async def _handle_playlist_callback(query, ctx, data: str):
         await query.edit_message_text("❌ Сессия истекла.")
         return
     dl_id = db.add_download(user.id, _redact_url_for_storage(url))
+    db.update_download(
+        dl_id,
+        title=info.title,
+        format_id="bestaudio" if audio_only else "best",
+        quality="Аудио" if audio_only else "Лучшее качество",
+        status="downloading",
+    )
 
-    await query.edit_message_text(
+    if not disk_has_capacity(config.DOWNLOAD_DIR):
+        db.update_download(dl_id, status="error", error="insufficient free disk space")
+        await query.edit_message_text(
+            "⚠️ Недостаточно свободного места для загрузки плейлиста."
+        )
+        return
+
+    cancel_flag = [False]
+    cancel_kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🛑 Отменить", callback_data="cancel")
+    ]])
+
+    status_msg = await query.edit_message_text(
         f"⬇️ Загружаю плейлист: <b>{_esc(info.title)}</b>\n"
         f"До {max_items} видео\n\n⏳ Это может занять несколько минут…",
         parse_mode=ParseMode.HTML,
+        reply_markup=cancel_kb,
     )
+    ctx.user_data.setdefault("_cancel_flags", {})[status_msg.message_id] = cancel_flag
 
     tmp_dir = config.DOWNLOAD_DIR / f"user_{user.id}" / f"pl_{dl_id}"
     try:
         sem: asyncio.Semaphore = ctx.bot_data["_download_sem"]
         if sem.locked():
-            await query.edit_message_text(
+            await status_msg.edit_text(
                 f"⏳ <b>Плейлист в очереди загрузок</b>\n"
                 f"{_esc(info.title)}\n\n"
                 f"Все {config.MAX_CONCURRENT_DOWNLOADS} слота заняты — загрузка начнётся автоматически.",
                 parse_mode=ParseMode.HTML,
+                reply_markup=cancel_kb,
             )
         async with sem:
+            if cancel_flag[0]:
+                raise DownloadCancelledError("CANCELLED")
             from downloader import download_playlist
             results = await download_playlist(
                 url=url,
                 format_id="bestaudio" if audio_only else "best",
                 output_dir=tmp_dir,
                 max_items=max_items,
+                cancel_flag=cancel_flag,
             )
 
         # Re-auth: проверяем, не забанили ли пользователя во время загрузки плейлиста
         if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
             logger.info("User %s was banned/revoked during playlist download %d", user.id, dl_id)
+            db.update_download(
+                dl_id, status="error", error="access revoked before delivery"
+            )
             await ctx.bot.send_message(
                 query.message.chat_id,
                 "🚫 Ваш доступ был отозван. Файлы не будут доставлены.",
@@ -2275,16 +2526,30 @@ async def _handle_playlist_callback(query, ctx, data: str):
                 disable_web_page_preview=True,
             )
 
-        db.update_download(dl_id, title=info.title, status="done")
-        summary = f"✅ Плейлист готов. Отправлено: {sent}/{len(results)}"
+        expected = min(max_items, info.playlist_count) if info.playlist_count else max_items
+        is_partial = skipped > 0 or sent < expected
+        if is_partial:
+            final_status = "partial"
+        elif fs_links:
+            final_status = "ready"
+        else:
+            final_status = "done"
+        db.update_download(dl_id, title=info.title, status=final_status)
+        summary = f"✅ Плейлист обработан. Доступно: {sent}/{expected}"
         if skipped:
             summary += f" (пропущено {skipped} — превышен лимит размера)"
         await ctx.bot.send_message(query.message.chat_id, summary)
 
+    except DownloadCancelledError:
+        db.update_download(dl_id, status="cancelled", error="CANCELLED")
+        try:
+            await status_msg.edit_text("⛔ Загрузка плейлиста отменена.")
+        except TelegramError:
+            pass
     except Exception as e:
-        logger.error("Playlist error: %s", e)
-        db.update_download(dl_id, status="error", error=str(e))
-        err_str = str(e)
+        err_str = _safe_error_text(e)
+        logger.error("Playlist error: %s", err_str)
+        db.update_download(dl_id, status="error", error=err_str)
         if "rate-limit" in err_str.lower() or "ratelimit" in err_str.lower() or "429" in err_str:
             user_msg = (
                 "⚠️ <b>YouTube ограничил скорость запросов</b>\n\n"
@@ -2296,6 +2561,7 @@ async def _handle_playlist_callback(query, ctx, data: str):
             user_msg = f"❌ Ошибка при загрузке плейлиста:\n<code>{_esc(err_str[:300])}</code>"
         await ctx.bot.send_message(query.message.chat_id, user_msg, parse_mode=ParseMode.HTML)
     finally:
+        ctx.user_data.get("_cancel_flags", {}).pop(status_msg.message_id, None)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
 
@@ -2659,28 +2925,29 @@ async def _cleanup_loop(bot: Bot) -> None:
 
 async def _post_init(application) -> None:
     application.bot_data["_download_sem"] = asyncio.Semaphore(config.MAX_CONCURRENT_DOWNLOADS)
-    task = asyncio.create_task(_cleanup_loop(application.bot))
-    application.bot_data["_cleanup_task"] = task
+    application.bot_data["_metadata_sem"] = asyncio.Semaphore(
+        max(2, config.MAX_CONCURRENT_DOWNLOADS * 2)
+    )
 
     # Файловый HTTP-сервер: запускается если задан любой внешний URL раздачи.
     if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS:
-        try:
-            await fileserver.start(port=config.HTTP_PORT)
-            urls = []
-            if config.PUBLIC_BASE_URL:
-                urls.append(f"туннель: {config.PUBLIC_BASE_URL}")
-            if config.DIRECT_BASE_URL:
-                urls.append(f"прямой IP: {config.DIRECT_BASE_URL}")
-            for relay_idx, relay_url in enumerate(config.RELAY_BASE_URLS, 1):
-                urls.append(f"relay {relay_idx}: {relay_url}")
-            logger.info(
-                "Файловый сервер запущен: порт %d | %s",
-                config.HTTP_PORT, " | ".join(urls),
-            )
-        except Exception as e:
-            logger.error("Не удалось запустить файловый сервер: %s", e)
+        await fileserver.start(port=config.HTTP_PORT)
+        urls = []
+        if config.PUBLIC_BASE_URL:
+            urls.append(f"туннель: {config.PUBLIC_BASE_URL}")
+        if config.DIRECT_BASE_URL:
+            urls.append(f"прямой IP: {config.DIRECT_BASE_URL}")
+        for relay_idx, relay_url in enumerate(config.RELAY_BASE_URLS, 1):
+            urls.append(f"relay {relay_idx}: {relay_url}")
+        logger.info(
+            "Файловый сервер запущен: порт %d | %s",
+            config.HTTP_PORT, " | ".join(urls),
+        )
     else:
         logger.info("URL раздачи файлов не заданы — файловый сервер отключён")
+
+    task = asyncio.create_task(_cleanup_loop(application.bot))
+    application.bot_data["_cleanup_task"] = task
 
     # Устанавливаем список команд (видны при вводе "/" в Telegram)
     try:

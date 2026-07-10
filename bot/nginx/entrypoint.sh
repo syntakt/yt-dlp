@@ -70,6 +70,7 @@ if [ -n "${CERTBOT_EMAIL:-}" ]; then
 fi
 
 # ── Генерация nginx.conf из шаблона ──────────────────────────────────────────
+# shellcheck disable=SC2016 # envsubst requires literal variable names here
 envsubst '${SSLIP_DOMAIN} ${HTTPS_PORT}' \
     < /etc/nginx/templates/nginx.conf.template \
     > /etc/nginx/nginx.conf

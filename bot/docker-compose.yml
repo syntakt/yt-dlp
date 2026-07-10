@@ -4,7 +4,7 @@ services:
   # Снимает лимит 50 МБ на файлы — позволяет отправлять до 2 ГБ.
   # Требует: TELEGRAM_API_ID и TELEGRAM_API_HASH из https://my.telegram.org
   telegram-bot-api:
-    image: aiogram/telegram-bot-api:9.4
+    image: aiogram/telegram-bot-api:10.1
     container_name: telegram-bot-api
     restart: unless-stopped
     environment:
@@ -50,8 +50,53 @@ services:
         condition: service_healthy
 
     # ── Переменные окружения ─────────────────────────────────────────────────
-    env_file:
-      - .env
+    # Явный allowlist не передаёт боту TELEGRAM_API_HASH и токен Cloudflare.
+    environment:
+      BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
+      ADMIN_IDS: ${ADMIN_IDS:?ADMIN_IDS is required}
+      LOCAL_API_SERVER: ${LOCAL_API_SERVER:-http://telegram-bot-api:8081}
+      REGISTRATION_MODE: ${REGISTRATION_MODE:-closed}
+      MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-10240}
+      DOWNLOAD_TIMEOUT: ${DOWNLOAD_TIMEOUT:-3600}
+      INFO_TIMEOUT: ${INFO_TIMEOUT:-120}
+      MAX_CONCURRENT_DOWNLOADS: ${MAX_CONCURRENT_DOWNLOADS:-3}
+      MAX_CONCURRENT_DOWNLOADS_PER_USER: ${MAX_CONCURRENT_DOWNLOADS_PER_USER:-1}
+      MAX_HISTORY_PER_USER: ${MAX_HISTORY_PER_USER:-50}
+      MAX_PLAYLIST_ITEMS: ${MAX_PLAYLIST_ITEMS:-10}
+      MAX_PLAYLIST_TOTAL_MB: ${MAX_PLAYLIST_TOTAL_MB:-10240}
+      MIN_FREE_DISK_MB: ${MIN_FREE_DISK_MB:-1024}
+      DOWNLOAD_DIR: /downloads
+      DB_PATH: /data/bot.db
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
+      DIRECT_BASE_URL: ${DIRECT_BASE_URL:-}
+      RELAY_BASE_URL: ${RELAY_BASE_URL:-}
+      RELAY_BASE_URLS: ${RELAY_BASE_URLS:-}
+      HTTP_PORT: ${HTTP_PORT:-8080}
+      FILE_TTL_HOURS: ${FILE_TTL_HOURS:-1}
+      SERVER_SECRET: ${SERVER_SECRET:-}
+      FS_RATE_LIMIT: ${FS_RATE_LIMIT:-30}
+      FS_TRUSTED_PROXY_CIDRS: ${FS_TRUSTED_PROXY_CIDRS:-10.10.2.0/24,127.0.0.1/32,::1/128}
+      ALLOW_PLAYLISTS: ${ALLOW_PLAYLISTS:-true}
+      ALLOW_AUDIO: ${ALLOW_AUDIO:-true}
+      ALLOW_SUBTITLES: ${ALLOW_SUBTITLES:-true}
+      ALLOW_OPUS: ${ALLOW_OPUS:-true}
+      ALLOW_WAV: ${ALLOW_WAV:-false}
+      USE_ARIA2C: ${USE_ARIA2C:-true}
+      USE_SPONSORBLOCK: ${USE_SPONSORBLOCK:-false}
+      ALLOW_GENERIC_URLS: ${ALLOW_GENERIC_URLS:-false}
+      SSRF_PROTECTION: ${SSRF_PROTECTION:-true}
+      TRUST_PROXY_FOR_SSRF: ${TRUST_PROXY_FOR_SSRF:-false}
+      PROXY_URL: ${PROXY_URL:-}
+      COOKIES_FILE: ${COOKIES_FILE:-}
+      AUTO_DELETE_SECONDS: ${AUTO_DELETE_SECONDS:-0}
+      WEBHOOK_URL: ${WEBHOOK_URL:-}
+      WEBHOOK_PORT: ${WEBHOOK_PORT:-8443}
+      WEBHOOK_SECRET_TOKEN: ${WEBHOOK_SECRET_TOKEN:-}
+      DISK_ALERT_THRESHOLD: ${DISK_ALERT_THRESHOLD:-80}
+      ENABLE_CLOUDFLARED: ${ENABLE_CLOUDFLARED:-false}
+      ENABLE_CLOUDFLARE_QUICK_TUNNEL: ${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-false}
+      PYTHONDONTWRITEBYTECODE: "1"
+      XDG_CACHE_HOME: /data/cache
 
     # ── Тома ────────────────────────────────────────────────────────────────
     volumes:
@@ -64,9 +109,19 @@ services:
       # Shared с cloudflared: entrypoint.sh читает URL тоннеля отсюда
       # (только в quick tunnel режиме; в named tunnel PUBLIC_BASE_URL берётся из .env)
       - cf-url:/cf-url
-    environment:
-      ENABLE_CLOUDFLARED: ${ENABLE_CLOUDFLARED:-false}
-      ENABLE_CLOUDFLARE_QUICK_TUNNEL: ${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-false}
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=64m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - DAC_OVERRIDE
+      - FOWNER
+      - SETGID
+      - SETUID
 
     # ── Лимиты ресурсов ──────────────────────────────────────────────────────
     # memory: файлы не буферизуются в RAM (стриминг при отправке в Telegram),
@@ -103,7 +158,7 @@ services:
 
     # ── Healthcheck ──────────────────────────────────────────────────────────
     healthcheck:
-      test: ["CMD", "python", "-c", "import yt_dlp; print('ok')"]
+      test: ["CMD", "python", "/app/healthcheck.py"]
       interval: 60s
       timeout: 10s
       retries: 3

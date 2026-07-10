@@ -1,7 +1,7 @@
 import asyncio
+from contextlib import contextmanager
 import ipaddress
 import logging
-import os
 import re
 import socket
 import threading
@@ -18,15 +18,54 @@ import shutil
 from config import (
     ALLOW_GENERIC_URLS,
     COOKIES_FILE,
-    DOWNLOAD_DIR,
     DOWNLOAD_TIMEOUT,
+    INFO_TIMEOUT,
     MAX_FILE_SIZE_BYTES,
+    MAX_PLAYLIST_TOTAL_BYTES,
+    MIN_FREE_DISK_BYTES,
     PROXY_URL,
+    SSRF_PROTECTION,
     USE_ARIA2C,
     USE_SPONSORBLOCK,
 )
 
 logger = logging.getLogger(__name__)
+
+
+_ORIGINAL_GETADDRINFO = getattr(
+    socket, "_ytdlp_bot_original_getaddrinfo", socket.getaddrinfo
+)
+if not hasattr(socket, "_ytdlp_bot_original_getaddrinfo"):
+    socket._ytdlp_bot_original_getaddrinfo = _ORIGINAL_GETADDRINFO
+_NETWORK_GUARD = threading.local()
+
+
+def _guarded_getaddrinfo(host, *args, **kwargs):
+    """Reject non-public DNS answers for guarded yt-dlp worker threads."""
+    answers = _ORIGINAL_GETADDRINFO(host, *args, **kwargs)
+    if not getattr(_NETWORK_GUARD, "enabled", False):
+        return answers
+    for answer in answers:
+        try:
+            address = ipaddress.ip_address(answer[4][0])
+        except (ValueError, IndexError, TypeError) as e:
+            raise socket.gaierror("blocked invalid DNS response") from e
+        if not address.is_global:
+            raise socket.gaierror(f"blocked non-public address for {host!r}")
+    return answers
+
+
+socket.getaddrinfo = _guarded_getaddrinfo
+
+
+@contextmanager
+def _guard_network():
+    previous = getattr(_NETWORK_GUARD, "enabled", False)
+    _NETWORK_GUARD.enabled = SSRF_PROTECTION
+    try:
+        yield
+    finally:
+        _NETWORK_GUARD.enabled = previous
 
 
 class _DownloadCancelled(BaseException):
@@ -36,6 +75,10 @@ class _DownloadCancelled(BaseException):
     `except Exception` внутри, поэтому только BaseException гарантированно
     пробьётся через все обёртки yt-dlp и отменит загрузку немедленно.
     """
+
+
+class DownloadCancelledError(Exception):
+    """A user-requested cancellation reported back to the async caller."""
 
 
 # ── Data classes ────────────────────────────────────────────────────────────────
@@ -132,20 +175,46 @@ def _base_opts() -> dict:
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": False,
+        "socket_timeout": 20,
+        "retries": 3,
+        "fragment_retries": 3,
+        "file_access_retries": 3,
     }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
         opts["cookiefile"] = COOKIES_FILE
-    if USE_ARIA2C and shutil.which("aria2c"):
+    if USE_ARIA2C and not SSRF_PROTECTION and shutil.which("aria2c"):
         # aria2c: до 16 параллельных соединений на файл — ускоряет HTTP/HTTPS загрузки
         opts["external_downloader"] = "aria2c"
         opts["external_downloader_args"] = {"default": ["-x16", "-s16", "-k1M", "--quiet"]}
     else:
         # Встроенный загрузчик yt-dlp: 3 потока для HLS/DASH фрагментов
         # (concurrent_fragment_downloads — официальная опция yt-dlp, см. README/download-options)
-        opts["concurrent_fragment_downloads"] = 3
+        # Keep network work in the guarded executor thread. Parallel fragment
+        # workers would not inherit the thread-local DNS policy.
+        opts["concurrent_fragment_downloads"] = 1 if SSRF_PROTECTION else 3
+        if SSRF_PROTECTION:
+            opts["hls_prefer_native"] = True
     return opts
+
+
+def disk_has_capacity(output_dir: Path, required_bytes: int = 0) -> bool:
+    """Return whether a download can preserve the configured free-space reserve."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    free = shutil.disk_usage(output_dir).free
+    return free >= MIN_FREE_DISK_BYTES + max(0, required_bytes)
+
+
+def _output_size(output_dir: Path) -> int:
+    total = 0
+    for path in output_dir.iterdir():
+        try:
+            if path.is_file() and not path.is_symlink():
+                total += path.stat().st_size
+        except OSError:
+            continue
+    return total
 
 
 def _human_size(n: Optional[int]) -> str:
@@ -187,10 +256,15 @@ async def get_video_info(url: str) -> VideoInfo:
     loop = asyncio.get_running_loop()
 
     def _extract():
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        with _guard_network(), yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
-    info = await loop.run_in_executor(None, _extract)
+    try:
+        info = await asyncio.wait_for(
+            loop.run_in_executor(None, _extract), timeout=INFO_TIMEOUT
+        )
+    except asyncio.TimeoutError as e:
+        raise TimeoutError("Metadata request timed out") from e
 
     is_playlist = info.get("_type") == "playlist"
     if is_playlist:
@@ -383,6 +457,7 @@ async def download_video(
     tracker = ProgressTracker(progress_callback, loop)
     deadline = time.monotonic() + DOWNLOAD_TIMEOUT
     timed_out = [False]
+    last_disk_check = [0.0]
 
     def _cancel_hook(d: dict) -> None:
         """Вызывается из yt-dlp прогресс-хука.
@@ -395,6 +470,11 @@ async def download_video(
         if time.monotonic() >= deadline:
             timed_out[0] = True
             raise _DownloadCancelled("TIMEOUT")
+        now = time.monotonic()
+        if now - last_disk_check[0] >= 1.0:
+            last_disk_check[0] = now
+            if not disk_has_capacity(output_dir):
+                raise _DownloadCancelled("DISK_FULL")
 
     if audio_only:
         if audio_format == "opus":
@@ -452,10 +532,8 @@ async def download_video(
     opts.update({
         "outtmpl": output_template,
         "progress_hooks": hooks,
-        "socket_timeout": 30,
-        "retries": 3,
-        "fragment_retries": 3,
-        "file_access_retries": 3,
+        "postprocessor_hooks": [_cancel_hook],
+        "max_filesize": MAX_FILE_SIZE_BYTES,
         "noplaylist": True,
     })
 
@@ -463,7 +541,7 @@ async def download_video(
 
     def _download():
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with _guard_network(), yt_dlp.YoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
                 result_holder["title"] = info.get("title", "")
@@ -487,11 +565,20 @@ async def download_video(
             # so it doesn't leak out of the executor thread.
             result_holder["error"] = str(e)
 
-    await loop.run_in_executor(None, _download)
+    worker = loop.run_in_executor(None, _download)
+    try:
+        await asyncio.wait_for(asyncio.shield(worker), timeout=DOWNLOAD_TIMEOUT + 60)
+    except asyncio.TimeoutError:
+        timed_out[0] = True
+        if cancel_flag is not None:
+            cancel_flag[0] = True
+        return DownloadResult(success=False, error="Download timed out")
 
     if "error" in result_holder:
         if result_holder["error"] == "TIMEOUT" or timed_out[0]:
             return DownloadResult(success=False, error="Download timed out")
+        if result_holder["error"] == "DISK_FULL":
+            return DownloadResult(success=False, error="Insufficient free disk space")
         if cancel_flag and cancel_flag[0]:
             return DownloadResult(success=False, error="CANCELLED")
         return DownloadResult(success=False, error=result_holder["error"])
@@ -538,6 +625,7 @@ async def download_playlist(
     format_id: str,
     output_dir: Path,
     max_items: int = 10,
+    cancel_flag: Optional[list] = None,
 ) -> list[DownloadResult]:
     output_dir.mkdir(parents=True, exist_ok=True)
     opts = _base_opts()
@@ -553,8 +641,6 @@ async def download_playlist(
         "outtmpl": str(output_dir / "%(playlist_index)s-%(title).60s.%(ext)s"),
         "noplaylist": False,
         "playlistend": max_items,
-        "socket_timeout": 30,
-        "retries": 5,
         # Задержки между запросами для обхода rate-limit YouTube
         "sleep_interval": 3,
         "max_sleep_interval": 8,
@@ -568,29 +654,56 @@ async def download_playlist(
     error_holder: dict = {}
     timeout = DOWNLOAD_TIMEOUT * max(1, max_items)
     deadline = time.monotonic() + timeout
+    last_disk_check = [0.0]
 
     def _deadline_hook(d: dict) -> None:
+        if cancel_flag and cancel_flag[0]:
+            raise _DownloadCancelled("CANCELLED")
         if time.monotonic() >= deadline:
             raise _DownloadCancelled("TIMEOUT")
+        now = time.monotonic()
+        if now - last_disk_check[0] >= 1.0:
+            last_disk_check[0] = now
+            if not disk_has_capacity(output_dir):
+                raise _DownloadCancelled("DISK_FULL")
+            if _output_size(output_dir) > MAX_PLAYLIST_TOTAL_BYTES:
+                raise _DownloadCancelled("PLAYLIST_TOTAL_LIMIT")
 
     opts["progress_hooks"] = [_deadline_hook]
+    opts["postprocessor_hooks"] = [_deadline_hook]
 
     def _download():
         try:
-            with yt_dlp.YoutubeDL(opts) as ydl:
+            with _guard_network(), yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.download([url])
         except _DownloadCancelled as e:
             error_holder["error"] = str(e) or "CANCELLED"
         except Exception as e:
             error_holder["error"] = str(e)
 
-    await loop.run_in_executor(None, _download)
-    if error_holder.get("error") == "TIMEOUT":
-        return [DownloadResult(success=False, error="Playlist download timed out")]
+    worker = loop.run_in_executor(None, _download)
+    try:
+        await asyncio.wait_for(asyncio.shield(worker), timeout=timeout + 60)
+    except asyncio.TimeoutError as e:
+        if cancel_flag is not None:
+            cancel_flag[0] = True
+        raise TimeoutError("Playlist download timed out") from e
+
+    error = error_holder.get("error")
+    if error == "TIMEOUT":
+        raise TimeoutError("Playlist download timed out")
+    if error == "CANCELLED" or (cancel_flag and cancel_flag[0]):
+        raise DownloadCancelledError("CANCELLED")
+    if error == "DISK_FULL":
+        raise RuntimeError("Insufficient free disk space")
+    if error == "PLAYLIST_TOTAL_LIMIT":
+        raise RuntimeError(
+            f"Playlist exceeded aggregate limit: {_human_size(MAX_PLAYLIST_TOTAL_BYTES)}"
+        )
 
     # Если плейлист не скачал ни одного файла и была ошибка — пробрасываем
-    if error_holder.get("error") and not any(output_dir.iterdir()):
-        raise RuntimeError(error_holder["error"])
+    if error and not any(output_dir.iterdir()):
+        raise RuntimeError(error)
 
     base_resolved = output_dir.resolve()
     for f in sorted(output_dir.iterdir()):
@@ -667,7 +780,7 @@ def is_supported_url(url: str) -> bool:
     if not re.match(r"https?://", url, re.IGNORECASE):
         return False
     # SSRF: блокируем приватные/loopback адреса
-    if _is_ssrf_url(url):
+    if SSRF_PROTECTION and _is_ssrf_url(url):
         logger.warning("Blocked SSRF attempt: %s", _redact_url(url))
         return False
     if _EXTRACTORS is None:

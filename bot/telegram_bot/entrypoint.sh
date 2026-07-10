@@ -9,15 +9,16 @@ umask 0022
 
 # ── Права на смонтированных томах (нужны root-права, только здесь) ────────────
 # chown только корневые директории (без -R): на большом /downloads -R медленный
+mkdir -p /data/cache
 chown botuser:botuser /downloads /data 2>/dev/null || true
+chown botuser:botuser /data/cache 2>/dev/null || true
 chmod 755 /downloads 2>/dev/null || true
 chmod 700 /data 2>/dev/null || true
 
 # ── Quick Tunnel: подставляем URL если PUBLIC_BASE_URL не задан вручную ────────
 # Схема: cf-entrypoint.sh пишет URL в /cf-url/public_url после старта тоннеля.
 # Бот ждёт до 90 сек (cloudflared получает URL за ~10-15 сек).
-# Если CLOUDFLARE_TUNNEL_TOKEN задан (named tunnel) — PUBLIC_BASE_URL берётся из .env,
-# ждать не нужно.
+# Для Named Tunnel PUBLIC_BASE_URL задаётся вручную, поэтому ждать не нужно.
 CF_URL_FILE="/cf-url/public_url"
 
 cloudflared_enabled() {
@@ -36,12 +37,12 @@ quick_tunnel_enabled() {
 
 if ! cloudflared_enabled; then
     echo "[entrypoint] ENABLE_CLOUDFLARED=false — Cloudflare Tunnel отключён, Quick Tunnel не используется"
-elif [ -z "$PUBLIC_BASE_URL" ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ] && quick_tunnel_enabled; then
+elif [ -z "$PUBLIC_BASE_URL" ] && quick_tunnel_enabled; then
     echo "[entrypoint] PUBLIC_BASE_URL не задан — проверяю Quick Tunnel..."
     # Запоминаем stale URL (если есть), чтобы не принять его за новый
     STALE_URL=""
     if [ -f "$CF_URL_FILE" ] && [ -s "$CF_URL_FILE" ]; then
-        STALE_URL="$(cat "$CF_URL_FILE" | tr -d '[:space:]')"
+        STALE_URL="$(tr -d '[:space:]' < "$CF_URL_FILE")"
         # Если файл содержит URL (не STARTING) — это stale данные от прошлого запуска
         case "$STALE_URL" in
             https://*trycloudflare.com)
@@ -56,7 +57,7 @@ elif [ -z "$PUBLIC_BASE_URL" ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ] && quick_tun
     i=0
     while [ $i -lt 90 ]; do
         if [ -f "$CF_URL_FILE" ] && [ -s "$CF_URL_FILE" ]; then
-            CF_URL="$(cat "$CF_URL_FILE" | tr -d '[:space:]')"
+            CF_URL="$(tr -d '[:space:]' < "$CF_URL_FILE")"
             # Валидируем формат URL
             if echo "$CF_URL" | grep -qE '^https://[a-zA-Z0-9-]+\.trycloudflare\.com$'; then
                 # Пропускаем stale URL от прошлого запуска (ждём STARTING → новый URL)

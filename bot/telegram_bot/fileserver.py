@@ -24,7 +24,6 @@ import hmac as _hmac_mod
 import ipaddress
 import logging
 import os
-import shutil
 import time
 import uuid
 from collections import defaultdict
@@ -35,6 +34,7 @@ from urllib.parse import quote as _urlquote
 
 from aiohttp import web
 
+from config import FS_RATE_LIMIT as _RATE_LIMIT
 from config import SERVER_SECRET as _SERVER_SECRET_STR
 
 logger = logging.getLogger(__name__)
@@ -44,10 +44,6 @@ logger = logging.getLogger(__name__)
 # Секрет для HMAC-подписи токенов (задаётся в .env как SERVER_SECRET).
 # Если не задан — токены без подписи (UUID4 = 122 бит энтропии, всё ещё безопасно).
 _SERVER_SECRET: bytes = _SERVER_SECRET_STR.encode()
-
-# Максимум запросов с одного IP в минуту (защита от сканирования)
-_RATE_LIMIT: int = int(os.environ.get("FS_RATE_LIMIT", "30"))
-
 
 def _parse_trusted_proxy_cidrs() -> list[ipaddress._BaseNetwork]:
     raw = os.environ.get("FS_TRUSTED_PROXY_CIDRS", "10.10.2.0/24,127.0.0.1/32,::1/128")
@@ -73,6 +69,7 @@ class FileEntry:
     filename: str
     file_size: int
     expires_at: float   # unix timestamp
+    download_id: int | None = None
 
 
 # uuid_key (32 hex) → FileEntry
@@ -127,22 +124,41 @@ def _verify_token(token: str) -> Optional[str]:
 
 # ── Публичный API ────────────────────────────────────────────────────────────────
 
-def register_file(path: Path, ttl_seconds: int = 3600) -> str:
-    """Регистрирует уже существующий файл. Возвращает full_token."""
-    if not path.exists():
-        raise FileNotFoundError(f"Cannot register non-existent file: {path}")
+def _fileserver_root() -> Path:
+    from config import DOWNLOAD_DIR
+    return (DOWNLOAD_DIR / "fileserver").resolve()
+
+
+def _validate_served_path(path: Path) -> Path:
+    if path.is_symlink():
+        raise ValueError("symlinks are not allowed")
+    real = path.resolve(strict=True)
+    real.relative_to(_fileserver_root())
+    if not real.is_file():
+        raise ValueError("served path is not a regular file")
+    return real
+
+
+def register_file(
+    path: Path, ttl_seconds: int = 3600, *, download_id: int | None = None
+) -> str:
+    """Регистрирует файл, уже изолированный в DOWNLOAD_DIR/fileserver."""
+    real_path = _validate_served_path(path)
     uuid_key, full_token = _make_token()
     _registry[uuid_key] = FileEntry(
-        path=path,
-        filename=path.name,
-        file_size=path.stat().st_size,
+        path=real_path,
+        filename=real_path.name,
+        file_size=real_path.stat().st_size,
         expires_at=time.time() + ttl_seconds,
+        download_id=download_id,
     )
-    logger.info("Зарегистрирован '%s' → %s… (TTL=%ds)", path.name, uuid_key[:8], ttl_seconds)
+    logger.info("Зарегистрирован '%s' → %s… (TTL=%ds)", real_path.name, uuid_key[:8], ttl_seconds)
     return full_token
 
 
-def move_and_register(src: Path, ttl_seconds: int = 3600) -> str:
+def move_and_register(
+    src: Path, ttl_seconds: int = 3600, *, download_id: int | None = None
+) -> str:
     """Перемещает файл в изолированную директорию и регистрирует его.
 
     Возвращает full_token. Файл переносится из временной папки бота в
@@ -154,6 +170,9 @@ def move_and_register(src: Path, ttl_seconds: int = 3600) -> str:
     общий том /downloads:ro — независимо от umask процесса.
     """
     from config import DOWNLOAD_DIR
+    if src.is_symlink() or not src.is_file():
+        raise ValueError(f"Refusing to register non-regular file: {src}")
+    src.resolve(strict=True).relative_to(DOWNLOAD_DIR.resolve())
     uuid_key, full_token = _make_token()
     # Создаём промежуточный каталог /downloads/fileserver/ и uuid-подкаталог
     fs_root = DOWNLOAD_DIR / "fileserver"
@@ -163,15 +182,28 @@ def move_and_register(src: Path, ttl_seconds: int = 3600) -> str:
     serve_dir.mkdir(parents=True, exist_ok=True)
     serve_dir.chmod(0o755)
     dest = serve_dir / src.name
-    shutil.move(str(src), str(dest))
-    # Явно выставляем 644: файл должен быть читаем другим UID (telegram-bot-api)
-    dest.chmod(0o644)
-    _registry[uuid_key] = FileEntry(
-        path=dest,
-        filename=dest.name,
-        file_size=dest.stat().st_size,
-        expires_at=time.time() + ttl_seconds,
-    )
+    moved = False
+    try:
+        os.replace(src, dest)
+        moved = True
+        dest.chmod(0o644)
+        real_dest = _validate_served_path(dest)
+        _registry[uuid_key] = FileEntry(
+            path=real_dest,
+            filename=real_dest.name,
+            file_size=real_dest.stat().st_size,
+            expires_at=time.time() + ttl_seconds,
+            download_id=download_id,
+        )
+    except BaseException:
+        _registry.pop(uuid_key, None)
+        if moved and dest.exists() and not src.exists():
+            try:
+                os.replace(dest, src)
+            except OSError as rollback_error:
+                logger.error("Could not roll back failed file registration: %s", rollback_error)
+        _rmdir_safe(serve_dir)
+        raise
     logger.info(
         "Перемещён и зарегистрирован '%s' → %s… (TTL=%ds)", src.name, uuid_key[:8], ttl_seconds
     )
@@ -204,8 +236,7 @@ def unregister(full_token: str, *, delete_file: bool = False) -> None:
     if entry is None:
         return
     if delete_file:
-        entry.path.unlink(missing_ok=True)
-        _rmdir_safe(entry.path.parent)
+        _delete_entry_file(entry)
         logger.debug("Токен %s… отозван + файл удалён", uuid_key[:8])
     else:
         logger.debug("Токен %s… отозван (файл сохранён)", uuid_key[:8])
@@ -216,9 +247,32 @@ def unregister(full_token: str, *, delete_file: bool = False) -> None:
 def _remove(uuid_key: str, reason: str = "") -> None:
     entry = _registry.pop(uuid_key, None)
     if entry:
-        entry.path.unlink(missing_ok=True)
-        _rmdir_safe(entry.path.parent)
+        _delete_entry_file(entry)
+        _update_download_status(entry, "error", reason or "file link expired")
         logger.info("Файл '%s' удалён (%s)", entry.filename, reason)
+
+
+def _delete_entry_file(entry: FileEntry) -> None:
+    try:
+        real_path = _validate_served_path(entry.path)
+    except (ValueError, OSError):
+        logger.error("Refusing to delete file outside fileserver root: %s", entry.path)
+        return
+    real_path.unlink(missing_ok=True)
+    _rmdir_safe(real_path.parent)
+
+
+def _update_download_status(
+    entry: FileEntry, status: str, error: str | None = None
+) -> None:
+    if entry.download_id is None:
+        return
+    try:
+        import database
+
+        database.update_download(entry.download_id, status=status, error=error)
+    except Exception as e:
+        logger.error("Could not update download %s status: %s", entry.download_id, e)
 
 
 def _rmdir_safe(d: Path) -> None:
@@ -453,12 +507,13 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
 
     if time.time() >= entry.expires_at:
         # TTL истёк — удаляем файл с диска (из реестра уже вынули выше)
-        entry.path.unlink(missing_ok=True)
-        _rmdir_safe(entry.path.parent)
+        _delete_entry_file(entry)
+        _update_download_status(entry, "error", "file link expired")
         logger.info("Файл '%s' удалён (TTL истёк на /dl/)", entry.filename)
         raise web.HTTPGone(reason="Срок действия ссылки истёк.", headers=_SEC_HEADERS)
 
     if not entry.path.exists():
+        _update_download_status(entry, "error", "file missing before delivery")
         raise web.HTTPNotFound(
             reason="Файл не найден на диске.",
             headers=_SEC_HEADERS,
@@ -467,17 +522,11 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
     # Defense-in-depth: реестр наполняется только внутренним кодом, но перед
     # отдачей проверяем, что путь реально внутри fileserver-каталога и это не
     # симлинк наружу (страховка от будущего бага/повреждённого реестра).
-    from config import DOWNLOAD_DIR
-    _fs_root = (DOWNLOAD_DIR / "fileserver").resolve()
     try:
-        _real = entry.path.resolve(strict=True)
-        _real.relative_to(_fs_root)
-        if entry.path.is_symlink():
-            raise ValueError("symlink")
+        entry.path = _validate_served_path(entry.path)
     except (ValueError, OSError):
         logger.error("Отклонена отдача файла вне fileserver-каталога: %s", entry.path)
-        entry.path.unlink(missing_ok=True)
-        _rmdir_safe(entry.path.parent)
+        _update_download_status(entry, "error", "file path validation failed")
         raise web.HTTPNotFound(headers=_SEC_HEADERS)
 
     file_size = entry.path.stat().st_size
@@ -499,7 +548,6 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
             **_SEC_HEADERS,
         }
     )
-    real_path = entry.path
     downloaded_ok = False
     try:
         await response.prepare(request)
@@ -520,12 +568,13 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
     finally:
         # Токен одноразовый и уже извлечён из реестра. Удаляем файл после любой
         # первой попытки /dl, включая обрыв соединения и ошибки prepare/write.
-        real_path.unlink(missing_ok=True)
-        _rmdir_safe(real_path.parent)
+        _delete_entry_file(entry)
 
     if downloaded_ok:
+        _update_download_status(entry, "done")
         logger.info("Файл '%s' успешно отдан клиенту %s и удалён", entry.filename, ip)
     else:
+        _update_download_status(entry, "error", "file delivery interrupted")
         logger.warning("Файл '%s' удалён после неуспешной попытки скачивания клиентом %s", entry.filename, ip)
 
     return response
@@ -588,6 +637,10 @@ def _restore_registry() -> None:
     restored = expired_removed = 0
 
     for serve_dir in fs_root.iterdir():
+        if serve_dir.is_symlink():
+            logger.warning("Удаляю симлинк из fileserver root: %s", serve_dir)
+            serve_dir.unlink(missing_ok=True)
+            continue
         if not serve_dir.is_dir():
             continue
         uuid_key = serve_dir.name
@@ -595,7 +648,12 @@ def _restore_registry() -> None:
         if len(uuid_key) != 32 or not all(c in "0123456789abcdef" for c in uuid_key):
             continue
 
-        files = [f for f in serve_dir.iterdir() if f.is_file()]
+        children = list(serve_dir.iterdir())
+        for child in children:
+            if child.is_symlink():
+                logger.warning("Удаляю симлинк из fileserver-каталога: %s", child)
+                child.unlink(missing_ok=True)
+        files = [f for f in children if not f.is_symlink() and f.is_file()]
         if not files:
             try:
                 serve_dir.rmdir()
@@ -603,7 +661,11 @@ def _restore_registry() -> None:
                 pass
             continue
 
-        f = files[0]
+        try:
+            f = _validate_served_path(files[0])
+        except (ValueError, OSError):
+            logger.warning("Пропускаю небезопасный файл при восстановлении: %s", files[0])
+            continue
         # В норме в serve_dir ровно один файл. Если их несколько (сбой/повреждение),
         # лишние не попадут в реестр и не будут удалены по /dl → чистим их сейчас,
         # чтобы не текла квота диска.

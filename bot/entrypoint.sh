@@ -24,23 +24,22 @@ quick_tunnel_enabled() {
 
 # Автозаполнение PUBLIC_BASE_URL только в quick tunnel режиме:
 # - PUBLIC_BASE_URL пустой (не задан в .env)
-# - CLOUDFLARE_TUNNEL_TOKEN тоже пустой (иначе это named tunnel — URL задаётся вручную)
 # - том /cf-url примонтирован (значит cloudflared используется)
 if ! cloudflared_enabled; then
     echo "[bot] ENABLE_CLOUDFLARED=false — Cloudflare Tunnel отключён"
-elif [ -z "$PUBLIC_BASE_URL" ] && [ -z "$CLOUDFLARE_TUNNEL_TOKEN" ] && quick_tunnel_enabled && [ -d "/cf-url" ]; then
+elif [ -z "$PUBLIC_BASE_URL" ] && quick_tunnel_enabled && [ -d "/cf-url" ]; then
     echo "[bot] Quick tunnel mode: ждём URL от cloudflared (max 3 мин)..."
     # Запоминаем stale URL от предыдущего запуска
     STALE_URL=""
     if [ -f "$CF_URL_FILE" ] && [ -s "$CF_URL_FILE" ]; then
-        _CONTENT="$(cat "$CF_URL_FILE" | tr -d '[:space:]')"
+        _CONTENT="$(tr -d '[:space:]' < "$CF_URL_FILE")"
         case "$_CONTENT" in
             https://*trycloudflare.com) STALE_URL="$_CONTENT" ;;
         esac
     fi
     for i in $(seq 1 90); do
         if [ -f "$CF_URL_FILE" ]; then
-            CF_CONTENT="$(cat "$CF_URL_FILE" | tr -d '[:space:]')"
+            CF_CONTENT="$(tr -d '[:space:]' < "$CF_URL_FILE")"
             case "$CF_CONTENT" in
                 https://*trycloudflare.com)
                     if [ -n "$STALE_URL" ] && [ "$CF_CONTENT" = "$STALE_URL" ]; then
