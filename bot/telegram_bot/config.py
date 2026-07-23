@@ -153,6 +153,33 @@ USE_ARIA2C = os.environ.get("USE_ARIA2C", "true").lower() == "true"
 # SponsorBlock: убирать рекламные вставки из YouTube-видео
 USE_SPONSORBLOCK = os.environ.get("USE_SPONSORBLOCK", "false").lower() == "true"
 
+# ── BitTorrent (magnet + .torrent) ────────────────────────────────────────────
+# По умолчанию ВЫКЛЮЧЕНО (opt-in): торренты расширяют поверхность атаки.
+# Скачивание идёт через aria2c (уже в образе). Модель безопасности:
+#   • Входящий порт НЕ публикуется и НЕ проксируется nftables — недостижим извне.
+#   • Не сидируем (seed-time=0) → только исходящие соединения, входящий порт не нужен.
+#   • DHT/LPD/PEX по умолчанию выключены → нет UDP-listener'ов и анонсов себя.
+#   • aria2c-подпроцесс НЕ наследует Python-SSRF-guard — трекеры проверяем сами,
+#     а доступ к приватной сети закрывается nftables egress (см. TELEGRAM_BOT.md).
+ALLOW_TORRENTS = _is_true("ALLOW_TORRENTS")
+# Агрегатный лимит размера всей раздачи (по умолчанию как у плейлиста).
+TORRENT_MAX_TOTAL_MB = _parse_int("TORRENT_MAX_TOTAL_MB", MAX_PLAYLIST_TOTAL_MB, minimum=1)
+TORRENT_MAX_TOTAL_BYTES = TORRENT_MAX_TOTAL_MB * 1024 * 1024
+# Таймаут всей торрент-загрузки (торренты медленные — дефолт 2 часа).
+TORRENT_TIMEOUT = _parse_int("TORRENT_TIMEOUT", 7200, minimum=60)
+# Ограничение числа пиров и скорости (0 = без лимита скорости).
+TORRENT_MAX_PEERS = _parse_int("TORRENT_MAX_PEERS", 50, minimum=1, maximum=1000)
+TORRENT_DOWNLOAD_LIMIT = _parse_int("TORRENT_DOWNLOAD_LIMIT", 0, minimum=0)
+# Фиксированный listen-порт (чтобы навесить DROP в nftables). НЕ публикуется наружу.
+TORRENT_LISTEN_PORT = _parse_int("TORRENT_LISTEN_PORT", 51413, minimum=1024, maximum=65535)
+# DHT: по умолчанию выключен (безопаснее). При выключенном DHT magnet без
+# трекеров (&tr=) может не получить метаданные.
+TORRENT_ENABLE_DHT = _is_true("TORRENT_ENABLE_DHT")
+# Отдавать только медиа-файлы (video/audio) из раздачи — в духе назначения бота.
+TORRENT_MEDIA_ONLY = _is_true("TORRENT_MEDIA_ONLY", "true")
+# Максимальный размер самого .torrent-файла, который принимаем документом (байт).
+TORRENT_FILE_MAX_BYTES = _parse_int("TORRENT_FILE_MAX_MB", 2, minimum=1, maximum=64) * 1024 * 1024
+
 # Generic extractor accepts arbitrary public HTTP(S) pages. Keep disabled by
 # default to reduce SSRF surface; enable only for trusted/private deployments.
 ALLOW_GENERIC_URLS = _is_true("ALLOW_GENERIC_URLS")
@@ -204,6 +231,18 @@ def validate_config() -> None:
 
     if REGISTRATION_MODE not in {"open", "closed"}:
         raise RuntimeError("REGISTRATION_MODE must be 'open' or 'closed'")
+
+    if ALLOW_TORRENTS:
+        import shutil as _shutil
+        if not _shutil.which("aria2c"):
+            _logger.warning(
+                "ALLOW_TORRENTS=true, но aria2c не найден в PATH — торренты работать не будут"
+            )
+        _logger.warning(
+            "ALLOW_TORRENTS=true — убедитесь, что торрент-порт %d НЕ проброшен наружу "
+            "и настроены nftables egress-правила (см. TELEGRAM_BOT.md)",
+            TORRENT_LISTEN_PORT,
+        )
 
     if PROXY_URL and SSRF_PROTECTION and not TRUST_PROXY_FOR_SSRF:
         raise RuntimeError(

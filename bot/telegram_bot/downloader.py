@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
 
@@ -27,6 +27,12 @@ from config import (
     SSRF_PROTECTION,
     USE_ARIA2C,
     USE_SPONSORBLOCK,
+    TORRENT_LISTEN_PORT,
+    TORRENT_MAX_PEERS,
+    TORRENT_ENABLE_DHT,
+    TORRENT_DOWNLOAD_LIMIT,
+    TORRENT_TIMEOUT,
+    TORRENT_MAX_TOTAL_BYTES,
 )
 
 logger = logging.getLogger(__name__)
@@ -796,3 +802,483 @@ def is_supported_url(url: str) -> bool:
         return True
     logger.warning("Blocked generic URL because ALLOW_GENERIC_URLS=false: %s", _redact_url(url))
     return False
+
+
+# ── BitTorrent (magnet + .torrent) через aria2c ──────────────────────────────────
+#
+# Модель безопасности (см. также config.py / TELEGRAM_BOT.md):
+#   • Не сидируем (--seed-time=0) → только исходящие соединения к пирам.
+#   • DHT/LPD/PEX по умолчанию выключены → нет UDP-listener'ов и анонсов себя.
+#   • listen-порт фиксирован и НЕ пробрасывается наружу (ни ports:, ни nftables DNAT).
+#   • aria2c — подпроцесс, он НЕ наследует Python-SSRF-guard. Трекеры проверяем сами
+#     (_torrent_trackers_are_safe), доступ к приватной сети закрывается nftables egress.
+
+
+class _BencodeError(ValueError):
+    """Некорректный bencode в .torrent-файле."""
+
+
+_BENCODE_MAX_DEPTH = 32  # .torrent не вкладывается глубоко; ограничение против stack overflow
+
+
+def _bdecode_at(data: bytes, i: int, depth: int = 0):
+    """Декодирует один bencode-элемент начиная с позиции i. Возвращает (value, next_i)."""
+    if depth > _BENCODE_MAX_DEPTH:
+        raise _BencodeError("bencode nesting too deep")
+    if i >= len(data):
+        raise _BencodeError("unexpected end of data")
+    c = data[i:i + 1]
+    if c == b"i":
+        end = data.index(b"e", i)
+        return int(data[i + 1:end]), end + 1
+    if c == b"l":
+        i += 1
+        out = []
+        while True:
+            if i >= len(data):
+                raise _BencodeError("unterminated list")
+            if data[i:i + 1] == b"e":
+                return out, i + 1
+            v, i = _bdecode_at(data, i, depth + 1)
+            out.append(v)
+    if c == b"d":
+        i += 1
+        out = {}
+        while True:
+            if i >= len(data):
+                raise _BencodeError("unterminated dict")
+            if data[i:i + 1] == b"e":
+                return out, i + 1
+            k, i = _bdecode_at(data, i, depth + 1)
+            v, i = _bdecode_at(data, i, depth + 1)
+            out[k] = v
+    if c.isdigit():
+        colon = data.index(b":", i)
+        length = int(data[i:colon])
+        if length < 0:
+            raise _BencodeError("negative string length")
+        start = colon + 1
+        end = start + length
+        if end > len(data):
+            raise _BencodeError("string length out of bounds")
+        return data[start:end], end
+    raise _BencodeError(f"invalid bencode token {c!r} at {i}")
+
+
+def _bdecode(data: bytes):
+    try:
+        value, _ = _bdecode_at(data, 0)
+    except (ValueError, IndexError) as e:
+        raise _BencodeError(str(e)) from e
+    return value
+
+
+def _b2s(b) -> str:
+    if isinstance(b, bytes):
+        return b.decode("utf-8", "replace")
+    return str(b)
+
+
+@dataclass
+class TorrentMeta:
+    name: str
+    total_size: Optional[int]      # суммарный размер всех файлов (None для magnet до метаданных)
+    files: list[str] = field(default_factory=list)  # относительные пути файлов
+    trackers: list[str] = field(default_factory=list)
+    btih: str = ""
+    source: str = ""               # magnet URI или путь к .torrent
+    is_magnet: bool = False
+
+    @property
+    def media_files(self) -> list[str]:
+        return [f for f in self.files if Path(f).suffix.lower() in _MEDIA_EXTS]
+
+
+_MAGNET_BTIH_RE = re.compile(r"^urn:btih:([0-9a-fA-F]{40}|[A-Za-z2-7]{32})$")
+
+
+def parse_magnet(uri: str) -> TorrentMeta:
+    """Парсит magnet-ссылку. Бросает ValueError при отсутствии валидного btih."""
+    parsed = urlparse(uri.strip())
+    if parsed.scheme != "magnet":
+        raise ValueError("not a magnet URI")
+    qs = parse_qs(parsed.query)
+    btih = ""
+    for xt in qs.get("xt", []):
+        m = _MAGNET_BTIH_RE.match(xt.strip())
+        if m:
+            btih = m.group(1).lower()
+            break
+    if not btih:
+        raise ValueError("magnet without a valid btih hash")
+    name = (qs.get("dn", [""])[0] or "").strip() or f"magnet-{btih[:12]}"
+    trackers = [t for t in qs.get("tr", []) if t]
+    return TorrentMeta(
+        name=name, total_size=None, files=[], trackers=trackers,
+        btih=btih, source=uri.strip(), is_magnet=True,
+    )
+
+
+def parse_torrent_file(path) -> TorrentMeta:
+    """Парсит .torrent-файл (bencode). Бросает ValueError при некорректном формате."""
+    data = Path(path).read_bytes()
+    meta = _bdecode(data)
+    if not isinstance(meta, dict):
+        raise ValueError("invalid torrent: top-level is not a dict")
+    info = meta.get(b"info")
+    if not isinstance(info, dict):
+        raise ValueError("invalid torrent: missing info dict")
+    name = _b2s(info.get(b"name", b"")) or "torrent"
+    files: list[str] = []
+    total = 0
+    if isinstance(info.get(b"files"), list):
+        # multi-file: каждый файл лежит внутри папки name/
+        for f in info[b"files"]:
+            if not isinstance(f, dict):
+                continue
+            total += int(f.get(b"length", 0) or 0)
+            parts = [_b2s(p) for p in (f.get(b"path") or [])]
+            files.append("/".join(parts) if parts else "")
+    else:
+        total = int(info.get(b"length", 0) or 0)
+        files.append(name)
+    trackers: list[str] = []
+    if b"announce" in meta:
+        trackers.append(_b2s(meta[b"announce"]))
+    for tier in (meta.get(b"announce-list") or []):
+        if isinstance(tier, list):
+            trackers.extend(_b2s(tr) for tr in tier)
+    return TorrentMeta(
+        name=name, total_size=total, files=files, trackers=trackers,
+        source=str(path), is_magnet=False,
+    )
+
+
+def _host_is_public(hostname: str) -> bool:
+    """True, если hostname резолвится ТОЛЬКО в глобальные (публичные) IP."""
+    if not hostname:
+        return False
+    try:
+        addrs = socket.getaddrinfo(hostname, None, proto=socket.IPPROTO_TCP)
+    except OSError:
+        return False
+    for _family, _t, _p, _c, sockaddr in addrs:
+        try:
+            ip = ipaddress.ip_address(sockaddr[0])
+        except (ValueError, IndexError):
+            return False
+        if not ip.is_global:
+            return False
+    return True
+
+
+def _torrent_trackers_are_safe(trackers: list[str]) -> bool:
+    """При включённой SSRF-защите отклоняет трекеры на приватных/loopback адресах.
+
+    Это best-effort: IP пиров, полученных от трекеров, aria2c не фильтрует —
+    основную защиту от SSRF даёт nftables egress (см. TELEGRAM_BOT.md).
+    """
+    if not SSRF_PROTECTION:
+        return True
+    for tr in trackers:
+        host = urlparse(tr).hostname
+        if not host:
+            continue
+        if not _host_is_public(host):
+            logger.warning("Blocked torrent tracker on non-public host: %s", host)
+            return False
+    return True
+
+
+def _build_aria2c_args(
+    source: str,
+    output_dir: Path,
+    *,
+    listen_port: int,
+    max_peers: int,
+    enable_dht: bool,
+    download_limit: int,
+    select_indices: Optional[list[int]] = None,
+    metadata_only: bool = False,
+) -> list[str]:
+    """Собирает hardened командную строку aria2c (чистая функция — тестируется отдельно)."""
+    dht = "true" if enable_dht else "false"
+    args = [
+        "aria2c",
+        "--dir", str(output_dir),
+        # ── Не работаем как сервер: не сидируем, только исходящие соединения ──
+        "--seed-time=0",
+        "--seed-ratio=0.0",
+        "--bt-detach-seed-only=true",
+        # ── Отключаем анонсы себя и UDP-listener'ы ──
+        f"--enable-dht={dht}",
+        f"--enable-dht6={dht}",
+        "--bt-enable-lpd=false",
+        "--enable-peer-exchange=false",
+        # ── Фиксированный порт (не пробрасывается наружу) ──
+        f"--listen-port={listen_port}",
+        f"--dht-listen-port={listen_port}",
+        f"--bt-max-peers={max_peers}",
+        # ── Прочее ──
+        "--file-allocation=none",
+        "--summary-interval=1",
+        "--console-log-level=warn",
+        "--check-integrity=true",
+        "--bt-stop-timeout=300",
+        "--max-file-not-found=3",
+        "--bt-tracker-connect-timeout=10",
+        "--bt-tracker-timeout=10",
+        "--no-conf=true",
+        "--auto-file-renaming=false",
+        "--allow-overwrite=false",
+        # RPC НЕ включаем: никаких дополнительных слушающих сокетов.
+    ]
+    if download_limit and download_limit > 0:
+        args.append(f"--max-overall-download-limit={download_limit}")
+    if metadata_only:
+        args += ["--bt-metadata-only=true", "--bt-save-metadata=true"]
+    if select_indices:
+        args.append("--select-file=" + ",".join(str(i) for i in select_indices))
+    args.append(source)
+    return args
+
+
+def _dir_size_recursive(path: Path) -> int:
+    """Суммарный размер всех файлов рекурсивно (мультифайловые торренты кладут файлы
+    во вложенную папку — нерекурсивный _output_size их не учёл бы)."""
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file() and not p.is_symlink():
+                total += p.stat().st_size
+        except OSError:
+            continue
+    return total
+
+
+async def _terminate_proc(proc) -> None:
+    """Мягко завершает aria2c (SIGTERM → SIGKILL). aria2c по SIGTERM корректно выходит."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=15)
+    except asyncio.TimeoutError:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
+_ARIA2_PCT_RE = re.compile(r"\((\d+)%\)")
+_ARIA2_SIZES_RE = re.compile(r"([0-9.]+[KMGT]?i?B)\s*/\s*([0-9.]+[KMGT]?i?B)")
+_ARIA2_DL_RE = re.compile(r"DL:\s*([0-9.]+[KMGT]?i?B)")
+_ARIA2_ETA_RE = re.compile(r"ETA:\s*(\S+)")
+_SIZE_UNITS = {"B": 1, "KIB": 1024, "MIB": 1024**2, "GIB": 1024**3, "TIB": 1024**4,
+               "KB": 1000, "MB": 1000**2, "GB": 1000**3, "TB": 1000**4}
+
+
+def _parse_aria2_size(text: str) -> int:
+    m = re.match(r"([0-9.]+)([KMGT]?i?B)", text)
+    if not m:
+        return 0
+    num = float(m.group(1))
+    unit = m.group(2).upper()
+    return int(num * _SIZE_UNITS.get(unit, 1))
+
+
+def _parse_eta_seconds(text: str) -> int:
+    total = 0
+    for value, unit in re.findall(r"(\d+)([dhms])", text):
+        total += int(value) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit]
+    return total
+
+
+async def fetch_magnet_metadata(magnet: str, meta_dir: Path) -> TorrentMeta:
+    """Скачивает только метаданные magnet (без данных) и возвращает TorrentMeta с размером."""
+    meta_dir.mkdir(parents=True, exist_ok=True)
+    base = parse_magnet(magnet)
+    if not _torrent_trackers_are_safe(base.trackers):
+        raise RuntimeError("Tracker points to a non-public address")
+    args = _build_aria2c_args(
+        magnet, meta_dir,
+        listen_port=TORRENT_LISTEN_PORT, max_peers=TORRENT_MAX_PEERS,
+        enable_dht=TORRENT_ENABLE_DHT, download_limit=TORRENT_DOWNLOAD_LIMIT,
+        metadata_only=True,
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
+    )
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=min(120, TORRENT_TIMEOUT))
+    except asyncio.TimeoutError as e:
+        await _terminate_proc(proc)
+        raise TimeoutError("Magnet metadata request timed out") from e
+
+    saved = sorted(meta_dir.glob("*.torrent"))
+    if not saved:
+        raise RuntimeError(
+            "Could not fetch magnet metadata "
+            "(magnet needs trackers, or enable TORRENT_ENABLE_DHT)"
+        )
+    meta = parse_torrent_file(saved[0])
+    meta.source = magnet
+    meta.is_magnet = True
+    meta.btih = base.btih
+    # Трекеры из magnet тоже проверяем (в .torrent их может не быть)
+    meta.trackers = list(dict.fromkeys(meta.trackers + base.trackers))
+    if not base.name.startswith("magnet-"):
+        meta.name = base.name
+    return meta
+
+
+async def download_torrent(
+    meta: TorrentMeta,
+    output_dir: Path,
+    progress_callback: Optional[Callable] = None,
+    cancel_flag: Optional[list] = None,
+    media_only: bool = True,
+) -> list[DownloadResult]:
+    """Скачивает торрент через aria2c. Возвращает список DownloadResult (по файлу).
+
+    meta должен быть уже провалидирован вызывающей стороной (размер, безопасность).
+    Для magnet source = magnet-URI; aria2c повторно подтянет метаданные.
+    """
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not _torrent_trackers_are_safe(meta.trackers):
+        raise RuntimeError("Tracker points to a non-public address")
+
+    select_indices: Optional[list[int]] = None
+    if media_only and meta.files:
+        select_indices = [
+            i for i, f in enumerate(meta.files, 1)
+            if Path(f).suffix.lower() in _MEDIA_EXTS
+        ]
+        if not select_indices:
+            return []  # в раздаче нет медиа-файлов
+
+    args = _build_aria2c_args(
+        meta.source, output_dir,
+        listen_port=TORRENT_LISTEN_PORT, max_peers=TORRENT_MAX_PEERS,
+        enable_dht=TORRENT_ENABLE_DHT, download_limit=TORRENT_DOWNLOAD_LIMIT,
+        select_indices=select_indices,
+    )
+    proc = await asyncio.create_subprocess_exec(
+        *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+    )
+
+    loop = asyncio.get_running_loop()
+    tracker = ProgressTracker(progress_callback, loop)
+    tracker.status = "downloading"
+    deadline = time.monotonic() + TORRENT_TIMEOUT
+    abort_reason: list[Optional[str]] = [None]
+
+    async def _watchdog():
+        last_disk = 0.0
+        while proc.returncode is None:
+            if cancel_flag and cancel_flag[0]:
+                abort_reason[0] = "CANCELLED"
+                await _terminate_proc(proc)
+                return
+            if time.monotonic() >= deadline:
+                abort_reason[0] = "TIMEOUT"
+                await _terminate_proc(proc)
+                return
+            now = time.monotonic()
+            if now - last_disk >= 1.0:
+                last_disk = now
+                if not disk_has_capacity(output_dir):
+                    abort_reason[0] = "DISK_FULL"
+                    await _terminate_proc(proc)
+                    return
+                if _dir_size_recursive(output_dir) > TORRENT_MAX_TOTAL_BYTES:
+                    abort_reason[0] = "TOTAL_LIMIT"
+                    await _terminate_proc(proc)
+                    return
+            await asyncio.sleep(1.0)
+
+    watchdog = asyncio.ensure_future(_watchdog())
+    last_emit = [0.0]
+
+    async def _emit():
+        now = time.monotonic()
+        if progress_callback and now - last_emit[0] >= 3.0:
+            last_emit[0] = now
+            try:
+                await progress_callback(tracker)
+            except Exception:
+                pass
+
+    try:
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode("utf-8", "replace")
+            pct = _ARIA2_PCT_RE.search(text)
+            sizes = _ARIA2_SIZES_RE.search(text)
+            if sizes:
+                tracker.downloaded = _parse_aria2_size(sizes.group(1))
+                tracker.total = _parse_aria2_size(sizes.group(2))
+            elif pct:
+                # Проценты без явных размеров — оценим по проценту (лучше, чем ничего)
+                pass
+            dl = _ARIA2_DL_RE.search(text)
+            if dl:
+                tracker.speed = _parse_aria2_size(dl.group(1))
+            eta = _ARIA2_ETA_RE.search(text)
+            if eta:
+                tracker.eta = _parse_eta_seconds(eta.group(1))
+            if pct or sizes:
+                await _emit()
+    finally:
+        await proc.wait()
+        watchdog.cancel()
+        try:
+            await watchdog
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    reason = abort_reason[0]
+    if reason == "CANCELLED" or (cancel_flag and cancel_flag[0]):
+        raise DownloadCancelledError("CANCELLED")
+    if reason == "TIMEOUT":
+        raise TimeoutError("Torrent download timed out")
+    if reason == "DISK_FULL":
+        raise RuntimeError("Insufficient free disk space")
+    if reason == "TOTAL_LIMIT":
+        raise RuntimeError(
+            f"Torrent exceeded aggregate limit: {_human_size(TORRENT_MAX_TOTAL_BYTES)}"
+        )
+
+    return _collect_torrent_results(output_dir, media_only)
+
+
+def _collect_torrent_results(output_dir: Path, media_only: bool) -> list[DownloadResult]:
+    """Рекурсивно собирает скачанные файлы в DownloadResult (с path-traversal guard)."""
+    base_resolved = output_dir.resolve()
+    results: list[DownloadResult] = []
+    for f in sorted(output_dir.rglob("*")):
+        if f.is_symlink() or not f.is_file():
+            continue
+        # Служебные файлы aria2c и сохранённые метаданные пропускаем
+        if f.suffix.lower() in (".aria2", ".torrent"):
+            continue
+        if media_only and f.suffix.lower() not in _MEDIA_EXTS:
+            continue
+        try:
+            f.resolve().relative_to(base_resolved)
+        except ValueError:
+            logger.warning("Skipping out-of-directory torrent file: %s", f)
+            continue
+        try:
+            size = f.stat().st_size
+        except OSError:
+            continue
+        results.append(DownloadResult(
+            success=True, file_path=f, title=f.stem, file_size=size,
+        ))
+    return results

@@ -14,6 +14,7 @@ other sites — all via a clean inline-button interface.
 | 🎬 Video download | Choose from all available resolutions |
 | 🎵 Audio extraction | MP3 download with one tap |
 | 📋 Playlists | Download first N items of a playlist |
+| 🧲 Torrents | magnet / `.torrent` via aria2c — opt-in, port never exposed |
 | 📄 Subtitles | Download video with embedded subtitles |
 | 📜 History | Per-user download history |
 | 👑 Admin panel | Approve/ban users, view stats |
@@ -171,6 +172,77 @@ For files that do not fit the selected delivery channel:
 - Only approved users can trigger downloads
 - Generic extraction is disabled and DNS answers are checked again on each
   connection to prevent redirects or DNS rebinding into private networks
+
+---
+
+## BitTorrent (magnet + .torrent)
+
+Disabled by default. Enable with `ALLOW_TORRENTS=true`. Downloads run through
+`aria2c` (already in the image). A user can send a **magnet link** (preferably
+with trackers) or upload a **`.torrent` file**; the bot fetches metadata, shows a
+confirmation menu (name, size, media-file count), then downloads and delivers the
+**media files** from the swarm (like a playlist).
+
+### Port isolation (the core requirement)
+
+The torrent listening port must never be reachable from the internet. This is
+enforced by several layers:
+
+1. **No port publishing / no DNAT.** The `ytdlp-bot` container publishes **no
+   ports** and Docker's own iptables is disabled — all ingress is manual nftables
+   DNAT on the host. `TORRENT_LISTEN_PORT` (default `51413`) is **never** added to
+   `ports:` and **never** gets a DNAT rule, so nothing on the internet can reach it.
+2. **No seeding.** `--seed-time=0` — the client stops as soon as the download
+   finishes and never acts as a server, so an inbound port is not even needed.
+3. **DHT / LPD / PEX disabled** by default — no UDP listeners, no announcing the
+   node to the DHT network.
+
+Verify: `docker exec ytdlp-bot ss -ltnp` (port bound only to the container IP);
+`nmap -Pn -p 51413 <server_ip>` from outside during an active download → filtered.
+
+### Outbound SSRF hardening (required when enabling torrents)
+
+`aria2c` is a **subprocess** and does **not** inherit the Python SSRF guard used
+for yt-dlp. Peer/tracker IPs from a malicious torrent could point at internal
+services (e.g. `telegram-bot-api` at `10.10.2.3`, the host gateway). The bot
+rejects trackers that resolve to non-public IPs, but it cannot filter peer IPs —
+so you **must** block the container's access to private ranges with host nftables
+egress rules. Add this in the `forward` chain **before** the generic
+`docker_nets accept`:
+
+```nft
+define YTDLP_IP  = 10.10.2.2
+define TG_API_IP = 10.10.2.3
+
+# Allow only the internal service the bot legitimately needs:
+ip saddr $YTDLP_IP ip daddr $TG_API_IP tcp dport 8081 accept
+# Block the container from reaching ANY private range (SSRF pivot defense):
+ip saddr $YTDLP_IP ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, \
+    127.0.0.0/8, 169.254.0.0/16, 100.64.0.0/10 } \
+    counter log prefix "[nft] ytdlp->private BLOCKED " drop
+# Public internet keeps working through the existing MASQUERADE/accept rules.
+# The torrent port is NOT forwarded: no ports:, no DNAT.
+```
+
+Verify: `docker exec ytdlp-bot sh -c 'wget -qO- http://10.10.2.3:8081; echo rc=$?'`
+should be blocked (nft log line appears), while `wget -qO- https://ifconfig.me`
+still works.
+
+### `.torrent` file uploads
+
+The local Bot API server stores uploaded files on its own filesystem and (in
+`local_mode`) hands the bot an absolute path to them. To let the bot read that
+path, `docker-compose.yml` mounts the API server's data directory read-only into
+`ytdlp-bot` (`/var/lib/telegram-bot-api:ro`). If the bot cannot read the file
+(e.g. filesystem permissions), it falls back to asking the user for a magnet link
+— magnet downloads need no cross-container file access.
+
+### Notes / limits
+
+- With `TORRENT_ENABLE_DHT=false`, a magnet **without** trackers may fail to fetch
+  metadata. Prefer magnets with `&tr=` or upload a `.torrent`.
+- Only media files (`TORRENT_MEDIA_ONLY=true`) are delivered; each delivered file
+  must fit `MAX_FILE_SIZE_MB`, and the whole swarm must fit `TORRENT_MAX_TOTAL_MB`.
 
 ---
 

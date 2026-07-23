@@ -11,6 +11,7 @@ import re
 import shutil
 import sqlite3
 import time
+import uuid
 from dataclasses import asdict
 from datetime import datetime
 import html as _html
@@ -51,12 +52,17 @@ from downloader import (
     DownloadResult,
     FormatInfo,
     ProgressTracker,
+    TorrentMeta,
     VideoInfo,
     disk_has_capacity,
+    download_torrent,
     download_video,
+    fetch_magnet_metadata,
     get_best_video_formats,
     get_video_info,
     is_supported_url,
+    parse_magnet,
+    parse_torrent_file,
 )
 
 # ── Logging ──────────────────────────────────────────────────────────────────────
@@ -129,6 +135,16 @@ KEY_MAIN_MENU_MSG = "main_menu_msg_id"  # message_id последнего соо
 KEY_QUALITY_MSG   = "quality_menu_msg_id"  # message_id меню выбора качества (для удаления при новой ссылке)
 KEY_BOUND_SESSIONS = "_bound_sessions"
 KEY_RESOLVE_SESSIONS = "_resolve_sessions"
+KEY_TORRENT_SESSIONS = "_torrent_sessions"  # token -> {"meta": TorrentMeta}
+
+# Промежуточное хранилище .torrent-файлов (magnet-метаданные и загруженные документы).
+# Под DOWNLOAD_DIR (том /downloads доступен на запись); чистится после загрузки/по TTL.
+_TORRENTS_STAGE_DIR = config.DOWNLOAD_DIR / "torrents"
+# magnet:?xt=urn:btih:<40 hex | 32 base32>
+_MAGNET_RE = re.compile(
+    r"magnet:\?[^\s<>\"']*xt=urn:btih:(?:[0-9a-fA-F]{40}|[A-Za-z2-7]{32})[^\s<>\"']*",
+    re.IGNORECASE,
+)
 
 
 def _session_key(chat_id: int, message_id: int) -> tuple[int, int]:
@@ -410,7 +426,15 @@ def _build_help_text(user_id: int, verbose: bool = True) -> str:
         "1. Отправьте ссылку на видео\n"
         "2. Выберите качество или аудио\n"
         "3. Дождитесь загрузки и отправки файла\n\n"
-        + SUPPORTED_SITES_TEXT +
+        + SUPPORTED_SITES_TEXT
+    )
+    if config.ALLOW_TORRENTS:
+        text += (
+            "\n\n🧲 <b>Торренты:</b> пришлите magnet-ссылку "
+            "(желательно с трекерами) или <code>.torrent</code>-файл. "
+            "Бот скачает и отдаст медиа-файлы из раздачи."
+        )
+    text += (
         "\n\n⚠️ <b>Ограничения:</b>\n"
         f"• Максимальный размер файла: {config.MAX_FILE_SIZE_MB} МБ\n"
     )
@@ -844,6 +868,22 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
     text = update.message.text.strip()
 
+    # ── Magnet-ссылки (BitTorrent) обрабатываем до обычных URL ────────────────────
+    # regex использует только non-capturing группы, поэтому findall отдаёт полные матчи.
+    magnets = _MAGNET_RE.findall(text)
+    if magnets:
+        if not config.ALLOW_TORRENTS:
+            await update.message.reply_text(
+                "⚠️ Скачивание торрентов отключено администратором."
+            )
+            return
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
+        await _start_magnet(update, ctx, magnets[0][:4096])
+        return
+
     # Ищем все URL в сообщении
     urls = _extract_urls(text)
     valid_urls = await _filter_supported_urls(urls)
@@ -1017,6 +1057,379 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
                 _save_session_safe(sent.chat_id, sent.message_id, url, info, user_id=user_id, ctx=ctx)
             except Exception as e:
                 logger.warning("save_session failed: %s", e)
+
+
+# ── BitTorrent (magnet + .torrent) ───────────────────────────────────────────────
+
+def _sweep_stale_torrents(max_age_s: int = 7200) -> None:
+    """Удаляет заброшенные staged .torrent-файлы (пользователь не подтвердил загрузку)."""
+    try:
+        if not _TORRENTS_STAGE_DIR.exists():
+            return
+        now = time.time()
+        for f in _TORRENTS_STAGE_DIR.glob("*.torrent"):
+            try:
+                if now - f.stat().st_mtime > max_age_s:
+                    f.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def _remember_torrent_session(ctx, token: str, meta: TorrentMeta) -> None:
+    sessions = ctx.user_data.setdefault(KEY_TORRENT_SESSIONS, {})
+    sessions[token] = {"meta": meta}
+    while len(sessions) > 30:
+        old_token, _ = next(iter(sessions.items()))
+        old = sessions.pop(old_token)
+        # Чистим staged-файл заброшенной сессии
+        try:
+            src = old["meta"].source
+            if src and src.endswith(".torrent"):
+                Path(src).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+async def _start_magnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE, magnet: str) -> None:
+    """Получает метаданные magnet-ссылки и показывает меню подтверждения."""
+    msg = await update.effective_chat.send_message("🧲 Получаю метаданные торрента…")
+    _spawn_update_task(
+        update, ctx,
+        _prepare_magnet(magnet, msg, ctx, user_id=update.effective_user.id),
+        name=f"magnet_{update.effective_user.id}_{msg.message_id}",
+    )
+
+
+async def _prepare_magnet(magnet: str, msg: Message, ctx: ContextTypes.DEFAULT_TYPE, user_id: int) -> None:
+    _sweep_stale_torrents()
+    token = uuid.uuid4().hex[:16]
+    meta_dir = _TORRENTS_STAGE_DIR / f"meta_{token}"
+    try:
+        async with ctx.bot_data["_metadata_sem"]:
+            meta = await fetch_magnet_metadata(magnet, meta_dir)
+    except (TimeoutError, RuntimeError, ValueError) as e:
+        await msg.edit_text(
+            "❌ Не удалось получить метаданные торрента.\n"
+            f"<code>{_esc(str(e)[:200])}</code>\n\n"
+            "Убедитесь, что magnet содержит трекеры (<code>&amp;tr=</code>), "
+            "или попросите администратора включить DHT.",
+            parse_mode=ParseMode.HTML,
+        )
+        shutil.rmtree(meta_dir, ignore_errors=True)
+        return
+    except Exception as e:
+        logger.error("magnet metadata error: %s", _safe_error_text(e))
+        await msg.edit_text("❌ Внутренняя ошибка при обработке magnet-ссылки.")
+        shutil.rmtree(meta_dir, ignore_errors=True)
+        return
+
+    # Переносим сохранённый .torrent в стабильное место, чтобы качать без повторного
+    # запроса метаданных и с точным выбором файлов.
+    _TORRENTS_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    stage = _TORRENTS_STAGE_DIR / f"{token}.torrent"
+    saved = sorted(meta_dir.glob("*.torrent"))
+    try:
+        if saved:
+            shutil.move(str(saved[0]), str(stage))
+            meta.source = str(stage)
+    finally:
+        shutil.rmtree(meta_dir, ignore_errors=True)
+
+    await _show_torrent_confirm(msg, meta, ctx, token)
+
+
+async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Приём .torrent-файла как документа."""
+    if update.effective_user is None or update.effective_message is None:
+        return
+    # Авторизация (документы не проходят через require_auth-декоратор автоматически)
+    user = update.effective_user
+    try:
+        db.upsert_user(user.id, user.username, user.full_name)
+        if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
+            return  # молча игнорируем — не флудим на каждый чужой документ
+    except sqlite3.Error as e:
+        logger.error("DB error in handle_document: %s", e)
+        return
+
+    doc = update.message.document
+    if doc is None:
+        return
+    name = (doc.file_name or "").lower()
+    is_torrent = name.endswith(".torrent") or doc.mime_type == "application/x-bittorrent"
+    if not is_torrent:
+        return  # не .torrent — не наше
+
+    if not config.ALLOW_TORRENTS:
+        await update.message.reply_text("⚠️ Скачивание торрентов отключено администратором.")
+        return
+    if doc.file_size and doc.file_size > config.TORRENT_FILE_MAX_BYTES:
+        await update.message.reply_text("⚠️ .torrent-файл слишком большой.")
+        return
+
+    msg = await update.effective_chat.send_message("🧲 Читаю .torrent…")
+    _sweep_stale_torrents()
+    token = uuid.uuid4().hex[:16]
+    _TORRENTS_STAGE_DIR.mkdir(parents=True, exist_ok=True)
+    stage = _TORRENTS_STAGE_DIR / f"{token}.torrent"
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(custom_path=str(stage))
+    except Exception as e:
+        logger.error("torrent document download failed: %s", _safe_error_text(e))
+        stage.unlink(missing_ok=True)
+        await msg.edit_text(
+            "❌ Не удалось прочитать .torrent-файл.\n"
+            "Попробуйте прислать magnet-ссылку вместо файла."
+        )
+        return
+
+    try:
+        meta = await asyncio.to_thread(parse_torrent_file, stage)
+    except (ValueError, OSError) as e:
+        logger.warning("torrent parse failed: %s", e)
+        stage.unlink(missing_ok=True)
+        await msg.edit_text("❌ Некорректный .torrent-файл.")
+        return
+    meta.source = str(stage)
+    await _show_torrent_confirm(msg, meta, ctx, token)
+
+
+async def _show_torrent_confirm(msg: Message, meta: TorrentMeta, ctx: ContextTypes.DEFAULT_TYPE, token: str) -> None:
+    """Меню подтверждения торрента: имя, размер, число медиа-файлов."""
+    media_only = config.TORRENT_MEDIA_ONLY
+    media = meta.media_files if media_only else meta.files
+    total = meta.total_size or 0
+
+    # Проверка: есть ли что качать
+    if media_only and not media:
+        try:
+            Path(meta.source).unlink(missing_ok=True)
+        except Exception:
+            pass
+        await msg.edit_text(
+            "⚠️ В этом торренте нет медиа-файлов (video/audio).\n"
+            "Бот отдаёт только медиа."
+        )
+        return
+
+    # Проверка агрегатного лимита размера
+    if total and total > config.TORRENT_MAX_TOTAL_BYTES:
+        try:
+            Path(meta.source).unlink(missing_ok=True)
+        except Exception:
+            pass
+        await msg.edit_text(
+            f"⚠️ Торрент слишком большой: <b>{_human_size(total)}</b>\n"
+            f"Лимит: <b>{config.TORRENT_MAX_TOTAL_MB} МБ</b>.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    _remember_torrent_session(ctx, token, meta)
+
+    n_media = len(media)
+    files_note = f"{n_media} медиа-файл(ов)" if media_only else f"{len(meta.files)} файл(ов)"
+    size_note = f"~{_human_size(total)}" if total else "размер уточнится при загрузке"
+    caption = (
+        f"🧲 <b>{_esc(meta.name[:120])}</b>\n"
+        f"📦 {size_note}\n"
+        f"🗂 {files_note}\n\n"
+        "Скачать медиа из этой раздачи?"
+    )
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📥 Скачать ({n_media})", callback_data=f"tor:{token}")],
+        [InlineKeyboardButton("❌ Отмена", callback_data=f"torcancel:{token}")],
+    ])
+    await msg.edit_text(caption, parse_mode=ParseMode.HTML, reply_markup=keyboard)
+
+
+async def _handle_torrent_callback(query, ctx: ContextTypes.DEFAULT_TYPE, token: str) -> None:
+    """Запускает загрузку торрента по подтверждению пользователя."""
+    user = query.from_user
+    sessions = ctx.user_data.get(KEY_TORRENT_SESSIONS) or {}
+    session = sessions.pop(token, None)
+    if not session:
+        await query.answer("❌ Сессия истекла. Отправьте magnet/.torrent заново.", show_alert=True)
+        return
+    meta: TorrentMeta = session["meta"]
+    media_only = config.TORRENT_MEDIA_ONLY
+
+    if not disk_has_capacity(config.DOWNLOAD_DIR, meta.total_size or 0):
+        await query.edit_message_text("⚠️ Недостаточно свободного места для этой раздачи.")
+        try:
+            Path(meta.source).unlink(missing_ok=True)
+        except Exception:
+            pass
+        return
+
+    dl_id = db.add_download(user.id, f"torrent:{meta.name[:80]}")
+    db.update_download(dl_id, title=meta.name, format_id="torrent",
+                       quality="Торрент", status="downloading")
+
+    cancel_flag = [False]
+    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]])
+    status_msg = await query.edit_message_text(
+        f"⬇️ Скачиваю торрент: <b>{_esc(meta.name[:120])}</b>\n\n⏳ Подключаюсь к пирам…",
+        parse_mode=ParseMode.HTML, reply_markup=cancel_kb,
+    )
+    ctx.user_data.setdefault("_cancel_flags", {})[status_msg.message_id] = cancel_flag
+
+    async def _on_progress(tracker: ProgressTracker) -> None:
+        if cancel_flag[0]:
+            return
+        speed_str = f"{tracker.speed / 1_048_576:.1f} МБ/с" if tracker.speed else "—"
+        if tracker.eta:
+            m, s = divmod(int(tracker.eta), 60)
+            eta_str = f"{m}м {s:02d}с" if m else f"{s}с"
+        else:
+            eta_str = "—"
+        if tracker.total:
+            pct = tracker.downloaded / tracker.total * 100
+            body = f"⏳ {pct:.1f}% • {speed_str} • ETA: {eta_str}"
+        else:
+            body = f"⏳ {_human_size(tracker.downloaded)} • {speed_str}"
+        try:
+            await status_msg.edit_text(
+                f"⬇️ Скачиваю торрент: <b>{_esc(meta.name[:120])}</b>\n\n{body}",
+                parse_mode=ParseMode.HTML, reply_markup=cancel_kb,
+            )
+        except TelegramError:
+            pass
+
+    tmp_dir = config.DOWNLOAD_DIR / f"user_{user.id}" / f"tor_{dl_id}"
+    try:
+        tmp_dir.resolve().relative_to(config.DOWNLOAD_DIR.resolve())
+    except ValueError:
+        db.update_download(dl_id, status="error", error="download dir validation failed")
+        await query.answer("❌ Внутренняя ошибка.", show_alert=True)
+        return
+
+    sem: asyncio.Semaphore = ctx.bot_data["_download_sem"]
+    try:
+        if sem.locked():
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>Торрент в очереди</b>\n{_esc(meta.name[:120])}\n\n"
+                    f"Все {config.MAX_CONCURRENT_DOWNLOADS} слота заняты — начнётся автоматически.",
+                    parse_mode=ParseMode.HTML, reply_markup=cancel_kb,
+                )
+            except TelegramError:
+                pass
+        async with sem:
+            if cancel_flag[0]:
+                raise DownloadCancelledError("CANCELLED")
+            results = await download_torrent(
+                meta=meta, output_dir=tmp_dir,
+                progress_callback=_on_progress, cancel_flag=cancel_flag,
+                media_only=media_only,
+            )
+
+        if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
+            logger.info("User %s revoked during torrent %d", user.id, dl_id)
+            db.update_download(dl_id, status="error", error="access revoked before delivery")
+            await ctx.bot.send_message(query.message.chat_id, "🚫 Ваш доступ был отозван. Файлы не доставлены.")
+            return
+
+        if not results:
+            db.update_download(dl_id, status="error", error="no media files")
+            await status_msg.edit_text("⚠️ В раздаче не оказалось медиа-файлов для отправки.")
+            return
+
+        sent, skipped = await _deliver_torrent_results(query.message.chat_id, results, ctx)
+        final_status = "partial" if skipped else ("ready" if _has_fileserver() else "done")
+        db.update_download(dl_id, title=meta.name, status=final_status)
+        summary = f"✅ Торрент обработан. Отправлено файлов: {sent}"
+        if skipped:
+            summary += f" (пропущено {skipped} — превышен лимит размера)"
+        try:
+            await status_msg.edit_text(summary)
+            _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
+        except TelegramError:
+            pass
+
+    except DownloadCancelledError:
+        db.update_download(dl_id, status="cancelled", error="CANCELLED")
+        try:
+            await status_msg.edit_text("⛔ Загрузка торрента отменена.")
+        except TelegramError:
+            pass
+    except TimeoutError:
+        db.update_download(dl_id, status="error", error="timeout")
+        try:
+            await status_msg.edit_text("⏱ Торрент не успел скачаться за отведённое время.")
+        except TelegramError:
+            pass
+    except Exception as e:
+        err = _safe_error_text(e)
+        logger.error("Torrent error: %s", err)
+        db.update_download(dl_id, status="error", error=err)
+        try:
+            await status_msg.edit_text(f"❌ Ошибка загрузки торрента:\n<code>{_esc(err[:250])}</code>",
+                                       parse_mode=ParseMode.HTML)
+        except TelegramError:
+            pass
+    finally:
+        ctx.user_data.get("_cancel_flags", {}).pop(status_msg.message_id, None)
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        try:
+            Path(meta.source).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _has_fileserver() -> bool:
+    return bool(config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS)
+
+
+async def _deliver_torrent_results(chat_id: int, results: list[DownloadResult], ctx) -> tuple[int, int]:
+    """Доставляет медиа-файлы торрента (fileserver-ссылки одним сообщением или в Telegram)."""
+    sent = 0
+    skipped = 0
+    fs_lines: list[str] = []
+    ttl_h = max(1, config.FILE_TTL_SECONDS // 3600)
+    for r in results:
+        if not (r.success and r.file_path and r.file_path.exists()):
+            continue
+        if r.file_size > config.MAX_FILE_SIZE_BYTES:
+            skipped += 1
+            continue
+        if _has_fileserver():
+            try:
+                token = fileserver.move_and_register(r.file_path, config.FILE_TTL_SECONDS)
+                links: dict[str, str] = {}
+                if config.DIRECT_BASE_URL:
+                    links["server"] = f"{config.DIRECT_BASE_URL}/info/{token}"
+                if config.PUBLIC_BASE_URL:
+                    links["cf"] = f"{config.PUBLIC_BASE_URL}/info/{token}"
+                for i, relay_url in enumerate(config.RELAY_BASE_URLS, 1):
+                    links[f"relay{i}"] = f"{relay_url}/info/{token}"
+                primary = next(iter(links.values()))
+                title = r.title or r.file_path.stem
+                fs_lines.append(
+                    f'{len(fs_lines)+1}. <a href="{_html.escape(primary, quote=True)}">'
+                    f'{_esc(title[:60])}</a>  {_human_size(r.file_size)}'
+                )
+                sent += 1
+                continue
+            except Exception as fs_err:
+                logger.warning("torrent fileserver item failed: %s — fallback TG", fs_err)
+        # Прямая отправка в Telegram
+        try:
+            await _deliver_file(chat_id, r, ctx.bot)
+            sent += 1
+            await asyncio.sleep(1)
+        except Exception as e:
+            logger.warning("torrent TG delivery failed: %s", _safe_error_text(e))
+    if fs_lines:
+        header = f"🔗 <b>Ссылки для скачивания</b> (действуют {ttl_h} ч):\n"
+        await ctx.bot.send_message(
+            chat_id, header + "\n".join(fs_lines),
+            parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
+    return sent, skipped
 
 
 # ── Меню видео ───────────────────────────────────────────────────────────────────
@@ -1291,6 +1704,23 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if data.startswith("torcancel:"):
+        # Пользователь отменил подтверждение торрента — чистим сессию и staged-файл
+        token = data.split(":", 1)[1]
+        sessions = ctx.user_data.get(KEY_TORRENT_SESSIONS) or {}
+        session = sessions.pop(token, None)
+        if session:
+            try:
+                Path(session["meta"].source).unlink(missing_ok=True)
+            except Exception:
+                pass
+        try:
+            await query.edit_message_text("❌ Торрент отменён.")
+            _schedule_delete(ctx.bot, query.message.chat_id, query.message.message_id)
+        except TelegramError:
+            pass
+        return
+
     if data == "clear_history":
         deleted = db.clear_user_history(user.id)
         await query.answer(f"🗑 Удалено записей: {deleted}", show_alert=True)
@@ -1357,6 +1787,29 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx,
             _run_playlist(),
             name=f"playlist_{user.id}_{query.message.message_id}",
+        )
+    elif data.startswith("tor:"):
+        token = data.split(":", 1)[1]
+        claim_error = _claim_download(
+            ctx, user.id, query.message.chat_id, query.message.message_id
+        )
+        if claim_error:
+            await query.message.reply_text(f"⚠️ {claim_error}")
+            return
+
+        async def _run_torrent():
+            try:
+                await _handle_torrent_callback(query, ctx, token)
+            finally:
+                _release_download(
+                    ctx, user.id, query.message.chat_id, query.message.message_id
+                )
+
+        _spawn_update_task(
+            update,
+            ctx,
+            _run_torrent(),
+            name=f"torrent_{user.id}_{query.message.message_id}",
         )
 
 
@@ -3128,6 +3581,14 @@ def main():
 
     # URL-сообщения
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+
+    # .torrent-файлы (документы) — только если торренты включены
+    if config.ALLOW_TORRENTS:
+        app.add_handler(MessageHandler(
+            filters.Document.FileExtension("torrent")
+            | filters.Document.MimeType("application/x-bittorrent"),
+            handle_document,
+        ))
 
     # Inline-кнопки
     app.add_handler(CallbackQueryHandler(handle_callback))

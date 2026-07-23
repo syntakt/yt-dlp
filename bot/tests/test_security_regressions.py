@@ -222,5 +222,133 @@ class ConfigParsingTests(unittest.TestCase):
         self.assertEqual(result.stdout.strip(), '3 3600')
 
 
+def _bencode(o):
+    if isinstance(o, int):
+        return b'i' + str(o).encode() + b'e'
+    if isinstance(o, bytes):
+        return str(len(o)).encode() + b':' + o
+    if isinstance(o, str):
+        return _bencode(o.encode())
+    if isinstance(o, list):
+        return b'l' + b''.join(_bencode(x) for x in o) + b'e'
+    if isinstance(o, dict):
+        return b'd' + b''.join(_bencode(k) + _bencode(v) for k, v in o.items()) + b'e'
+    raise TypeError(type(o))
+
+
+class TorrentTests(unittest.TestCase):
+    def _write_torrent(self, data: dict) -> Path:
+        p = Path(tempfile.mktemp(suffix='.torrent'))
+        p.write_bytes(_bencode(data))
+        self.addCleanup(lambda: p.unlink(missing_ok=True))
+        return p
+
+    def test_parse_single_file_torrent(self):
+        p = self._write_torrent({
+            b'announce': b'udp://tracker.example:1337/announce',
+            b'info': {b'length': 123456, b'name': b'movie.mp4',
+                      b'piece length': 16384, b'pieces': b''},
+        })
+        meta = downloader.parse_torrent_file(p)
+        self.assertEqual(meta.name, 'movie.mp4')
+        self.assertEqual(meta.total_size, 123456)
+        self.assertEqual(meta.files, ['movie.mp4'])
+        self.assertIn('udp://tracker.example:1337/announce', meta.trackers)
+
+    def test_parse_multi_file_torrent_and_media_filter(self):
+        p = self._write_torrent({
+            b'info': {b'name': b'dir', b'piece length': 16384, b'pieces': b'',
+                      b'files': [
+                          {b'length': 100, b'path': [b'sub', b'a.mkv']},
+                          {b'length': 200, b'path': [b'readme.txt']},
+                      ]},
+        })
+        meta = downloader.parse_torrent_file(p)
+        self.assertEqual(meta.total_size, 300)
+        self.assertEqual(meta.files, ['sub/a.mkv', 'readme.txt'])
+        # только медиа отбирается
+        self.assertEqual(meta.media_files, ['sub/a.mkv'])
+
+    def test_parse_magnet_valid_and_invalid(self):
+        meta = downloader.parse_magnet(
+            'magnet:?xt=urn:btih:' + 'A' * 40 + '&dn=Cool+Video'
+            '&tr=udp://tracker.example:80/announce'
+        )
+        self.assertTrue(meta.is_magnet)
+        self.assertEqual(meta.btih, 'a' * 40)  # нормализуется в lower
+        self.assertEqual(meta.name, 'Cool Video')
+        self.assertIn('udp://tracker.example:80/announce', meta.trackers)
+        self.assertIsNone(meta.total_size)
+        with self.assertRaises(ValueError):
+            downloader.parse_magnet('magnet:?xt=urn:btih:zzz')
+        with self.assertRaises(ValueError):
+            downloader.parse_magnet('https://example.com/not-a-magnet')
+
+    def test_bencode_rejects_malformed(self):
+        with self.assertRaises(ValueError):
+            downloader._bdecode(b'd3:fooi1e')  # незакрытый dict
+
+    def test_tracker_ssrf_check_blocks_private_hosts(self):
+        with mock.patch.object(downloader, 'SSRF_PROTECTION', True):
+            self.assertFalse(
+                downloader._torrent_trackers_are_safe(['http://127.0.0.1:80/announce'])
+            )
+            self.assertFalse(
+                downloader._torrent_trackers_are_safe(['udp://10.10.2.3:1337/announce'])
+            )
+        # при выключенной защите — не блокируем
+        with mock.patch.object(downloader, 'SSRF_PROTECTION', False):
+            self.assertTrue(
+                downloader._torrent_trackers_are_safe(['http://127.0.0.1:80/announce'])
+            )
+
+    def test_aria2c_args_are_hardened(self):
+        args = downloader._build_aria2c_args(
+            'magnet:?xt=urn:btih:' + 'a' * 40,
+            Path('/tmp/torrent-out'),
+            listen_port=51413, max_peers=50, enable_dht=False, download_limit=0,
+        )
+        joined = ' '.join(args)
+        # не сидируем, не работаем как сервер
+        self.assertIn('--seed-time=0', args)
+        self.assertIn('--seed-ratio=0.0', args)
+        # никаких UDP-listener'ов / анонсов себя
+        self.assertIn('--enable-dht=false', args)
+        self.assertIn('--enable-dht6=false', args)
+        self.assertIn('--bt-enable-lpd=false', args)
+        self.assertIn('--enable-peer-exchange=false', args)
+        # фиксированный порт
+        self.assertIn('--listen-port=51413', args)
+        self.assertIn('--dht-listen-port=51413', args)
+        # никакого RPC-сокета
+        self.assertNotIn('--enable-rpc', joined)
+
+    def test_aria2c_args_dht_toggle_and_select(self):
+        args = downloader._build_aria2c_args(
+            'src', Path('/tmp/o'), listen_port=6881, max_peers=10,
+            enable_dht=True, download_limit=1000, select_indices=[1, 3],
+        )
+        self.assertIn('--enable-dht=true', args)
+        self.assertIn('--max-overall-download-limit=1000', args)
+        self.assertIn('--select-file=1,3', args)
+
+    def test_collect_torrent_results_media_only_and_traversal(self):
+        base = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__('shutil').rmtree(base, ignore_errors=True))
+        (base / 'sub').mkdir()
+        (base / 'sub' / 'a.mp4').write_bytes(b'x' * 10)
+        (base / 'readme.txt').write_bytes(b'y' * 5)
+        (base / 'a.mp4.aria2').write_bytes(b'z')  # служебный файл aria2c
+        results = downloader._collect_torrent_results(base, media_only=True)
+        names = sorted(r.file_path.name for r in results)
+        self.assertEqual(names, ['a.mp4'])
+
+    def test_magnet_regex_detects_link(self):
+        text = 'смотри magnet:?xt=urn:btih:' + 'b' * 40 + '&dn=x вот'
+        found = bot._MAGNET_RE.findall(text)
+        self.assertEqual(len(found), 1)
+        self.assertTrue(found[0].startswith('magnet:?xt=urn:btih:'))
+
+
 if __name__ == '__main__':
     unittest.main()

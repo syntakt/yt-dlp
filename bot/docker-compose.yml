@@ -83,6 +83,20 @@ services:
       ALLOW_WAV: ${ALLOW_WAV:-false}
       USE_ARIA2C: ${USE_ARIA2C:-true}
       USE_SPONSORBLOCK: ${USE_SPONSORBLOCK:-false}
+      # ── BitTorrent (magnet + .torrent) — по умолчанию выключено ──────────────
+      # Скачивание через aria2c (уже в образе). Порт TORRENT_LISTEN_PORT НЕ
+      # публикуется наружу (ни ports:, ни nftables DNAT) и не сидируется —
+      # это и есть защита «порт не торчит наружу». Egress-SSRF через пиров
+      # закрывается nftables (см. TELEGRAM_BOT.md, раздел BitTorrent).
+      ALLOW_TORRENTS: ${ALLOW_TORRENTS:-false}
+      TORRENT_MAX_TOTAL_MB: ${TORRENT_MAX_TOTAL_MB:-10240}
+      TORRENT_TIMEOUT: ${TORRENT_TIMEOUT:-7200}
+      TORRENT_MAX_PEERS: ${TORRENT_MAX_PEERS:-50}
+      TORRENT_DOWNLOAD_LIMIT: ${TORRENT_DOWNLOAD_LIMIT:-0}
+      TORRENT_LISTEN_PORT: ${TORRENT_LISTEN_PORT:-51413}
+      TORRENT_ENABLE_DHT: ${TORRENT_ENABLE_DHT:-false}
+      TORRENT_MEDIA_ONLY: ${TORRENT_MEDIA_ONLY:-true}
+      TORRENT_FILE_MAX_MB: ${TORRENT_FILE_MAX_MB:-2}
       ALLOW_GENERIC_URLS: ${ALLOW_GENERIC_URLS:-false}
       SSRF_PROTECTION: ${SSRF_PROTECTION:-true}
       TRUST_PROXY_FOR_SSRF: ${TRUST_PROXY_FOR_SSRF:-false}
@@ -109,6 +123,12 @@ services:
       # Shared с cloudflared: entrypoint.sh читает URL тоннеля отсюда
       # (только в quick tunnel режиме; в named tunnel PUBLIC_BASE_URL берётся из .env)
       - cf-url:/cf-url
+      # RO-доступ к данным локального Bot API сервера — нужен ТОЛЬКО для чтения
+      # загруженных пользователем .torrent-файлов (magnet работает и без этого).
+      # local_mode=True отдаёт боту абсолютный путь файла на ФС API-сервера;
+      # монтируем тот же путь read-only, чтобы бот мог его скопировать.
+      # Если чтение не удаётся (права доступа) — бот попросит прислать magnet-ссылку.
+      - ./data/telegram-bot-api:/var/lib/telegram-bot-api:ro
     read_only: true
     tmpfs:
       - /tmp:rw,noexec,nosuid,size=64m
@@ -146,6 +166,10 @@ services:
     # ports: НЕ используется — Docker iptables отключён (daemon.json: iptables=false).
     # HTTP_PORT должен оставаться внутренним. Не публикуйте 8080 наружу:
     # токены скачивания окажутся в HTTP URL без TLS.
+    #
+    # ⚠ ТОРРЕНТ-ПОРТ (TORRENT_LISTEN_PORT, дефолт 51413) ТАКЖЕ НЕ публикуется
+    #   и НЕ проксируется nftables DNAT — так он недостижим извне. Не добавляйте
+    #   его в ports:. Бот не сидирует (--seed-time=0), входящий порт не нужен.
     # Для внешнего доступа используйте Cloudflare Tunnel или вручную настроенный nginx HTTPS.
     # Раскомментировать ТОЛЬКО для локальной отладки без внешнего доступа:
     # ports:
