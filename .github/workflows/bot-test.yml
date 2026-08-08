@@ -1,0 +1,51 @@
+name: Bot Test
+on:
+  push:
+    branches: ['tgbot']
+    paths:
+      - 'bot/**'
+      - '.github/workflows/bot-test.yml'
+  pull_request:
+    branches: ['**']
+    paths:
+      - 'bot/**'
+      - '.github/workflows/bot-test.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: bot-test-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: Telegram bot tests
+    permissions:
+      contents: read
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+      with:
+        persist-credentials: false
+    - name: Set up Python 3.12
+      uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+      with:
+        python-version: '3.12'
+    - name: Install requirements
+      shell: bash
+      run: |
+        # Бот импортирует yt-dlp из ЭТОГО репозитория, а не с PyPI —
+        # так же, как это делает bot/Dockerfile.
+        python -m pip install -U pip
+        python -m pip install -e .
+        python -m pip install -r bot/requirements-dev.txt
+    - name: Lint
+      shell: bash
+      working-directory: bot
+      run: ruff check telegram_bot tests
+    - name: Run tests
+      timeout-minutes: 10
+      shell: bash
+      working-directory: bot
+      run: pytest tests -q

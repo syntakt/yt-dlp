@@ -1,0 +1,14 @@
+# Зависимости для запуска тестов и линтера бота.
+#
+#   python -m venv .venv && . .venv/bin/activate
+#   pip install -e ..            # yt-dlp из этого репозитория (импортирует downloader)
+#   pip install -r requirements-dev.txt
+#   pytest tests -q && ruff check telegram_bot tests
+#
+# Без этого файла тесты не запускались: модулей telegram/aiohttp/pytest
+# в системе нет, и `pytest bot/tests` падал на импорте bot.py.
+
+-r telegram_bot/requirements.txt
+
+pytest>=8.0
+ruff>=0.14

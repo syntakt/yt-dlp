@@ -118,7 +118,10 @@ All settings are in `.env` (see `.env.example`):
 | `MIN_FREE_DISK_MB` | `1024` | Disk space that downloads must leave free |
 | `ALLOW_PLAYLISTS` | `true` | Enable playlist downloads |
 | `ALLOW_AUDIO` | `true` | Enable audio-only (MP3) |
-| `ALLOW_SUBTITLES` | `true` | Enable subtitle download |
+| `ALLOW_SUBTITLES` | `true` | Enable subtitles (embedded into the video via ffmpeg) |
+| `USER_ACTIONS_PER_MINUTE` | `20` | Anti-flood: link/.torrent parsing requests per user per minute |
+| `FS_RATE_LIMIT` | `30` | File-server requests per client IP per minute |
+| `FS_TRUSTED_PROXY_CIDRS` | `10.10.2.0/24,127.0.0.1/32,::1/128` | Proxies whose client-IP headers are trusted; **add relay server IPs here**, otherwise the whole relay shares one rate-limit bucket |
 | `PROXY_URL` | — | HTTP/SOCKS5 proxy URL |
 | `COOKIES_FILE` | — | Path to Netscape cookies file |
 | `ENABLE_CLOUDFLARED` | `false` | Start Cloudflare Tunnel container via `deploy.sh`; keep `false` to skip cloudflared entirely |
@@ -150,11 +153,39 @@ cd bot && ./deploy.sh
 
 ---
 
+## Development: tests and linting
+
+The bot imports yt-dlp **from this repository**, exactly like `bot/Dockerfile`
+does, so install the repo itself first:
+
+```bash
+python -m venv .venv && . .venv/bin/activate
+pip install -e ..                        # yt-dlp from this checkout
+pip install -r requirements-dev.txt      # telegram/aiohttp/pytest/ruff
+pytest tests -q
+ruff check telegram_bot tests            # uses bot/ruff.toml, not the yt-dlp one
+```
+
+CI runs the same two commands on every change under `bot/`
+(`.github/workflows/bot-test.yml`).
+
+`tests/test_security_regressions.py` guards the hardening work (auth, SSRF,
+file-server isolation, torrent sandboxing); `tests/test_functional_regressions.py`
+guards behaviour bugs found by audit (subtitle embedding, cleanup vs. active
+downloads, Telegram message/upload limits, WAV size estimation).
+
+---
+
 ## File size limits
 
 The configured download limit is **10 GB** by default. Files delivered through
 the built-in signed-link file server can use that full limit. Direct Telegram
 delivery through the local Bot API is limited by Telegram to **2 GB**.
+
+The bot knows this boundary: for a file above the Telegram limit the
+«📤 Отправить в Telegram» button is not offered at all (only signed links), and
+if no link channel is configured the download is reported as too large instead
+of failing after a long upload.
 
 For files that do not fit the selected delivery channel:
 

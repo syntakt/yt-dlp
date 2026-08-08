@@ -1,6 +1,9 @@
+import asyncio
 import os
 import sqlite3
 import logging
+import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -24,33 +27,125 @@ def _harden_db_permissions() -> None:
                 logger.warning("Could not chmod DB file %s: %s", path, e)
 
 
-@contextmanager
-def get_connection():
-    """Контекстный менеджер: открывает соединение, коммитит/откатывает и ЗАКРЫВАЕТ."""
+# Одно долгоживущее соединение вместо connect/close на каждый запрос.
+#
+# Прежняя схема на каждый вызов делала mkdir + chmod каталога + chmod трёх
+# файлов БД + connect + PRAGMA + close + снова четыре chmod. При этом
+# is_authorized()/is_super_admin()/upsert_user() дёргаются на КАЖДОЕ сообщение
+# и каждый callback, и всё это синхронно в event loop.
+#
+# check_same_thread=False + _db_lock: соединение переиспользуется из потоков
+# asyncio.to_thread (см. aio()), запросы сериализуются блокировкой.
+_conn: Optional[sqlite3.Connection] = None
+_conn_path: Optional[str] = None
+_db_lock = threading.RLock()
+
+
+def _connect() -> sqlite3.Connection:
+    global _conn, _conn_path
+    if _conn is not None and _conn_path == str(DB_PATH):
+        return _conn
+    if _conn is not None:
+        # DB_PATH изменился (тесты подменяют его на временный файл)
+        try:
+            _conn.close()
+        except sqlite3.Error:
+            pass
+        _conn = None
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     _harden_db_permissions()
     old_umask = os.umask(0o077)
     try:
-        conn = sqlite3.connect(str(DB_PATH), timeout=10)
+        conn = sqlite3.connect(str(DB_PATH), timeout=10, check_same_thread=False)
     finally:
         os.umask(old_umask)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    try:
-        yield conn
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-    finally:
-        conn.close()
-        _harden_db_permissions()
+    conn.execute("PRAGMA busy_timeout = 10000")
+    # WAL: читатели не блокируют писателей при параллельных загрузках
+    conn.execute("PRAGMA journal_mode = WAL")
+    _conn = conn
+    _conn_path = str(DB_PATH)
+    _harden_db_permissions()
+    return conn
+
+
+@contextmanager
+def get_connection():
+    """Контекстный менеджер: отдаёт общее соединение, коммитит/откатывает."""
+    with _db_lock:
+        conn = _connect()
+        try:
+            yield conn
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+
+
+def close_connection() -> None:
+    """Закрывает общее соединение (при остановке бота и в тестах)."""
+    global _conn, _conn_path
+    with _db_lock:
+        if _conn is not None:
+            try:
+                _conn.close()
+            except sqlite3.Error:
+                pass
+            _conn = None
+            _conn_path = None
+    _invalidate_auth_cache()
+
+
+async def aio(func, *args, **kwargs):
+    """Выполняет синхронный запрос к БД в отдельном потоке.
+
+    Нужна для тяжёлых запросов (сканирование таблиц в /status, /users, очистка),
+    чтобы они не блокировали event loop. Лёгкие точечные запросы по индексу
+    остаются синхронными — с постоянным соединением они занимают микросекунды.
+    """
+    return await asyncio.to_thread(func, *args, **kwargs)
+
+
+# ── Кэш авторизации ───────────────────────────────────────────────────────────
+#
+# is_authorized()/is_super_admin() вызываются по нескольку раз на каждый апдейт.
+# Кэш живёт секунды и СБРАСЫВАЕТСЯ при любом изменении прав (approve/ban/unban/
+# set_admin), поэтому бан вступает в силу мгновенно, а не через TTL.
+_AUTH_CACHE_TTL = 5.0
+_auth_cache: dict[int, tuple[float, bool, bool]] = {}  # uid → (ts, approved, banned)
+
+
+def _invalidate_auth_cache(user_id: Optional[int] = None) -> None:
+    with _db_lock:
+        if user_id is None:
+            _auth_cache.clear()
+        else:
+            _auth_cache.pop(user_id, None)
+
+
+def _auth_flags(user_id: int) -> tuple[bool, bool]:
+    """Возвращает (is_approved, is_banned) с коротким кэшем."""
+    now = time.monotonic()
+    cached = _auth_cache.get(user_id)
+    if cached and now - cached[0] < _AUTH_CACHE_TTL:
+        return cached[1], cached[2]
+    with get_connection() as conn:
+        row = conn.execute(
+            "SELECT is_approved, is_banned FROM users WHERE user_id = ?", (user_id,)
+        ).fetchone()
+    approved = bool(row["is_approved"]) if row else False
+    banned = bool(row["is_banned"]) if row else False
+    if len(_auth_cache) > 10_000:
+        _auth_cache.clear()
+    _auth_cache[user_id] = (now, approved, banned)
+    return approved, banned
 
 
 def init_db() -> None:
+    _invalidate_auth_cache()
     with get_connection() as conn:
-        # WAL: читатели не блокируют писателей при параллельных загрузках
-        conn.execute("PRAGMA journal_mode=WAL")
+        # journal_mode=WAL и busy_timeout выставляются в _connect()
         conn.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id     INTEGER PRIMARY KEY,
@@ -151,6 +246,7 @@ def approve_user(user_id: int, approved_by: int) -> bool:
                    approved_by = ?
              WHERE user_id = ?
         """, (datetime.now(timezone.utc).isoformat(), approved_by, user_id))
+        _invalidate_auth_cache(user_id)
         return cur.rowcount > 0
 
 
@@ -159,6 +255,7 @@ def ban_user(user_id: int) -> bool:
         cur = conn.execute(
             "UPDATE users SET is_banned = 1 WHERE user_id = ?", (user_id,)
         )
+        _invalidate_auth_cache(user_id)
         return cur.rowcount > 0
 
 
@@ -167,6 +264,7 @@ def unban_user(user_id: int) -> bool:
         cur = conn.execute(
             "UPDATE users SET is_banned = 0 WHERE user_id = ?", (user_id,)
         )
+        _invalidate_auth_cache(user_id)
         return cur.rowcount > 0
 
 
@@ -176,6 +274,7 @@ def set_admin(user_id: int, is_admin: bool) -> bool:
             "UPDATE users SET is_admin = ? WHERE user_id = ?",
             (1 if is_admin else 0, user_id)
         )
+        _invalidate_auth_cache(user_id)
         return cur.rowcount > 0
 
 
@@ -193,26 +292,8 @@ def list_users(approved: Optional[bool] = None, banned: bool = False) -> list:
 
 
 def is_authorized(user_id: int) -> bool:
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT is_approved, is_banned FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        if row is None:
-            return False
-        return bool(row["is_approved"]) and not bool(row["is_banned"])
-
-
-def is_admin(user_id: int) -> bool:
-    from config import ADMIN_IDS
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT is_admin, is_banned FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        if row and row["is_banned"]:
-            return False
-        if user_id in ADMIN_IDS:
-            return True
-        return bool(row["is_admin"]) if row else False
+    approved, banned = _auth_flags(user_id)
+    return approved and not banned
 
 
 def is_super_admin(user_id: int) -> bool:
@@ -220,13 +301,8 @@ def is_super_admin(user_id: int) -> bool:
     from config import ADMIN_IDS
     if user_id not in ADMIN_IDS:
         return False
-    with get_connection() as conn:
-        row = conn.execute(
-            "SELECT is_banned FROM users WHERE user_id = ?", (user_id,)
-        ).fetchone()
-        if row and row["is_banned"]:
-            return False
-    return True
+    _approved, banned = _auth_flags(user_id)
+    return not banned
 
 
 def mark_access_request_notified(user_id: int, cooldown_hours: int = 24) -> bool:

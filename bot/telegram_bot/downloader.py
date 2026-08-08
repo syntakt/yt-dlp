@@ -1,4 +1,5 @@
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import ipaddress
 import logging
@@ -20,6 +21,7 @@ from config import (
     COOKIES_FILE,
     DOWNLOAD_TIMEOUT,
     INFO_TIMEOUT,
+    MAX_CONCURRENT_DOWNLOADS,
     MAX_FILE_SIZE_BYTES,
     MAX_PLAYLIST_TOTAL_BYTES,
     MIN_FREE_DISK_BYTES,
@@ -36,6 +38,29 @@ from config import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+# Отдельный пул потоков для блокирующей работы yt-dlp.
+#
+# ВАЖНО: нельзя использовать executor по умолчанию (run_in_executor(None, …) /
+# asyncio.to_thread). asyncio выполняет в нём же loop.getaddrinfo(), поэтому
+# несколько многочасовых загрузок насыщали бы пул (его размер — min(32, cpu+4))
+# и резолвинг DNS всего бота вставал бы вместе с ними.
+_EXECUTOR = ThreadPoolExecutor(
+    max_workers=max(8, MAX_CONCURRENT_DOWNLOADS * 3),
+    thread_name_prefix="ytdlp",
+)
+
+
+async def run_blocking(func, *args):
+    """Выполняет блокирующую функцию yt-dlp в выделенном пуле потоков."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_EXECUTOR, func, *args)
+
+
+def shutdown_executor() -> None:
+    """Останавливает пул потоков (вызывается при остановке бота)."""
+    _EXECUTOR.shutdown(wait=False, cancel_futures=True)
 
 
 _ORIGINAL_GETADDRINFO = getattr(
@@ -172,6 +197,8 @@ class DownloadResult:
     title: str = ""
     file_size: int = 0
     error: str = ""
+    # True, если запрошенные субтитры действительно нашлись и были вшиты
+    has_subtitles: bool = False
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -253,22 +280,20 @@ async def get_video_info(url: str) -> VideoInfo:
     opts = _base_opts()
     opts.update({
         "skip_download": True,
-        # extract_flat=True: для плейлистов возвращает только плоский список
-        # (id, title, url) без HTTP-запросов для каждого видео — на порядок быстрее.
-        # Для одиночных видео поведение не меняется.
-        "extract_flat": True,
+        # extract_flat="in_playlist": для плейлистов возвращает плоский список
+        # (id, title, url) без HTTP-запроса на каждое видео — на порядок быстрее.
+        # Именно "in_playlist", а не True: с True yt-dlp не резолвит и URL верхнего
+        # уровня, из-за чего у редиректных/обёрточных экстракторов возвращался
+        # {"_type": "url"} без formats — меню качества выходило пустым.
+        "extract_flat": "in_playlist",
     })
-
-    loop = asyncio.get_running_loop()
 
     def _extract():
         with _guard_network(), yt_dlp.YoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
-        info = await asyncio.wait_for(
-            loop.run_in_executor(None, _extract), timeout=INFO_TIMEOUT
-        )
+        info = await asyncio.wait_for(run_blocking(_extract), timeout=INFO_TIMEOUT)
     except asyncio.TimeoutError as e:
         raise TimeoutError("Metadata request timed out") from e
 
@@ -309,7 +334,11 @@ async def get_video_info(url: str) -> VideoInfo:
 
 
 def _parse_formats(raw_formats: list) -> list[FormatInfo]:
-    seen = set()
+    # dedup_key → FormatInfo. Дубликаты разрешаем в пользу большего битрейта,
+    # а не первого встреченного (раньше комментарий обещал «keep best tbr»,
+    # но код оставлял первый). Служебные форматы отсеиваются ДО дедупа —
+    # иначе storyboard занимал ключ и прятал настоящий формат.
+    best: dict[tuple, FormatInfo] = {}
     result = []
 
     for f in raw_formats:
@@ -335,19 +364,13 @@ def _parse_formats(raw_formats: list) -> list[FormatInfo]:
 
         quality = f.get("quality", 0) or 0
 
-        # Skip duplicate resolutions for video formats (keep best tbr)
-        dedup_key = (res, ext, vcodec != "none", acodec != "none")
-        if dedup_key in seen and res != "audio only":
-            continue
-        seen.add(dedup_key)
-
         # Skip storyboard/mhtml
         if ext in ("mhtml", "none"):
             continue
         if "storyboard" in fid.lower():
             continue
 
-        result.append(FormatInfo(
+        candidate = FormatInfo(
             format_id=fid,
             ext=ext,
             quality=str(quality),
@@ -358,7 +381,19 @@ def _parse_formats(raw_formats: list) -> list[FormatInfo]:
             filesize=filesize,
             tbr=tbr,
             note=f.get("format_note", ""),
-        ))
+        )
+
+        if res == "audio only":
+            # Аудио-дорожки не схлопываем: пользователь выбирает из них отдельно
+            result.append(candidate)
+            continue
+
+        dedup_key = (res, ext, vcodec != "none", acodec != "none")
+        current = best.get(dedup_key)
+        if current is None or (candidate.tbr or 0) > (current.tbr or 0):
+            best[dedup_key] = candidate
+
+    result.extend(best.values())
 
     # Sort: video by height desc, then audio
     def sort_key(f: FormatInfo):
@@ -444,6 +479,7 @@ async def download_video(
     audio_format: str = "mp3",   # "mp3" | "opus" | "wav"
     subtitle_lang: Optional[str] = None,
     cancel_flag: Optional[list] = None,
+    max_height: Optional[int] = None,
 ) -> DownloadResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(output_dir / "%(title).80s.%(ext)s")
@@ -515,9 +551,16 @@ async def download_video(
                 "postprocessor_args": {"ffmpeg": ["-threads", "0"]},
             })
     else:
-        # Combine selected video with best audio
+        # Combine selected video with best audio.
+        # max_height приходит из FormatInfo.resolution вызывающей стороны.
+        # Раньше высота парсилась из самого format_id — у YouTube он числовой
+        # («137» = 1080p), и fallback превращался в бессмысленный
+        # best[height<=137], то есть в 144p вместо запрошенного качества.
         if format_id and format_id != "best":
-            fmt = f"{format_id}+bestaudio/best[height<={_height_from_fid(format_id)}]/best"
+            if max_height:
+                fmt = f"{format_id}+bestaudio/best[height<={max_height}]/best"
+            else:
+                fmt = f"{format_id}+bestaudio/best"
         else:
             fmt = "bestvideo+bestaudio/best"
         opts["format"] = fmt
@@ -528,6 +571,13 @@ async def download_video(
             "writesubtitles": True,
             "subtitleslangs": [subtitle_lang],
             "writeautomaticsub": True,
+        })
+        # Без FFmpegEmbedSubtitle субтитры оставались отдельным .vtt в tmp_dir
+        # и удалялись вместе с ним — пользователь получал видео без субтитров.
+        # already_have_subtitle=False → после вшивания отдельный файл удаляется.
+        opts.setdefault("postprocessors", []).append({
+            "key": "FFmpegEmbedSubtitle",
+            "already_have_subtitle": False,
         })
 
     # SponsorBlock: автоматически вырезать рекламные вставки из YouTube
@@ -551,6 +601,7 @@ async def download_video(
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
                 result_holder["title"] = info.get("title", "")
+                result_holder["has_subtitles"] = bool(info.get("requested_subtitles"))
                 if audio_only:
                     ext = ".opus" if audio_format == "opus" else ".wav" if audio_format == "wav" else ".mp3"
                     filename = Path(filename).with_suffix(ext)
@@ -571,7 +622,7 @@ async def download_video(
             # so it doesn't leak out of the executor thread.
             result_holder["error"] = str(e)
 
-    worker = loop.run_in_executor(None, _download)
+    worker = asyncio.ensure_future(run_blocking(_download))
     try:
         await asyncio.wait_for(asyncio.shield(worker), timeout=DOWNLOAD_TIMEOUT + 60)
     except asyncio.TimeoutError:
@@ -623,6 +674,7 @@ async def download_video(
         file_path=file_path,
         title=result_holder.get("title", ""),
         file_size=file_size,
+        has_subtitles=bool(result_holder.get("has_subtitles")),
     )
 
 
@@ -655,7 +707,6 @@ async def download_playlist(
         "max_filesize": MAX_FILE_SIZE_BYTES,
     })
 
-    loop = asyncio.get_running_loop()
     results = []
     error_holder: dict = {}
     timeout = DOWNLOAD_TIMEOUT * max(1, max_items)
@@ -687,7 +738,7 @@ async def download_playlist(
         except Exception as e:
             error_holder["error"] = str(e)
 
-    worker = loop.run_in_executor(None, _download)
+    worker = asyncio.ensure_future(run_blocking(_download))
     try:
         await asyncio.wait_for(asyncio.shield(worker), timeout=timeout + 60)
     except asyncio.TimeoutError as e:
@@ -736,10 +787,12 @@ async def download_playlist(
     return results
 
 
-def _height_from_fid(format_id: str) -> int:
-    """Best-effort: if format_id encodes height, extract it."""
-    m = re.search(r"(\d{3,4})p?", format_id)
-    return int(m.group(1)) if m else 9999
+def height_from_resolution(resolution: Optional[str]) -> Optional[int]:
+    """'1080p' → 1080. Возвращает None, если высота неизвестна ('audio only')."""
+    if not resolution:
+        return None
+    m = re.fullmatch(r"(\d{2,5})p", resolution.strip())
+    return int(m.group(1)) if m else None
 
 
 _EXTRACTORS_LOCK = threading.Lock()
@@ -1235,7 +1288,13 @@ async def download_torrent(
             if pct or sizes:
                 await _emit()
     finally:
-        await proc.wait()
+        # Без таймаута зависший aria2c держал бы корутину вечно (в т.ч. при
+        # отмене задачи на shutdown бота) — добиваем процесс принудительно.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=30)
+        except asyncio.TimeoutError:
+            logger.warning("aria2c не завершился за 30 с — принудительная остановка")
+            await _terminate_proc(proc)
         watchdog.cancel()
         try:
             await watchdog

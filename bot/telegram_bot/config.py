@@ -90,6 +90,12 @@ MAX_FILE_SIZE_BYTES = MAX_FILE_SIZE_MB * 1024 * 1024
 # При использовании docker-compose значение: http://telegram-bot-api:8081
 LOCAL_API_SERVER = os.environ.get("LOCAL_API_SERVER", "http://telegram-bot-api:8081")
 
+# Жёсткий потолок Telegram на размер отправляемого файла: 2000 МБ у локального
+# Bot API сервера и 50 МБ у публичного api.telegram.org. MAX_FILE_SIZE_MB может
+# быть больше (такие файлы отдаются ссылкой), поэтому кнопка «Отправить в
+# Telegram» показывается только для файлов, которые реально влезут.
+TELEGRAM_UPLOAD_LIMIT_BYTES = (2000 if LOCAL_API_SERVER else 50) * 1024 * 1024
+
 # Concurrency
 MAX_CONCURRENT_DOWNLOADS = _parse_int("MAX_CONCURRENT_DOWNLOADS", 3, minimum=1, maximum=32)
 MAX_CONCURRENT_DOWNLOADS_PER_USER = _parse_int(
@@ -109,8 +115,9 @@ INFO_TIMEOUT = _parse_int("INFO_TIMEOUT", 120, minimum=15, maximum=900)
 #   Пример: https://myserver.com  или  http://1.2.3.4:8080
 #   Если пусто — только Telegram (старое поведение), кнопка «Ссылка» не появляется
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
-# Прямая ссылка на сервер по IP (без Cloudflare Tunnel).
-# Пример: http://1.2.3.4:8080
+# Прямая ссылка на сервер (без Cloudflare Tunnel), через nginx-ssl.
+# ТОЛЬКО https:// — ссылка несёт bearer-токен скачивания, validate_config()
+# отклоняет http:// для всего, кроме loopback. Пример: https://1-2-3-4.sslip.io:7443
 # Если задан — добавляется кнопка «Прямая ссылка (IP)» в меню доставки.
 DIRECT_BASE_URL = os.environ.get("DIRECT_BASE_URL", "").rstrip("/")
 # Relay-сервер — резервный путь для пользователей с заблокированным Cloudflare/IP.
@@ -130,10 +137,12 @@ SERVER_SECRET = os.environ.get("SERVER_SECRET", "")
 if not SERVER_SECRET:
     _log.getLogger(__name__).warning("SERVER_SECRET is not set — file tokens lack HMAC protection")
 
-# Feature flags
-ALLOW_PLAYLISTS = os.environ.get("ALLOW_PLAYLISTS", "true").lower() == "true"
-ALLOW_AUDIO = os.environ.get("ALLOW_AUDIO", "true").lower() == "true"
-ALLOW_SUBTITLES = os.environ.get("ALLOW_SUBTITLES", "true").lower() == "true"
+# Feature flags. Все булевы настройки читаются через _is_true(), чтобы 1/yes/on
+# работали одинаково везде (раньше часть флагов сравнивалась с "true" буквально
+# и ALLOW_AUDIO=1 молча означало «выключено»).
+ALLOW_PLAYLISTS = _is_true("ALLOW_PLAYLISTS", "true")
+ALLOW_AUDIO = _is_true("ALLOW_AUDIO", "true")
+ALLOW_SUBTITLES = _is_true("ALLOW_SUBTITLES", "true")
 # Максимальное количество видео в плейлисте (кнопки покажут half и full)
 MAX_PLAYLIST_ITEMS = _parse_int("MAX_PLAYLIST_ITEMS", 10, minimum=1, maximum=100)
 # Суммарный лимит плейлиста и неприкосновенный резерв диска.
@@ -144,14 +153,14 @@ MAX_PLAYLIST_TOTAL_BYTES = MAX_PLAYLIST_TOTAL_MB * 1024 * 1024
 MIN_FREE_DISK_MB = _parse_int("MIN_FREE_DISK_MB", 1024, minimum=128)
 MIN_FREE_DISK_BYTES = MIN_FREE_DISK_MB * 1024 * 1024
 # Аудио в формате OPUS — ремукс без перекодирования, значительно быстрее MP3
-ALLOW_OPUS = os.environ.get("ALLOW_OPUS", "true").lower() == "true"
+ALLOW_OPUS = _is_true("ALLOW_OPUS", "true")
 # Аудио в формате WAV — несжатый PCM, максимальное качество, большие файлы
-ALLOW_WAV = os.environ.get("ALLOW_WAV", "false").lower() == "true"
+ALLOW_WAV = _is_true("ALLOW_WAV")
 # aria2c: параллельные соединения ускоряют загрузку больших файлов по HTTP
 # Требует aria2 в системе (уже установлен в Dockerfile)
-USE_ARIA2C = os.environ.get("USE_ARIA2C", "true").lower() == "true"
+USE_ARIA2C = _is_true("USE_ARIA2C", "true")
 # SponsorBlock: убирать рекламные вставки из YouTube-видео
-USE_SPONSORBLOCK = os.environ.get("USE_SPONSORBLOCK", "false").lower() == "true"
+USE_SPONSORBLOCK = _is_true("USE_SPONSORBLOCK")
 
 # ── BitTorrent (magnet + .torrent) ────────────────────────────────────────────
 # По умолчанию ВЫКЛЮЧЕНО (opt-in): торренты расширяют поверхность атаки.
@@ -215,6 +224,24 @@ DISK_ALERT_THRESHOLD = _parse_int("DISK_ALERT_THRESHOLD", 80, minimum=0, maximum
 
 # Файловый HTTP-сервер
 FS_RATE_LIMIT = _parse_int("FS_RATE_LIMIT", 30, minimum=1, maximum=10000)
+
+# Анти-флуд: сколько «дорогих» действий (разбор ссылок, .torrent-файлы) один
+# пользователь может инициировать в минуту. Ограничение на параллельные
+# загрузки (MAX_CONCURRENT_DOWNLOADS_PER_USER) не мешало ставить в очередь
+# неограниченное число запросов метаданных.
+USER_ACTIONS_PER_MINUTE = _parse_int("USER_ACTIONS_PER_MINUTE", 20, minimum=1, maximum=600)
+
+
+def ttl_label() -> str:
+    """Человекочитаемый TTL ссылок: «2 ч», «45 м», «5 м».
+
+    Раньше в UI везде стояло max(1, FILE_TTL_SECONDS // 3600), поэтому при
+    FILE_TTL_HOURS=0.25 бот обещал «1 ч» вместо реальных 15 минут.
+    """
+    if FILE_TTL_SECONDS >= 3600:
+        hours = FILE_TTL_SECONDS / 3600
+        return f"{hours:.0f} ч" if abs(hours - round(hours)) < 0.05 else f"{hours:.1f} ч"
+    return f"{max(1, FILE_TTL_SECONDS // 60)} м"
 
 
 def validate_config() -> None:

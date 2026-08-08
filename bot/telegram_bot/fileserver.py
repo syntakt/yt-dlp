@@ -24,6 +24,7 @@ import hmac as _hmac_mod
 import ipaddress
 import logging
 import os
+import re
 import time
 import uuid
 from collections import defaultdict
@@ -44,6 +45,11 @@ logger = logging.getLogger(__name__)
 # Секрет для HMAC-подписи токенов (задаётся в .env как SERVER_SECRET).
 # Если не задан — токены без подписи (UUID4 = 122 бит энтропии, всё ещё безопасно).
 _SERVER_SECRET: bytes = _SERVER_SECRET_STR.encode()
+
+# uuid4().hex (32) и uuid4().hex + hmac16 (48) — только строчные hex-символы
+_HEX32_RE = re.compile(r"[0-9a-f]{32}")
+_HEX48_RE = re.compile(r"[0-9a-f]{48}")
+
 
 def _parse_trusted_proxy_cidrs() -> list[ipaddress._BaseNetwork]:
     raw = os.environ.get("FS_TRUSTED_PROXY_CIDRS", "10.10.2.0/24,127.0.0.1/32,::1/128")
@@ -100,7 +106,7 @@ def _verify_token(token: str) -> Optional[str]:
     """Проверяет токен и возвращает uuid_key (32 hex) или None при ошибке."""
     token = token.strip()
     if _SERVER_SECRET:
-        if len(token) != 48:
+        if not _HEX48_RE.fullmatch(token):
             return None
         uuid_key = token[:32]
         sig = token[32:]
@@ -112,12 +118,10 @@ def _verify_token(token: str) -> Optional[str]:
             return None
         return uuid_key
     else:
-        if len(token) != 32:
-            return None
-        # Только hex-символы
-        try:
-            int(token, 16)
-        except ValueError:
+        # Строгая regex-проверка вместо int(token, 16): int() принимает '0x…',
+        # знак '-' и пробелы, то есть пропускал бы в реестр строки, которые
+        # ключом uuid4().hex быть не могут.
+        if not _HEX32_RE.fullmatch(token):
             return None
         return token
 
@@ -255,11 +259,27 @@ def _remove(uuid_key: str, reason: str = "") -> None:
 def _delete_entry_file(entry: FileEntry) -> None:
     try:
         real_path = _validate_served_path(entry.path)
+    except FileNotFoundError:
+        # Файла уже нет (например, он ушёл через Telegram и был удалён отправителем).
+        # Это штатная ситуация, а не «путь вне корня»: раньше сюда попадал
+        # пугающий ERROR, а пустой каталог <uuid_key>/ оставался на диске навсегда.
+        _rmdir_if_inside_root(entry.path.parent)
+        return
     except (ValueError, OSError):
         logger.error("Refusing to delete file outside fileserver root: %s", entry.path)
         return
     real_path.unlink(missing_ok=True)
     _rmdir_safe(real_path.parent)
+
+
+def _rmdir_if_inside_root(directory: Path) -> None:
+    """Удаляет пустой каталог, но только если он лежит внутри fileserver-корня."""
+    try:
+        resolved = directory.resolve(strict=True)
+        resolved.relative_to(_fileserver_root())
+    except (ValueError, OSError):
+        return
+    _rmdir_safe(resolved)
 
 
 def _update_download_status(
@@ -437,7 +457,8 @@ async def _handle_info(request: web.Request) -> web.Response:
     if not _check_rate_limit(ip):
         logger.warning("Rate limit exceeded: %s /info/%s…", ip, token[:8])
         raise web.HTTPTooManyRequests(
-            reason="Слишком много запросов. Попробуйте через минуту.",
+            text="Слишком много запросов. Попробуйте через минуту.",
+            content_type="text/plain",
             headers=_SEC_HEADERS,
         )
 
@@ -448,13 +469,18 @@ async def _handle_info(request: web.Request) -> web.Response:
     entry = _registry.get(uuid_key)
     if entry is None:
         raise web.HTTPGone(
-            reason="Файл не найден или ссылка уже использована.",
+            text="Файл не найден или ссылка уже использована.",
+            content_type="text/plain",
             headers=_SEC_HEADERS,
         )
 
     if time.time() >= entry.expires_at:
         _remove(uuid_key, "TTL истёк (info)")
-        raise web.HTTPGone(reason="Срок действия ссылки истёк.", headers=_SEC_HEADERS)
+        raise web.HTTPGone(
+            text="Срок действия ссылки истёк.",
+            content_type="text/plain",
+            headers=_SEC_HEADERS,
+        )
 
     remaining = int(entry.expires_at - time.time())
     # & должен экранироваться первым, иначе уже экранированные &lt; превратятся в &amp;lt;
@@ -486,7 +512,8 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
     if not _check_rate_limit(ip):
         logger.warning("Rate limit exceeded: %s /dl/%s…", ip, token[:8])
         raise web.HTTPTooManyRequests(
-            reason="Слишком много запросов.",
+            text="Слишком много запросов.",
+            content_type="text/plain",
             headers=_SEC_HEADERS,
         )
 
@@ -501,7 +528,8 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
     entry = _registry.pop(uuid_key, None)
     if entry is None:
         raise web.HTTPGone(
-            reason="Файл не найден или ссылка уже использована.",
+            text="Файл не найден или ссылка уже использована.",
+            content_type="text/plain",
             headers=_SEC_HEADERS,
         )
 
@@ -510,12 +538,17 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
         _delete_entry_file(entry)
         _update_download_status(entry, "error", "file link expired")
         logger.info("Файл '%s' удалён (TTL истёк на /dl/)", entry.filename)
-        raise web.HTTPGone(reason="Срок действия ссылки истёк.", headers=_SEC_HEADERS)
+        raise web.HTTPGone(
+            text="Срок действия ссылки истёк.",
+            content_type="text/plain",
+            headers=_SEC_HEADERS,
+        )
 
     if not entry.path.exists():
         _update_download_status(entry, "error", "file missing before delivery")
         raise web.HTTPNotFound(
-            reason="Файл не найден на диске.",
+            text="Файл не найден на диске.",
+            content_type="text/plain",
             headers=_SEC_HEADERS,
         )
 

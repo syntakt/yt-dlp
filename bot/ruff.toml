@@ -1,0 +1,26 @@
+# Отдельная конфигурация линтера для кода бота.
+#
+# Корневой pyproject.toml задаёт стиль upstream yt-dlp (одинарные кавычки,
+# обязательные trailing commas). Бот написан в другом стиле, и переформатировать
+# 8 тыс. строк ради этого смысла нет — здесь проверяем то, что ловит реальные
+# ошибки: неиспользуемые имена, битые импорты, bugbear-ловушки, устаревший
+# синтаксис. ruff берёт ближайший конфиг, поэтому этот файл покрывает bot/**.
+
+line-length = 120
+target-version = "py312"
+
+[lint]
+select = [
+    "E",    # pycodestyle Error
+    "W",    # pycodestyle Warning
+    "F",    # Pyflakes: мёртвые имена, битые импорты, опечатки
+    "B",    # flake8-bugbear: реальные ловушки времени выполнения
+    "C4",   # flake8-comprehensions
+]
+ignore = [
+    "E501",    # line-too-long — длина ограничена ревью, не линтером
+    "B008",    # function-call-in-default-argument
+    "B904",    # raise-without-from-inside-except
+    "B007",    # unused-loop-control-variable — читаемость распаковки важнее
+    "B905",    # zip() без strict= — длины гарантированы вызывающим кодом
+]
