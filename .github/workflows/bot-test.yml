@@ -38,7 +38,10 @@ jobs:
         # Бот импортирует yt-dlp из ЭТОГО репозитория, а не с PyPI —
         # так же, как это делает bot/Dockerfile.
         python -m pip install -U pip
-        python -m pip install -e .
+        # extras `default` — как в bot/Dockerfile: mutagen, pycryptodomex,
+        # brotli, websockets, yt-dlp-ejs. Без них тесты проверяли бы не то,
+        # что реально работает в контейнере.
+        python -m pip install -e ".[default]"
         python -m pip install -r bot/requirements-dev.txt
     - name: Lint
       shell: bash

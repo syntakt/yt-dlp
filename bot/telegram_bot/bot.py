@@ -13,7 +13,7 @@ import sqlite3
 import time
 import uuid
 from dataclasses import asdict
-from datetime import datetime
+from datetime import datetime, timezone
 import html as _html
 from functools import wraps
 from pathlib import Path
@@ -138,6 +138,10 @@ KEY_QUALITY_MSG   = "quality_menu_msg_id"  # message_id меню выбора к
 KEY_BOUND_SESSIONS = "_bound_sessions"
 KEY_RESOLVE_SESSIONS = "_resolve_sessions"
 KEY_TORRENT_SESSIONS = "_torrent_sessions"  # token -> {"meta": TorrentMeta}
+# Ожидание диапазона отрывка: {"message": Message, "format_id": str, "duration": int}
+KEY_PENDING_CLIP = "_pending_clip"
+# (chat_id, message_id) -> (start, end): передаёт диапазон в _handle_download_callback
+KEY_CLIP_RANGES = "_clip_ranges"
 
 # Промежуточное хранилище .torrent-файлов (magnet-метаданные и загруженные документы).
 # Под DOWNLOAD_DIR (том /downloads доступен на запись); чистится после загрузки/по TTL.
@@ -444,6 +448,35 @@ def _get_bot_version() -> str:
 BOT_VERSION = _get_bot_version()
 
 
+def _get_build_age() -> str:
+    """«2026-08-08 (14 дн назад)» — насколько протух образ.
+
+    Экстракторы ломаются на стороне сайтов, поэтому образ надо пересобирать
+    регулярно; без этой строки админ никак не видел возраст сборки.
+    """
+    raw = os.environ.get("BUILD_DATE", "").strip()
+    if not raw:
+        try:
+            raw = Path(os.path.dirname(__file__) or ".").joinpath(".build_date").read_text().strip()
+        except OSError:
+            return "неизвестно"
+    if not raw:
+        return "неизвестно"
+    try:
+        built = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return raw
+    if built.tzinfo is None:
+        built = built.replace(tzinfo=timezone.utc)
+    days = (datetime.now(timezone.utc) - built).days
+    if days <= 0:
+        return f"{built:%Y-%m-%d} (сегодня)"
+    return f"{built:%Y-%m-%d} ({days} дн назад)"
+
+
+BUILD_AGE = _get_build_age()
+
+
 # ── Основные команды ─────────────────────────────────────────────────────────────
 
 def _build_main_menu(user_obj) -> tuple[str, InlineKeyboardMarkup]:
@@ -678,7 +711,8 @@ async def _build_status_text(user_id: int, verbose: bool = True) -> str:
             _channels.append(f"Relay x{len(config.RELAY_BASE_URLS)}")
         text += f"• Каналы доставки: {', '.join(_channels) if _channels else 'только Telegram'}\n"
         text += f"• HMAC подпись: {'✓' if config.SERVER_SECRET else '✗'}\n"
-        text += f"• Версия: <code>v{BOT_VERSION}</code>"
+        text += f"• Версия: <code>v{BOT_VERSION}</code>\n"
+        text += f"• Сборка образа: {BUILD_AGE}"
 
         # Список пользователей с подробностями.
         # ВАЖНО: собираем построчно и режем по бюджету — на ~30 пользователях
@@ -974,6 +1008,10 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
+
+    # Ждём интервал отрывка — тогда это не ссылка, а ответ на запрос бота
+    if await _handle_clip_reply(update, ctx, text):
+        return
 
     if not _allow_user_action(update.effective_user.id):
         await update.message.reply_text(
@@ -1460,7 +1498,7 @@ async def _handle_torrent_callback(query, ctx: ContextTypes.DEFAULT_TYPE, token:
             await status_msg.edit_text("⚠️ В раздаче не оказалось медиа-файлов для отправки.")
             return
 
-        sent, skipped = await _deliver_torrent_results(query.message.chat_id, results, ctx)
+        sent, skipped = await _deliver_results_batch(query.message.chat_id, results, ctx)
         final_status = "partial" if skipped else ("ready" if _has_fileserver() else "done")
         db.update_download(dl_id, title=meta.name, status=final_status)
         summary = f"✅ Торрент обработан. Отправлено файлов: {sent}"
@@ -1507,8 +1545,12 @@ def _has_fileserver() -> bool:
     return bool(config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS)
 
 
-async def _deliver_torrent_results(chat_id: int, results: list[DownloadResult], ctx) -> tuple[int, int]:
-    """Доставляет медиа-файлы торрента (fileserver-ссылки одним сообщением или в Telegram)."""
+async def _deliver_results_batch(chat_id: int, results: list[DownloadResult], ctx) -> tuple[int, int]:
+    """Доставляет пачку файлов: ссылки файлового сервера одним сообщением или файлы в Telegram.
+
+    Используется торрентами и разбиением по главам — оба дают несколько файлов.
+    Возвращает (отправлено, пропущено).
+    """
     sent = 0
     skipped = 0
     fs_lines: list[str] = []
@@ -1605,6 +1647,16 @@ def _build_quality_menu(info: VideoInfo) -> tuple[str, InlineKeyboardMarkup]:
             InlineKeyboardButton("📄 + Субтитры RU", callback_data="dl:s:ru"),
             InlineKeyboardButton("📄 + Субтитры EN", callback_data="dl:s:en"),
         ])
+    _extra: list[InlineKeyboardButton] = []
+    if config.ALLOW_CLIPS and info.duration:
+        _extra.append(InlineKeyboardButton("✂️ Отрывок", callback_data="dl:clip:best"))
+    # Кнопку разбиения показываем только если у видео реально есть главы
+    if config.ALLOW_SPLIT_CHAPTERS and info.chapter_count > 1:
+        _extra.append(InlineKeyboardButton(
+            f"🔖 По главам ({info.chapter_count})", callback_data="dl:sc:best"
+        ))
+    if _extra:
+        buttons.append(_extra)
     buttons.append([
         InlineKeyboardButton("🔄 Обновить", callback_data="refresh"),
         InlineKeyboardButton("ℹ️ Подробнее", callback_data="info"),
@@ -1697,6 +1749,33 @@ def _release_download(ctx, user_id: int, chat_id: int, message_id: int) -> None:
 
 def _spawn_update_task(update: Update, ctx, coro, name: str) -> None:
     ctx.application.create_task(coro, update=update, name=name)
+
+
+class _MessageQuery:
+    """CallbackQuery-подобный адаптер поверх обычного сообщения.
+
+    Нужен, чтобы поток «скачать отрывок» (запускается текстовым сообщением с
+    диапазоном, а не нажатием кнопки) переиспользовал _handle_download_callback
+    целиком, вместо копии его 200 строк с обработкой очереди, отмены и доставки.
+    """
+
+    def __init__(self, message: Message, user):
+        self.message = message
+        self.from_user = user
+        self.data = ""
+
+    async def answer(self, text: str = "", show_alert: bool = False):
+        if text:
+            await self.message.reply_text(text)
+
+    async def edit_message_text(self, *args, **kwargs):
+        return await self.message.edit_text(*args, **kwargs)
+
+    async def edit_message_caption(self, *args, **kwargs):
+        return await self.message.edit_caption(*args, **kwargs)
+
+    async def edit_message_reply_markup(self, *args, **kwargs):
+        return await self.message.edit_reply_markup(*args, **kwargs)
 
 
 async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -2294,7 +2373,130 @@ def _estimate_download_size(
     return int((base + audio_overhead) * 1.1)
 
 
-_VALID_DL_TYPES = {"v", "a", "ao", "aw", "s"}
+_VALID_DL_TYPES = {"v", "a", "ao", "aw", "s", "sc", "clip"}
+
+# Диапазон отрывка: «10:00-12:30», «1:02:00 - 1:05:00», «90-150» (секунды)
+_TIME_RANGE_RE = re.compile(
+    r"^\s*(?P<start>[\d:]{1,9})\s*[-–—]\s*(?P<end>[\d:]{1,9})\s*$"
+)
+
+
+def _parse_timestamp(text: str) -> Optional[float]:
+    """«90» → 90, «1:30» → 90, «1:02:03» → 3723. None при мусоре."""
+    parts = text.split(":")
+    if len(parts) > 3:
+        return None
+    total = 0.0
+    for part in parts:
+        if not part.isdigit():
+            return None
+        total = total * 60 + int(part)
+    return total
+
+
+def _parse_time_range(text: str, duration: int = 0) -> tuple[float, float] | None:
+    """Разбирает «10:00-12:30» в (600, 750) с валидацией.
+
+    Возвращает None, если формат непонятен, конец не позже начала, отрывок
+    длиннее MAX_CLIP_SECONDS или начало выходит за длительность видео.
+    """
+    match = _TIME_RANGE_RE.match(text)
+    if not match:
+        return None
+    start = _parse_timestamp(match.group("start"))
+    end = _parse_timestamp(match.group("end"))
+    if start is None or end is None or end <= start:
+        return None
+    if end - start > config.MAX_CLIP_SECONDS:
+        return None
+    if duration and start >= duration:
+        return None
+    return start, end
+
+
+def _fmt_clock(seconds: float) -> str:
+    """600 → «10:00», 3723 → «1:02:03»."""
+    total = int(seconds)
+    h, r = divmod(total, 3600)
+    m, s = divmod(r, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+async def _ask_for_clip_range(query, ctx, info: VideoInfo, url: str, format_id: str) -> None:
+    """Просит прислать интервал отрывка и запоминает ожидание."""
+    limit_min = max(1, config.MAX_CLIP_SECONDS // 60)
+    prompt = (
+        f"✂️ <b>Отрывок</b> — {_esc(info.title[:80])}\n"
+        f"Длительность: {info.duration_str}\n\n"
+        "Пришлите интервал сообщением:\n"
+        "<code>10:00-12:30</code>   •   <code>1:02:00-1:05:00</code>   •   <code>90-150</code>\n\n"
+        f"Максимум {limit_min} мин на отрывок. Для отмены — /cancel."
+    )
+    try:
+        prompt_msg = await query.edit_message_text(prompt, parse_mode=ParseMode.HTML)
+    except TelegramError:
+        # Меню было фото-сообщением: шлём новое и перепривязываем к нему сессию
+        prompt_msg = await ctx.bot.send_message(
+            query.message.chat_id, prompt, parse_mode=ParseMode.HTML,
+        )
+    ctx.user_data[KEY_PENDING_CLIP] = {
+        "message": prompt_msg,
+        "format_id": format_id,
+        "duration": info.duration or 0,
+    }
+    try:
+        _save_session_safe(
+            prompt_msg.chat_id, prompt_msg.message_id, url, info,
+            user_id=query.from_user.id, ctx=ctx,
+        )
+    except Exception as e:
+        logger.warning("save_session (clip prompt) failed: %s", e)
+
+
+async def _handle_clip_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, text: str) -> bool:
+    """Обрабатывает присланный интервал отрывка. True — сообщение обработано."""
+    pending = ctx.user_data.get(KEY_PENDING_CLIP)
+    if not pending:
+        return False
+    clip = _parse_time_range(text, pending.get("duration", 0))
+    if clip is None:
+        limit_min = max(1, config.MAX_CLIP_SECONDS // 60)
+        await update.message.reply_text(
+            "❌ Не понял интервал. Формат: <code>10:00-12:30</code>\n"
+            f"Конец должен быть позже начала, длина — не больше {limit_min} мин.",
+            parse_mode=ParseMode.HTML,
+        )
+        return True
+
+    ctx.user_data.pop(KEY_PENDING_CLIP, None)
+    prompt_msg: Message = pending["message"]
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    key = _session_key(prompt_msg.chat_id, prompt_msg.message_id)
+    ctx.user_data.setdefault(KEY_CLIP_RANGES, {})[key] = clip
+
+    user = update.effective_user
+    claim_error = _claim_download(ctx, user.id, *key)
+    if claim_error:
+        ctx.user_data.get(KEY_CLIP_RANGES, {}).pop(key, None)
+        await update.effective_chat.send_message(f"⚠️ {claim_error}")
+        return True
+
+    query = _MessageQuery(prompt_msg, user)
+
+    async def _run_clip():
+        try:
+            await _handle_download_callback(query, ctx, f"dl:v:{pending['format_id']}")
+        finally:
+            _release_download(ctx, user.id, *key)
+
+    _spawn_update_task(
+        update, ctx, _run_clip(), name=f"clip_{user.id}_{prompt_msg.message_id}",
+    )
+    return True
 
 
 def _subtitle_note(dl_type: str, result: DownloadResult) -> str:
@@ -2375,6 +2577,13 @@ async def _handle_download_callback(query, ctx, data: str):
     # сбрасываем ключ, чтобы следующий URL не пытался удалить уже изменившееся сообщение.
     ctx.user_data.pop(KEY_QUALITY_MSG, None)
 
+    # «✂️ Отрывок» — не скачивание, а запрос диапазона: просим прислать его
+    # сообщением и запоминаем ожидание. Сессия остаётся привязанной к этому же
+    # message_id, поэтому после ответа поток продолжится штатным путём.
+    if dl_type == "clip":
+        await _ask_for_clip_range(query, ctx, info, url, format_id)
+        return
+
     dl_id = db.add_download(user.id, _redact_url_for_storage(url))
     # CRITICAL-3: validate format_id against known formats (allowlist)
     if dl_type == "v" and format_id not in ("best",):
@@ -2390,6 +2599,11 @@ async def _handle_download_callback(query, ctx, data: str):
 
     audio_only = dl_type in ("a", "ao", "aw")
     audio_format = "opus" if dl_type == "ao" else "wav" if dl_type == "aw" else "mp3"
+    split_chapters = dl_type == "sc"
+    # Диапазон отрывка кладёт сюда _handle_clip_reply перед перезапуском потока
+    clip_range = (ctx.user_data.get(KEY_CLIP_RANGES) or {}).pop(
+        _session_key(query.message.chat_id, query.message.message_id), None
+    )
     subtitle_lang = format_id if dl_type == "s" else None
     if dl_type == "s":
         # SEC: validate subtitle_lang (callback_data is user-controllable)
@@ -2412,12 +2626,18 @@ async def _handle_download_callback(query, ctx, data: str):
     elif dl_type == "s":
         quality_label = f"Субтитры ({subtitle_lang})"
         fmt_obj = None
+    elif dl_type == "sc":
+        quality_label = "По главам"
+        fmt_obj = None
     elif format_id == "best":
         quality_label = "Лучшее качество"
         fmt_obj = None
     else:
         fmt_obj = next((f for f in info.formats if f.format_id == format_id), None)
         quality_label = f"Видео {fmt_obj.resolution}" if fmt_obj else "Лучшее качество"
+
+    if clip_range:
+        quality_label += f" · отрывок {_fmt_clock(clip_range[0])}–{_fmt_clock(clip_range[1])}"
 
     # Проверяем размер файла ДО начала загрузки (экономит трафик и время).
     # Для форматов без точного filesize оцениваем по TBR × длительность.
@@ -2611,6 +2831,9 @@ async def _handle_download_callback(query, ctx, data: str):
                     audio_format=audio_format,
                     subtitle_lang=subtitle_lang,
                     max_height=height_from_resolution(fmt_obj.resolution) if fmt_obj else None,
+                    clip_range=clip_range,
+                    split_chapters=split_chapters,
+                    is_live=info.is_live,
                     progress_callback=_on_progress,
                     cancel_flag=cancel_flag,
                 )
@@ -2660,6 +2883,38 @@ async def _handle_download_callback(query, ctx, data: str):
                     )
                     try:
                         await status_msg.edit_text("🚫 Ваш доступ был отозван. Файл не будет доставлен.")
+                    except TelegramError:
+                        pass
+                    return
+
+                # Разбиение по главам даёт несколько файлов — отдаём их пачкой
+                # тем же путём, что и торренты (ссылки одним сообщением).
+                if len(result.parts) > 1:
+                    batch = []
+                    for part in result.parts:
+                        try:
+                            batch.append(DownloadResult(
+                                success=True, file_path=part, title=part.stem,
+                                file_size=part.stat().st_size,
+                            ))
+                        except OSError:
+                            continue
+                    sent_count, skipped_count = await _deliver_results_batch(
+                        query.message.chat_id, batch, ctx
+                    )
+                    db.update_download(
+                        dl_id,
+                        status="partial" if skipped_count else (
+                            "ready" if _has_fileserver() else "done"
+                        ),
+                        file_size=sum(b.file_size for b in batch),
+                    )
+                    summary = f"✅ Разбито по главам. Отправлено файлов: {sent_count}"
+                    if skipped_count:
+                        summary += f" (пропущено {skipped_count} — превышен лимит размера)"
+                    try:
+                        await status_msg.edit_text(summary)
+                        _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
                     except TelegramError:
                         pass
                     return

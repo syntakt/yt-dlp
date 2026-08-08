@@ -13,6 +13,7 @@ from typing import Callable, Optional
 from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
+from yt_dlp.utils import download_range_func
 
 import shutil
 
@@ -20,15 +21,24 @@ from config import (
     ALLOW_GENERIC_URLS,
     COOKIES_FILE,
     DOWNLOAD_TIMEOUT,
+    EMBED_CHAPTERS,
+    EMBED_METADATA,
+    EMBED_THUMBNAIL,
+    IMPERSONATE,
     INFO_TIMEOUT,
+    JS_RUNTIMES,
+    LIVE_FROM_START,
     MAX_CONCURRENT_DOWNLOADS,
     MAX_FILE_SIZE_BYTES,
     MAX_PLAYLIST_TOTAL_BYTES,
     MIN_FREE_DISK_BYTES,
+    POT_PROVIDER_URL,
     PROXY_URL,
+    SPONSORBLOCK_MODE,
     SSRF_PROTECTION,
     USE_ARIA2C,
-    USE_SPONSORBLOCK,
+    YOUTUBE_PLAYER_CLIENT,
+    YOUTUBE_PO_TOKEN,
     TORRENT_LISTEN_PORT,
     TORRENT_MAX_PEERS,
     TORRENT_ENABLE_DHT,
@@ -71,10 +81,29 @@ if not hasattr(socket, "_ytdlp_bot_original_getaddrinfo"):
 _NETWORK_GUARD = threading.local()
 
 
+def _ssrf_allowed_hosts() -> frozenset[str]:
+    """Хосты, которым guard разрешает приватные адреса.
+
+    Единственный случай — PO-token-провайдер: он живёт соседним контейнером на
+    10.10.2.x, и без исключения бот блокировал бы собственный сервис.
+    """
+    hosts = set()
+    if POT_PROVIDER_URL:
+        host = urlparse(POT_PROVIDER_URL).hostname
+        if host:
+            hosts.add(host.lower())
+    return frozenset(hosts)
+
+
+_SSRF_ALLOWED_HOSTS = _ssrf_allowed_hosts()
+
+
 def _guarded_getaddrinfo(host, *args, **kwargs):
     """Reject non-public DNS answers for guarded yt-dlp worker threads."""
     answers = _ORIGINAL_GETADDRINFO(host, *args, **kwargs)
     if not getattr(_NETWORK_GUARD, "enabled", False):
+        return answers
+    if isinstance(host, str) and host.lower() in _SSRF_ALLOWED_HOSTS:
         return answers
     for answer in answers:
         try:
@@ -171,6 +200,10 @@ class VideoInfo:
     playlist_count: Optional[int] = None
     webpage_url: str = ""
     extractor: str = ""
+    # Число глав — по нему бот решает, показывать ли кнопку «По главам».
+    # У полей есть дефолты, поэтому старые сессии из БД десериализуются без ошибок.
+    chapter_count: int = 0
+    is_live: bool = False
 
     @property
     def duration_str(self) -> str:
@@ -199,9 +232,70 @@ class DownloadResult:
     error: str = ""
     # True, если запрошенные субтитры действительно нашлись и были вшиты
     has_subtitles: bool = False
+    # Файлы-части при разбиении по главам (пусто, если разбиения не было)
+    parts: list[Path] = field(default_factory=list)
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
+
+def _impersonate_target():
+    """ImpersonateTarget из IMPERSONATE или None.
+
+    Без curl_cffi yt-dlp падает с «Impersonate target is not available», поэтому
+    при отсутствии зависимости просто предупреждаем и работаем обычным стеком.
+    """
+    if not IMPERSONATE:
+        return None
+    from yt_dlp.dependencies import curl_cffi
+    if not curl_cffi:
+        logger.warning(
+            "IMPERSONATE=%s задан, но curl_cffi не установлен — работаем без "
+            "подмены отпечатка (пересоберите образ: pip install 'yt-dlp[curl-cffi]')",
+            IMPERSONATE,
+        )
+        return None
+    from yt_dlp.networking.impersonate import ImpersonateTarget
+    try:
+        return ImpersonateTarget.from_str(IMPERSONATE.lower())
+    except ValueError as e:
+        logger.warning("Некорректный IMPERSONATE=%r: %s", IMPERSONATE, e)
+        return None
+
+
+def _youtube_extractor_args() -> dict:
+    """extractor_args для YouTube: PO-токены и выбор клиентов."""
+    args: dict[str, list[str]] = {}
+    if POT_PROVIDER_URL:
+        # Плагин bgutil-ytdlp-pot-provider читает базовый URL отсюда
+        args["getpot_bgutil_baseurl"] = [POT_PROVIDER_URL]
+    if YOUTUBE_PO_TOKEN:
+        args["po_token"] = [t.strip() for t in YOUTUBE_PO_TOKEN.split(",") if t.strip()]
+    if YOUTUBE_PLAYER_CLIENT:
+        args["player_client"] = [c.strip() for c in YOUTUBE_PLAYER_CLIENT.split(",") if c.strip()]
+    return args
+
+
+def _embed_postprocessors(opts: dict) -> list[dict]:
+    """Постпроцессоры вшивания тегов/обложки/глав (общие для видео и плейлистов).
+
+    Порядок как в yt_dlp/__init__.py: Metadata обязан идти перед EmbedThumbnail.
+    Побочный эффект: включает writethumbnail в переданных opts.
+    """
+    pps: list[dict] = []
+    if EMBED_METADATA or EMBED_CHAPTERS:
+        pps.append({
+            "key": "FFmpegMetadata",
+            "add_metadata": EMBED_METADATA,
+            "add_chapters": EMBED_CHAPTERS,
+        })
+    if EMBED_THUMBNAIL:
+        # mutagen вшивает обложку в mp3/m4a/mp4/opus/flac (см. extra `default`
+        # у yt-dlp). already_have_thumbnail=False → временный файл обложки
+        # удаляется после вшивания и не мешает поиску результата на диске.
+        opts["writethumbnail"] = True
+        pps.append({"key": "EmbedThumbnail", "already_have_thumbnail": False})
+    return pps
+
 
 def _base_opts() -> dict:
     opts: dict = {
@@ -213,6 +307,16 @@ def _base_opts() -> dict:
         "fragment_retries": 3,
         "file_access_retries": 3,
     }
+    # JS-рантайм для n/sig-челленджей YouTube. Формат параметра — как у CLI
+    # --js-runtimes (см. yt_dlp/__init__.py): {runtime: {"path": None}}.
+    if JS_RUNTIMES:
+        opts["js_runtimes"] = {name: {"path": None} for name in JS_RUNTIMES}
+    target = _impersonate_target()
+    if target is not None:
+        opts["impersonate"] = target
+    yt_args = _youtube_extractor_args()
+    if yt_args:
+        opts["extractor_args"] = {"youtube": yt_args}
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
@@ -330,6 +434,8 @@ async def get_video_info(url: str) -> VideoInfo:
         formats=formats,
         webpage_url=info.get("webpage_url", url),
         extractor=info.get("extractor", ""),
+        chapter_count=len(info.get("chapters") or []),
+        is_live=bool(info.get("is_live")),
     )
 
 
@@ -480,6 +586,9 @@ async def download_video(
     subtitle_lang: Optional[str] = None,
     cancel_flag: Optional[list] = None,
     max_height: Optional[int] = None,
+    clip_range: Optional[tuple[float, float]] = None,
+    split_chapters: bool = False,
+    is_live: bool = False,
 ) -> DownloadResult:
     output_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(output_dir / "%(title).80s.%(ext)s")
@@ -572,26 +681,67 @@ async def download_video(
             "subtitleslangs": [subtitle_lang],
             "writeautomaticsub": True,
         })
+
+    # ── Постпроцессоры ────────────────────────────────────────────────────────
+    # Порядок важен и повторяет сборку в yt_dlp/__init__.py:
+    #   SponsorBlock → ExtractAudio → EmbedSubtitle → ModifyChapters →
+    #   Metadata → EmbedThumbnail → SplitChapters
+    # (ModifyChapters обязан идти до Metadata, иначе главы уедут).
+    pps: list[dict] = []
+    sponsor_categories = ["sponsor", "selfpromo", "interaction"]
+    sponsorblock_on = SPONSORBLOCK_MODE in ("remove", "mark") and not audio_only
+    if sponsorblock_on:
+        pps.append({
+            "key": "SponsorBlock",
+            "categories": sponsor_categories,
+            "when": "after_filter",
+        })
+
+    pps.extend(opts.pop("postprocessors", []))   # FFmpegExtractAudio из аудио-веток
+
+    if subtitle_lang:
         # Без FFmpegEmbedSubtitle субтитры оставались отдельным .vtt в tmp_dir
         # и удалялись вместе с ним — пользователь получал видео без субтитров.
         # already_have_subtitle=False → после вшивания отдельный файл удаляется.
-        opts.setdefault("postprocessors", []).append({
-            "key": "FFmpegEmbedSubtitle",
-            "already_have_subtitle": False,
+        pps.append({"key": "FFmpegEmbedSubtitle", "already_have_subtitle": False})
+
+    if sponsorblock_on:
+        pps.append({
+            "key": "ModifyChapters",
+            "remove_sponsor_segments": sponsor_categories if SPONSORBLOCK_MODE == "remove" else [],
+            "force_keyframes": SPONSORBLOCK_MODE == "remove",
         })
 
-    # SponsorBlock: автоматически вырезать рекламные вставки из YouTube
-    if USE_SPONSORBLOCK and not audio_only:
-        opts["sponsorblock_remove"] = ["sponsor", "selfpromo", "interaction"]
+    pps.extend(_embed_postprocessors(opts))
+
+    if split_chapters:
+        opts["outtmpl"] = {
+            "default": output_template,
+            "chapter": str(output_dir / "%(section_number)03d-%(section_title).60s.%(ext)s"),
+        }
+        pps.append({"key": "FFmpegSplitChapters", "force_keyframes": False})
+
+    if pps:
+        opts["postprocessors"] = pps
+
+    if clip_range:
+        # Скачиваем только запрошенный интервал. force_keyframes_at_cuts даёт
+        # точные границы ценой перекодирования краёв.
+        start, end = clip_range
+        opts["download_ranges"] = download_range_func([], [(start, end)])
+        opts["force_keyframes_at_cuts"] = True
+
+    if is_live and LIVE_FROM_START:
+        opts["live_from_start"] = True
 
     hooks = [tracker.hook, _cancel_hook]
     opts.update({
-        "outtmpl": output_template,
         "progress_hooks": hooks,
         "postprocessor_hooks": [_cancel_hook],
         "max_filesize": MAX_FILE_SIZE_BYTES,
         "noplaylist": True,
     })
+    opts.setdefault("outtmpl", output_template)
 
     result_holder = {}
 
@@ -642,6 +792,20 @@ async def download_video(
 
     if cancel_flag and cancel_flag[0]:
         return DownloadResult(success=False, error="CANCELLED")
+
+    if split_chapters:
+        # Файлы глав названы по шаблону NNN-<title>.<ext> (см. outtmpl['chapter']).
+        # Если у видео глав не оказалось, yt-dlp ничего не разрезал — отдаём целый файл.
+        parts = _collect_chapter_files(output_dir)
+        if parts:
+            first = parts[0]
+            return DownloadResult(
+                success=True,
+                file_path=first,
+                title=result_holder.get("title", ""),
+                file_size=first.stat().st_size,
+                parts=parts,
+            )
 
     file_path: Path = result_holder.get("file_path")
     if not file_path or not file_path.exists():
@@ -706,6 +870,11 @@ async def download_playlist(
         "ignoreerrors": True,  # не прерываем плейлист на недоступном видео
         "max_filesize": MAX_FILE_SIZE_BYTES,
     })
+    # Обложки и теги — как у одиночных загрузок, иначе треки из плейлиста
+    # приходили бы в Telegram без картинки, а из одиночной загрузки — с ней
+    embed_pps = _embed_postprocessors(opts)
+    if embed_pps:
+        opts["postprocessors"] = embed_pps
 
     results = []
     error_holder: dict = {}
@@ -785,6 +954,26 @@ async def download_playlist(
             file_size=size,
         ))
     return results
+
+
+_CHAPTER_FILE_RE = re.compile(r"^\d{3}-")
+
+
+def _collect_chapter_files(output_dir: Path) -> list[Path]:
+    """Файлы, порождённые FFmpegSplitChapters (шаблон NNN-<title>.<ext>).
+
+    Исходный целый файл остаётся на диске рядом — его в список не берём,
+    иначе пользователь получил бы и главы, и полную копию видео.
+    """
+    parts = []
+    for path in sorted(output_dir.iterdir()):
+        if path.is_symlink() or not path.is_file():
+            continue
+        if path.suffix.lower() not in _MEDIA_EXTS:
+            continue
+        if _CHAPTER_FILE_RE.match(path.name):
+            parts.append(path)
+    return parts
 
 
 def height_from_resolution(resolution: Optional[str]) -> Optional[int]:

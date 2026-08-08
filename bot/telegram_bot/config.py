@@ -159,8 +159,39 @@ ALLOW_WAV = _is_true("ALLOW_WAV")
 # aria2c: параллельные соединения ускоряют загрузку больших файлов по HTTP
 # Требует aria2 в системе (уже установлен в Dockerfile)
 USE_ARIA2C = _is_true("USE_ARIA2C", "true")
-# SponsorBlock: убирать рекламные вставки из YouTube-видео
+# SponsorBlock: off | remove (вырезать) | mark (разметить главами).
+# Старый USE_SPONSORBLOCK=true продолжает работать как remove.
 USE_SPONSORBLOCK = _is_true("USE_SPONSORBLOCK")
+SPONSORBLOCK_MODE = os.environ.get(
+    "SPONSORBLOCK_MODE", "remove" if USE_SPONSORBLOCK else "off"
+).strip().lower()
+
+# ── Постобработка медиа ───────────────────────────────────────────────────────
+# Обложка вшивается mutagen'ом (mp3/m4a/mp4/opus/flac) — Telegram показывает её
+# в плеере. Требует extra `default` у yt-dlp (см. bot/Dockerfile).
+EMBED_THUMBNAIL = _is_true("EMBED_THUMBNAIL", "true")
+# Теги (исполнитель/название/описание) через FFmpegMetadata
+EMBED_METADATA = _is_true("EMBED_METADATA", "true")
+# Главы видео в контейнер (работает вместе с EMBED_METADATA)
+EMBED_CHAPTERS = _is_true("EMBED_CHAPTERS", "true")
+# Стримы качать с начала эфира, а не с текущего момента
+LIVE_FROM_START = _is_true("LIVE_FROM_START")
+# Кнопка «✂️ Отрывок»: скачать только заданный интервал видео
+ALLOW_CLIPS = _is_true("ALLOW_CLIPS", "true")
+# Максимальная длительность отрывка (секунды), защита от «отрежь мне 10 часов»
+MAX_CLIP_SECONDS = _parse_int("MAX_CLIP_SECONDS", 7200, minimum=10)
+# Кнопка «🔖 По главам»: разбить видео на файлы по главам (может дать много файлов)
+ALLOW_SPLIT_CHAPTERS = _is_true("ALLOW_SPLIT_CHAPTERS")
+
+# ── JavaScript-рантайм (обязателен для YouTube) ───────────────────────────────
+# yt-dlp решает n/sig-челленджи YouTube внешним JS-движком. Без него клиент `web`
+# исключается из списка по умолчанию и часть форматов пропадает; сам режим
+# «без рантайма» объявлен deprecated. В образ ставится deno (единственный
+# рантайм, включённый в yt-dlp по умолчанию).
+# Поддерживаются: deno, node, quickjs, bun. Пусто — оставить дефолт yt-dlp.
+JS_RUNTIMES = [
+    r.strip().lower() for r in os.environ.get("JS_RUNTIMES", "deno").split(",") if r.strip()
+]
 
 # ── BitTorrent (magnet + .torrent) ────────────────────────────────────────────
 # По умолчанию ВЫКЛЮЧЕНО (opt-in): торренты расширяют поверхность атаки.
@@ -195,6 +226,25 @@ ALLOW_GENERIC_URLS = _is_true("ALLOW_GENERIC_URLS")
 SSRF_PROTECTION = _is_true("SSRF_PROTECTION", "true")
 # Прокси резолвит целевые имена сам, поэтому должен иметь свою SSRF-фильтрацию.
 TRUST_PROXY_FOR_SSRF = _is_true("TRUST_PROXY_FOR_SSRF")
+
+# ── Impersonation (curl_cffi) ─────────────────────────────────────────────────
+# Подмена TLS/JA3-отпечатка под настоящий браузер — снимает блокировки на
+# Instagram/TikTok/X. Примеры: chrome, chrome:windows-10, safari, edge.
+# ⚠ curl_cffi ходит через libcurl (C) и НЕ проходит через socket.getaddrinfo,
+#   то есть обходит SSRF-guard бота ровно так же, как внешний прокси.
+IMPERSONATE = os.environ.get("IMPERSONATE", "").strip()
+TRUST_IMPERSONATE_FOR_SSRF = _is_true("TRUST_IMPERSONATE_FOR_SSRF")
+
+# ── PO Token (YouTube) ────────────────────────────────────────────────────────
+# Лечит «Sign in to confirm you're not a bot» на серверных IP.
+# POT_PROVIDER_URL — адрес bgutil-провайдера (контейнер профиля `pot`),
+# например http://bgutil-pot:4416. Хост провайдера добавляется в allowlist
+# SSRF-guard: иначе собственный guard заблокировал бы приватный 10.10.2.x.
+POT_PROVIDER_URL = os.environ.get("POT_PROVIDER_URL", "").strip().rstrip("/")
+# Ручной вариант без провайдера: токены в формате CLIENT.CONTEXT+TOKEN через запятую
+YOUTUBE_PO_TOKEN = os.environ.get("YOUTUBE_PO_TOKEN", "").strip()
+# Переопределение списка клиентов YouTube (например: default,-web или tv_simply)
+YOUTUBE_PLAYER_CLIENT = os.environ.get("YOUTUBE_PLAYER_CLIENT", "").strip()
 
 # Proxy (optional)
 PROXY_URL = os.environ.get("PROXY_URL", "")
@@ -276,6 +326,35 @@ def validate_config() -> None:
             "PROXY_URL with SSRF_PROTECTION requires TRUST_PROXY_FOR_SSRF=true "
             "and an SSRF-filtering proxy"
         )
+
+    # curl_cffi ходит мимо socket.getaddrinfo, поэтому SSRF-guard его не видит —
+    # та же схема доверия, что и для внешнего прокси.
+    if IMPERSONATE and SSRF_PROTECTION and not TRUST_IMPERSONATE_FOR_SSRF:
+        raise RuntimeError(
+            "IMPERSONATE uses curl_cffi, which bypasses the DNS-level SSRF guard. "
+            "Set TRUST_IMPERSONATE_FOR_SSRF=true (and rely on nftables egress rules) "
+            "or disable IMPERSONATE"
+        )
+
+    if SPONSORBLOCK_MODE not in {"off", "remove", "mark"}:
+        raise RuntimeError("SPONSORBLOCK_MODE must be 'off', 'remove' or 'mark'")
+
+    for runtime in JS_RUNTIMES:
+        if runtime not in {"deno", "node", "quickjs", "bun"}:
+            raise RuntimeError(
+                f"JS_RUNTIMES contains unsupported runtime: {runtime} "
+                "(supported: deno, node, quickjs, bun)"
+            )
+    if not JS_RUNTIMES:
+        _logger.warning(
+            "JS_RUNTIMES is empty — YouTube extraction without a JS runtime is deprecated "
+            "and some formats will be missing"
+        )
+
+    if POT_PROVIDER_URL:
+        parsed = urlparse(POT_PROVIDER_URL)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise RuntimeError(f"POT_PROVIDER_URL is not a valid URL: {POT_PROVIDER_URL}")
 
     if WEBHOOK_URL:
         parsed = urlparse(WEBHOOK_URL)

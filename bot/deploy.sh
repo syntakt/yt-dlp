@@ -18,8 +18,24 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-export GIT_COMMIT
+export GIT_COMMIT BUILD_DATE
 GIT_COMMIT=$(git rev-parse --short=7 HEAD 2>/dev/null || echo "dev")
+BUILD_DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# Экстракторы yt-dlp ломаются на стороне сайтов, поэтому важно собирать образ
+# из свежего чекаута. Показываем версию и отставание от upstream, если он настроен.
+show_source_freshness() {
+    local version behind
+    version=$(python3 -c 'import sys; sys.path.insert(0, ".."); from yt_dlp.version import __version__; print(__version__)' 2>/dev/null || echo "unknown")
+    echo "yt-dlp в чекауте: $version (commit $GIT_COMMIT)"
+    if git rev-parse --verify --quiet upstream/master >/dev/null 2>&1; then
+        behind=$(git rev-list --count HEAD..upstream/master 2>/dev/null || echo 0)
+        if [ "${behind:-0}" -gt 0 ]; then
+            echo "⚠ Отставание от upstream/master: $behind коммит(ов)."
+            echo "  Обновиться: git fetch upstream && git merge upstream/master"
+        fi
+    fi
+}
 
 read_env_value() {
     local key="$1"
@@ -66,10 +82,16 @@ ENABLE_CLOUDFLARED="${ENABLE_CLOUDFLARED:-$(read_env_value ENABLE_CLOUDFLARED)}"
 ENABLE_CLOUDFLARED="${ENABLE_CLOUDFLARED:-false}"
 ENABLE_CLOUDFLARE_QUICK_TUNNEL="${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-$(read_env_value ENABLE_CLOUDFLARE_QUICK_TUNNEL)}"
 ENABLE_CLOUDFLARE_QUICK_TUNNEL="${ENABLE_CLOUDFLARE_QUICK_TUNNEL:-false}"
+ENABLE_POT_PROVIDER="${ENABLE_POT_PROVIDER:-$(read_env_value ENABLE_POT_PROVIDER)}"
+ENABLE_POT_PROVIDER="${ENABLE_POT_PROVIDER:-false}"
 
 ACTIVE_PROFILES=()
 if has_profile ssl || [ "${1:-}" = "nginx-ssl" ] || [ "${2:-}" = "nginx-ssl" ]; then
     ACTIVE_PROFILES+=(ssl)
+fi
+
+if is_true "$ENABLE_POT_PROVIDER" || [ "${1:-}" = "bgutil-pot" ] || [ "${2:-}" = "bgutil-pot" ]; then
+    ACTIVE_PROFILES+=(pot)
 fi
 
 if is_true "$ENABLE_CLOUDFLARED"; then
@@ -83,12 +105,13 @@ if [ "${#ACTIVE_PROFILES[@]}" -gt 0 ]; then
 else
     COMPOSE_PROFILES=""
 fi
-export COMPOSE_PROFILES ENABLE_CLOUDFLARED ENABLE_CLOUDFLARE_QUICK_TUNNEL
+export COMPOSE_PROFILES ENABLE_CLOUDFLARED ENABLE_CLOUDFLARE_QUICK_TUNNEL ENABLE_POT_PROVIDER
 
 COMPOSE=(docker compose)
 
 case "${1:-all}" in
     build)
+        show_source_freshness
         echo "Building with GIT_COMMIT=$GIT_COMMIT ..."
         if [ -n "${2:-}" ]; then
             "${COMPOSE[@]}" build "$2"
@@ -156,6 +179,7 @@ case "${1:-all}" in
         esac
         ;;
     all|"")
+        show_source_freshness
         echo "Building with GIT_COMMIT=$GIT_COMMIT ..."
         "${COMPOSE[@]}" up -d --build
         echo "Done. Version commit: $GIT_COMMIT"

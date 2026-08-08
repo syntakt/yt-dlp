@@ -1,7 +1,7 @@
 # Зависимости для запуска тестов и линтера бота.
 #
 #   python -m venv .venv && . .venv/bin/activate
-#   pip install -e ..            # yt-dlp из этого репозитория (импортирует downloader)
+#   pip install -e "..[default]" # yt-dlp из этого репозитория + его зависимости
 #   pip install -r requirements-dev.txt
 #   pytest tests -q && ruff check telegram_bot tests
 #

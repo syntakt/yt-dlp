@@ -120,6 +120,18 @@ All settings are in `.env` (see `.env.example`):
 | `ALLOW_AUDIO` | `true` | Enable audio-only (MP3) |
 | `ALLOW_SUBTITLES` | `true` | Enable subtitles (embedded into the video via ffmpeg) |
 | `USER_ACTIONS_PER_MINUTE` | `20` | Anti-flood: link/.torrent parsing requests per user per minute |
+| `JS_RUNTIMES` | `deno` | JavaScript runtime for YouTube n/sig challenges. **Required** — without it the `web` client is dropped and formats go missing. `deno` ships in the image; `node`, `quickjs`, `bun` also supported |
+| `IMPERSONATE` | — | Impersonate a browser TLS fingerprint via curl_cffi (`chrome`, `chrome:windows-10`, `safari`). Helps with Instagram/TikTok/X |
+| `TRUST_IMPERSONATE_FOR_SSRF` | `false` | Required opt-in: curl_cffi bypasses the DNS-level SSRF guard |
+| `ENABLE_POT_PROVIDER` | `false` | Start the bgutil PO-token container (compose profile `pot`) |
+| `POT_PROVIDER_URL` | — | PO-token provider address, e.g. `http://bgutil-pot:4416` |
+| `YOUTUBE_PO_TOKEN` | — | Manual PO tokens, `CLIENT.CONTEXT+TOKEN` comma-separated |
+| `YOUTUBE_PLAYER_CLIENT` | — | Override YouTube player clients, e.g. `default,-web` |
+| `EMBED_THUMBNAIL` / `EMBED_METADATA` / `EMBED_CHAPTERS` | `true` | Embed cover art, tags and chapters into the file |
+| `SPONSORBLOCK_MODE` | `off` | `off` / `remove` (cut ads) / `mark` (chapter markers) |
+| `LIVE_FROM_START` | `false` | Download live streams from the beginning |
+| `ALLOW_CLIPS` / `MAX_CLIP_SECONDS` | `true` / `7200` | «✂️ Отрывок» button: download a time range |
+| `ALLOW_SPLIT_CHAPTERS` | `false` | «🔖 По главам» button: split video into per-chapter files |
 | `FS_RATE_LIMIT` | `30` | File-server requests per client IP per minute |
 | `FS_TRUSTED_PROXY_CIDRS` | `10.10.2.0/24,127.0.0.1/32,::1/128` | Proxies whose client-IP headers are trusted; **add relay server IPs here**, otherwise the whole relay shares one rate-limit bucket |
 | `PROXY_URL` | — | HTTP/SOCKS5 proxy URL |
@@ -192,6 +204,49 @@ For files that do not fit the selected delivery channel:
 - Choosing a lower quality
 - Using audio-only mode
 - Configure `PUBLIC_BASE_URL`, `DIRECT_BASE_URL`, or `RELAY_BASE_URLS` for signed links
+
+---
+
+## YouTube specifics
+
+**JavaScript runtime is mandatory.** yt-dlp solves YouTube's n/sig challenges with an
+external JS engine; without one the `web` client is excluded and formats disappear
+(the runtime-less mode is deprecated upstream). The image ships `deno`; verify with:
+
+```bash
+docker exec ytdlp-bot deno --version
+docker compose logs ytdlp-bot | grep -i "javascript runtime"   # должно быть пусто
+```
+
+**PO tokens.** On datacenter IPs YouTube often answers «Sign in to confirm you're not a
+bot». yt-dlp cannot mint these tokens itself — run the provider container:
+
+```bash
+# .env
+ENABLE_POT_PROVIDER=true
+POT_PROVIDER_URL=http://bgutil-pot:4416
+```
+
+The container is not published to the host and is reachable only inside `botnet`.
+The bot whitelists exactly this hostname in its SSRF guard (private addresses stay
+blocked for everything else). Give `10.10.2.6` outbound access in nftables, and keep
+the provider image and the `bgutil-ytdlp-pot-provider` plugin in `bot/Dockerfile` on the
+same version.
+
+---
+
+## Keeping extractors fresh
+
+Sites break extractors constantly — the useful lifetime of a build is weeks, not months.
+The bot pins yt-dlp to **this checkout**, so updates arrive only with a rebuild:
+
+```bash
+git pull                 # или: git fetch upstream && git merge upstream/master
+cd bot && ./deploy.sh    # печатает версию yt-dlp и отставание от upstream
+```
+
+`/status` (super-admin) shows the image build date and its age — if it reads
+«90 дн назад», that is the first thing to check when downloads start failing.
 
 ---
 
