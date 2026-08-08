@@ -11,6 +11,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -345,6 +346,102 @@ class MenuTests(unittest.TestCase):
         )
         with mock.patch.object(config, 'ALLOW_SPLIT_CHAPTERS', True):
             self.assertNotIn('dl:sc:best', self._menu_callbacks(info))
+
+
+class ChatCleanupTests(unittest.IsolatedAsyncioTestCase):
+    """Чистка чата: трекинг сообщений, /clean и самоудаляющиеся служебные."""
+
+    def _ctx(self):
+        return SimpleNamespace(bot=mock.AsyncMock(), chat_data={}, user_data={})
+
+    def test_tracking_is_bounded_and_ignores_non_messages(self):
+        ctx = self._ctx()
+        for i in range(bot._MAX_TRACKED_MESSAGES + 50):
+            bot._track_msg(ctx, SimpleNamespace(message_id=i))
+        ids = ctx.chat_data[bot.KEY_BOT_MESSAGES]
+        self.assertEqual(len(ids), bot._MAX_TRACKED_MESSAGES)
+        self.assertEqual(ids[-1], bot._MAX_TRACKED_MESSAGES + 49)  # хвост — свежие
+        # edit_message_text для inline-сообщений возвращает True, а не Message
+        bot._track_msg(ctx, True)
+        bot._track_msg(ctx, None)
+        self.assertEqual(len(ctx.chat_data[bot.KEY_BOT_MESSAGES]), bot._MAX_TRACKED_MESSAGES)
+
+    async def test_clean_deletes_tracked_messages_newest_first(self):
+        ctx = self._ctx()
+        ctx.chat_data[bot.KEY_BOT_MESSAGES] = [10, 11, 12]
+        ctx.user_data[bot.KEY_MAIN_MENU_MSG] = 12
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-100),
+            message=mock.AsyncMock(),
+            effective_user=SimpleNamespace(id=1, username='u', full_name='U'),
+            effective_message=mock.AsyncMock(),
+        )
+        with (
+            mock.patch.object(bot.db, 'upsert_user'),
+            mock.patch.object(bot.db, 'is_super_admin', return_value=True),
+            mock.patch.object(config, 'TRANSIENT_DELETE_SECONDS', 0),
+        ):
+            await bot.cmd_clean(update, ctx)
+
+        deleted = [c.kwargs['message_id'] for c in ctx.bot.delete_message.call_args_list]
+        self.assertEqual(deleted, [12, 11, 10])
+        # Старые id очищены; остался только сам отчёт /clean — он тоже
+        # трекается и через минуту удалится сам
+        self.assertEqual(len(ctx.chat_data[bot.KEY_BOT_MESSAGES]), 1)
+        self.assertNotIn(bot.KEY_MAIN_MENU_MSG, ctx.user_data)
+
+    async def test_clean_survives_undeletable_messages(self):
+        ctx = self._ctx()
+        ctx.chat_data[bot.KEY_BOT_MESSAGES] = [1, 2]
+        ctx.bot.delete_message = mock.AsyncMock(
+            side_effect=[bot.TelegramError('too old'), True, True]
+        )
+        update = SimpleNamespace(
+            effective_chat=SimpleNamespace(id=-100),
+            message=mock.AsyncMock(),
+            effective_user=SimpleNamespace(id=1, username='u', full_name='U'),
+            effective_message=mock.AsyncMock(),
+        )
+        with (
+            mock.patch.object(bot.db, 'upsert_user'),
+            mock.patch.object(bot.db, 'is_super_admin', return_value=True),
+            mock.patch.object(config, 'TRANSIENT_DELETE_SECONDS', 0),
+        ):
+            await bot.cmd_clean(update, ctx)
+        # одно сообщение не удалилось — команда всё равно отработала и сообщила
+        text = ctx.bot.send_message.call_args.args[1]
+        self.assertIn('48 часов', text)
+
+    def test_transient_delete_is_independent_of_auto_delete(self):
+        bot_api = mock.AsyncMock()
+        with (
+            mock.patch.object(config, 'AUTO_DELETE_SECONDS', 0),
+            mock.patch.object(config, 'TRANSIENT_DELETE_SECONDS', 60),
+            mock.patch.object(bot, '_spawn_bg') as spawn,
+        ):
+            bot._schedule_delete(bot_api, 1, 2)                    # обычное — выключено
+            self.assertEqual(spawn.call_count, 0)
+            bot._schedule_delete(bot_api, 1, 2, transient=True)    # служебное — чистится
+            self.assertEqual(spawn.call_count, 1)
+        for call in spawn.call_args_list:      # закрываем неиспользованные корутины
+            call.args[0].close()
+
+    def test_expired_link_cleanup_respects_flag(self):
+        ctx = self._ctx()
+        with (
+            mock.patch.object(config, 'DELETE_EXPIRED_LINK_MESSAGES', False),
+            mock.patch.object(bot, '_spawn_bg') as spawn,
+        ):
+            bot._schedule_link_expiry_cleanup(ctx, 1, 2, 3600)
+            self.assertEqual(spawn.call_count, 0)
+        with (
+            mock.patch.object(config, 'DELETE_EXPIRED_LINK_MESSAGES', True),
+            mock.patch.object(bot, '_spawn_bg') as spawn,
+        ):
+            bot._schedule_link_expiry_cleanup(ctx, 1, 2, 3600)
+            self.assertEqual(spawn.call_count, 1)
+        for call in spawn.call_args_list:
+            call.args[0].close()
 
 
 class BuildFreshnessTests(unittest.TestCase):

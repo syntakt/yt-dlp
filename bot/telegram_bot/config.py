@@ -270,6 +270,15 @@ REGISTRATION_MODE = _env_str("REGISTRATION_MODE", "closed").lower()
 # 0 = выключено. Пример: AUTO_DELETE_SECONDS=300 → удаляет через 5 минут.
 AUTO_DELETE_SECONDS = _parse_int("AUTO_DELETE_SECONDS", 0, minimum=0)
 
+# Служебные сообщения (ошибки, «ссылка не распознана», лимиты, итоги пачек)
+# живут отдельно от AUTO_DELETE_SECONDS: они не несут результата и чистятся
+# всегда, иначе чат ими зарастает. 0 = не удалять.
+TRANSIENT_DELETE_SECONDS = _parse_int("TRANSIENT_DELETE_SECONDS", 60, minimum=0)
+
+# Удалять сообщение со ссылкой, когда истёк TTL файла: ссылка уже нерабочая,
+# держать её в чате смысла нет. 0 = оставлять.
+DELETE_EXPIRED_LINK_MESSAGES = _is_true("DELETE_EXPIRED_LINK_MESSAGES", "true")
+
 # Webhook-режим (вместо polling). Требует публичного HTTPS-адреса.
 # WEBHOOK_URL — публичный URL бота (без trailing slash), например https://example.com
 # Если пусто — используется polling.

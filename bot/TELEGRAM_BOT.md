@@ -85,6 +85,7 @@ cd bot
 | `/history` | Last 10 downloads |
 | `/status` | Bot & disk stats |
 | `/cancel` | Cancel current operation |
+| `/clean` | Remove the bot's own messages from the chat — menus, statuses, expired links. Delivered files are kept; Telegram only allows deleting messages younger than 48 h |
 
 ### Commands (admin only)
 
@@ -120,6 +121,9 @@ All settings are in `.env` (see `.env.example`):
 | `ALLOW_AUDIO` | `true` | Enable audio-only (MP3) |
 | `ALLOW_SUBTITLES` | `true` | Enable subtitles (embedded into the video via ffmpeg) |
 | `USER_ACTIONS_PER_MINUTE` | `20` | Anti-flood: link/.torrent parsing requests per user per minute |
+| `AUTO_DELETE_SECONDS` | `0` | Auto-delete result messages after N seconds (0 = keep) |
+| `TRANSIENT_DELETE_SECONDS` | `60` | Auto-delete service messages (errors, limits, batch summaries) — independent of the setting above |
+| `DELETE_EXPIRED_LINK_MESSAGES` | `true` | Remove the link message once the file TTL expires and the link is dead |
 | `JS_RUNTIMES` | `deno` | JavaScript runtime for YouTube n/sig challenges. **Required** — without it the `web` client is dropped and formats go missing. `deno` ships in the image; `node`, `quickjs`, `bun` also supported |
 | `IMPERSONATE` | — | Impersonate a browser TLS fingerprint via curl_cffi (`chrome`, `chrome:windows-10`, `safari`). Helps with Instagram/TikTok/X |
 | `TRUST_IMPERSONATE_FOR_SSRF` | `false` | Required opt-in: curl_cffi bypasses the DNS-level SSRF guard |

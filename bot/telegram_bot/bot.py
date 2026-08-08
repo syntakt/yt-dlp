@@ -524,6 +524,7 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             reply_markup=keyboard,
         )
         ctx.user_data[KEY_MAIN_MENU_MSG] = sent.message_id
+        _track_msg(ctx, sent)
         # Удаляем само сообщение /start чтобы не засорять чат
         try:
             await update.effective_message.delete()
@@ -563,6 +564,7 @@ def _build_help_text(user_id: int, verbose: bool = True) -> str:
         "/history — последние 10 загрузок\n"
         "/status — статус бота и диск\n"
         "/cancel — отменить текущую операцию\n"
+        "/clean — убрать из чата сообщения бота\n"
     )
     if is_adm:
         text += (
@@ -836,6 +838,41 @@ async def cmd_cancel(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 @require_auth
+async def cmd_clean(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """Удаляет из чата всё, что бот сюда написал.
+
+    Telegram позволяет боту удалять только собственные сообщения и только за
+    последние 48 часов — что не удалось, молча пропускаем.
+    """
+    chat_id = update.effective_chat.id
+    try:
+        await update.message.delete()
+    except TelegramError:
+        pass
+
+    ids = list((ctx.chat_data or {}).get(KEY_BOT_MESSAGES) or [])
+    # Идём от свежих к старым: старше 48 ч всё равно не удалятся
+    deleted = 0
+    for message_id in reversed(ids):
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=message_id)
+            deleted += 1
+        except TelegramError:
+            continue
+    if ctx.chat_data is not None:
+        ctx.chat_data[KEY_BOT_MESSAGES] = []
+
+    # Меню и сессии указывали на уже удалённые сообщения
+    ctx.user_data.pop(KEY_MAIN_MENU_MSG, None)
+    ctx.user_data.pop(KEY_QUALITY_MSG, None)
+
+    note = "🧹 Удалено сообщений: %d\nПрисланные файлы остаются в чате." % deleted
+    if deleted < len(ids):
+        note += "\nЧасть сообщений старше 48 часов — Telegram их удалять не разрешает."
+    await _send_transient(ctx, chat_id, note)
+
+
+@require_auth
 async def cmd_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     """Показывает клавиатуру с командами бота."""
     # Удаляем команду пользователя
@@ -1014,8 +1051,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     if not _allow_user_action(update.effective_user.id):
-        await update.message.reply_text(
-            "⏳ Слишком много запросов подряд. Подождите минуту и попробуйте снова."
+        await _send_transient(
+            ctx, update.effective_chat.id,
+            "⏳ Слишком много запросов подряд. Подождите минуту и попробуйте снова.",
         )
         return
 
@@ -1040,13 +1078,18 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     valid_urls = await _filter_supported_urls(urls)
 
     if not valid_urls:
-        await update.message.reply_text(
+        await _send_transient(
+            ctx, update.effective_chat.id,
             "❓ Ссылка не распознана как поддерживаемая.\n\n"
             "Отправьте прямую ссылку на страницу видео.\n"
             + SUPPORTED_SITES_TEXT,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
+        try:
+            await update.message.delete()
+        except TelegramError:
+            pass
         return
 
     # Удаляем оригинальное сообщение пользователя (убирает превью ссылки).
@@ -1086,6 +1129,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             }
             return
         msg = await update.effective_chat.send_message("🔍 Получаю информацию о видео…")
+        _track_msg(ctx, msg)
         _spawn_update_task(
             update,
             ctx,
@@ -1103,6 +1147,7 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         msg = await update.effective_chat.send_message(
             f"🔍 [{i}/{len(batch)}] Получаю информацию о видео…"
         )
+        _track_msg(ctx, msg)
         msgs.append(msg)
     _uid = update.effective_user.id
     for url, msg in zip(batch, msgs):
@@ -1202,6 +1247,7 @@ async def _fetch_and_show_menu(url: str, msg: Message, ctx: ContextTypes.DEFAULT
     else:
         sent = await _show_video_menu(msg, info, ctx)
         if sent:
+            _track_msg(ctx, sent)
             # Запоминаем message_id меню выбора качества — удалим при следующей ссылке.
             ctx.user_data[KEY_QUALITY_MSG] = sent.message_id
             try:
@@ -1246,6 +1292,7 @@ def _remember_torrent_session(ctx, token: str, meta: TorrentMeta) -> None:
 async def _start_magnet(update: Update, ctx: ContextTypes.DEFAULT_TYPE, magnet: str) -> None:
     """Получает метаданные magnet-ссылки и показывает меню подтверждения."""
     msg = await update.effective_chat.send_message("🧲 Получаю метаданные торрента…")
+    _track_msg(ctx, msg)
     _spawn_update_task(
         update, ctx,
         _prepare_magnet(magnet, msg, ctx, user_id=update.effective_user.id),
@@ -1326,6 +1373,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     msg = await update.effective_chat.send_message("🧲 Читаю .torrent…")
+    _track_msg(ctx, msg)
     _sweep_stale_torrents()
     token = uuid.uuid4().hex[:16]
     _TORRENTS_STAGE_DIR.mkdir(parents=True, exist_ok=True)
@@ -1490,7 +1538,12 @@ async def _handle_torrent_callback(query, ctx: ContextTypes.DEFAULT_TYPE, token:
         if not (db.is_super_admin(user.id) or db.is_authorized(user.id)):
             logger.info("User %s revoked during torrent %d", user.id, dl_id)
             db.update_download(dl_id, status="error", error="access revoked before delivery")
-            await ctx.bot.send_message(query.message.chat_id, "🚫 Ваш доступ был отозван. Файлы не доставлены.")
+            try:
+                await status_msg.edit_text("🚫 Ваш доступ был отозван. Файлы не доставлены.")
+            except TelegramError:
+                await _send_transient(
+                    ctx, query.message.chat_id, "🚫 Ваш доступ был отозван. Файлы не доставлены.",
+                )
             return
 
         if not results:
@@ -1594,9 +1647,14 @@ async def _deliver_results_batch(chat_id: int, results: list[DownloadResult], ct
             logger.warning("torrent TG delivery failed: %s", _safe_error_text(e))
     if fs_lines:
         header = f"🔗 <b>Ссылки для скачивания</b> (действуют {ttl}):\n"
-        await ctx.bot.send_message(
+        links_msg = await ctx.bot.send_message(
             chat_id, header + "\n".join(fs_lines),
             parse_mode=ParseMode.HTML, disable_web_page_preview=True,
+        )
+        _track_msg(ctx, links_msg)
+        # Когда TTL истечёт, ссылки станут нерабочими — убираем сообщение
+        _schedule_link_expiry_cleanup(
+            ctx, chat_id, links_msg.message_id, config.FILE_TTL_SECONDS,
         )
     return sent, skipped
 
@@ -1955,7 +2013,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx, user.id, query.message.chat_id, query.message.message_id
         )
         if claim_error:
-            await query.message.reply_text(f"⚠️ {claim_error}")
+            await _send_transient(ctx, query.message.chat_id, f"⚠️ {claim_error}")
             return
 
         async def _run_download():
@@ -1977,7 +2035,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx, user.id, query.message.chat_id, query.message.message_id
         )
         if claim_error:
-            await query.message.reply_text(f"⚠️ {claim_error}")
+            await _send_transient(ctx, query.message.chat_id, f"⚠️ {claim_error}")
             return
 
         async def _run_playlist():
@@ -2000,7 +2058,7 @@ async def handle_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx, user.id, query.message.chat_id, query.message.message_id
         )
         if claim_error:
-            await query.message.reply_text(f"⚠️ {claim_error}")
+            await _send_transient(ctx, query.message.chat_id, f"⚠️ {claim_error}")
             return
 
         async def _run_torrent():
@@ -3085,7 +3143,7 @@ async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str,
     # Проверяем, что файл ещё существует (не был скачан досрочно)
     if fileserver.get_entry(token):
         try:
-            await bot.send_message(
+            notice = await bot.send_message(
                 chat_id,
                 f"⏰ <b>Ссылка истекает через 10 минут:</b>\n"
                 f'<a href="{_html.escape(info_url, quote=True)}">{_esc(title[:60])}</a>\n\n'
@@ -3093,6 +3151,8 @@ async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
             )
+            # Через 10 минут ссылка мертва — предупреждение тоже не нужно
+            _schedule_delete(bot, chat_id, notice.message_id, delay=600)
         except TelegramError:
             pass
 
@@ -3198,6 +3258,12 @@ async def _handle_deliver_callback(query, ctx, data: str):
                 disable_web_page_preview=True,
                 reply_markup=_keyboard,
             )
+        _track_msg(ctx, delivery_message)
+        # Ссылка перестанет работать по TTL — тогда и уберём сообщение
+        _schedule_link_expiry_cleanup(
+            ctx, delivery_message.chat_id, delivery_message.message_id,
+            config.FILE_TTL_SECONDS,
+        )
         deliveries.pop(cb_dl_id, None)
         notify_delay = config.FILE_TTL_SECONDS - 600
         if notify_delay > 60:
@@ -3370,10 +3436,13 @@ async def _handle_playlist_callback(query, ctx, data: str):
             db.update_download(
                 dl_id, status="error", error="access revoked before delivery"
             )
-            await ctx.bot.send_message(
-                query.message.chat_id,
-                "🚫 Ваш доступ был отозван. Файлы не будут доставлены.",
-            )
+            try:
+                await status_msg.edit_text("🚫 Ваш доступ был отозван. Файлы не будут доставлены.")
+            except TelegramError:
+                await _send_transient(
+                    ctx, query.message.chat_id,
+                    "🚫 Ваш доступ был отозван. Файлы не будут доставлены.",
+                )
             return
 
         sent = 0
@@ -3444,11 +3513,16 @@ async def _handle_playlist_callback(query, ctx, data: str):
                     alt_parts.append(f'<a href="{_html.escape(item_links[relay_key], quote=True)}">{relay_key}</a>')
                 if len(alt_parts) > 1:
                     lines.append(f"   └ {' | '.join(alt_parts)}")
-            await ctx.bot.send_message(
+            links_msg = await ctx.bot.send_message(
                 query.message.chat_id,
                 "\n".join(lines),
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True,
+            )
+            _track_msg(ctx, links_msg)
+            _schedule_link_expiry_cleanup(
+                ctx, query.message.chat_id, links_msg.message_id,
+                config.FILE_TTL_SECONDS,
             )
 
         expected = min(max_items, info.playlist_count) if info.playlist_count else max_items
@@ -3463,7 +3537,12 @@ async def _handle_playlist_callback(query, ctx, data: str):
         summary = f"✅ Плейлист обработан. Доступно: {sent}/{expected}"
         if skipped:
             summary += f" (пропущено {skipped} — превышен лимит размера)"
-        await ctx.bot.send_message(query.message.chat_id, summary)
+        # Редактируем статусное сообщение, а не шлём новое рядом с ним
+        try:
+            await status_msg.edit_text(summary)
+            _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id, transient=True)
+        except TelegramError:
+            await _send_transient(ctx, query.message.chat_id, summary)
 
     except DownloadCancelledError:
         db.update_download(dl_id, status="cancelled", error="CANCELLED")
@@ -3484,7 +3563,13 @@ async def _handle_playlist_callback(query, ctx, data: str):
             )
         else:
             user_msg = f"❌ Ошибка при загрузке плейлиста:\n<code>{_esc(err_str[:300])}</code>"
-        await ctx.bot.send_message(query.message.chat_id, user_msg, parse_mode=ParseMode.HTML)
+        try:
+            await status_msg.edit_text(user_msg, parse_mode=ParseMode.HTML)
+            _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id, transient=True)
+        except TelegramError:
+            await _send_transient(
+                ctx, query.message.chat_id, user_msg, parse_mode=ParseMode.HTML,
+            )
     finally:
         _unmark_dir_active(_active_dir)
         ctx.user_data.get("_cancel_flags", {}).pop(status_msg.message_id, None)
@@ -3783,9 +3868,18 @@ def _spawn_bg(coro, name: str) -> None:
     task.add_done_callback(_bg_tasks.discard)
 
 
-def _schedule_delete(bot, chat_id: int, message_id: int, delay: int = 0) -> None:
-    """Планирует удаление сообщения через delay секунд (если AUTO_DELETE_SECONDS > 0)."""
-    secs = delay or config.AUTO_DELETE_SECONDS
+def _schedule_delete(
+    bot, chat_id: int, message_id: int, delay: int = 0, *, transient: bool = False
+) -> None:
+    """Планирует удаление сообщения бота.
+
+    transient=True — служебное сообщение (ошибка, предупреждение, итог пачки):
+    удаляется по TRANSIENT_DELETE_SECONDS независимо от AUTO_DELETE_SECONDS,
+    потому что результата оно не несёт и в чате только мешает.
+    """
+    secs = delay or (
+        config.TRANSIENT_DELETE_SECONDS if transient else config.AUTO_DELETE_SECONDS
+    )
     if secs <= 0:
         return
 
@@ -3797,6 +3891,56 @@ def _schedule_delete(bot, chat_id: int, message_id: int, delay: int = 0) -> None
             pass  # уже удалено или нет прав
 
     _spawn_bg(_do_delete(), name=f"auto_delete_{chat_id}_{message_id}")
+
+
+# ── Реестр сообщений бота (для /clean) ───────────────────────────────────────────
+#
+# Telegram разрешает боту удалять свои сообщения 48 часов, но только по
+# message_id — узнать «все свои сообщения в чате» через API нельзя. Поэтому
+# ведём кольцевой буфер id в chat_data (переживает перезапуск только в памяти —
+# после рестарта чистить будет нечего, и это нормально).
+KEY_BOT_MESSAGES = "_bot_messages"
+_MAX_TRACKED_MESSAGES = 300
+
+
+def _track_msg(ctx, message) -> None:
+    """Запоминает отправленное ботом сообщение, чтобы /clean мог его удалить."""
+    if message is None or isinstance(message, bool):
+        return
+    try:
+        chat_data = ctx.chat_data
+    except AttributeError:
+        return
+    if chat_data is None:
+        return
+    ids = chat_data.setdefault(KEY_BOT_MESSAGES, [])
+    ids.append(message.message_id)
+    if len(ids) > _MAX_TRACKED_MESSAGES:
+        del ids[:-_MAX_TRACKED_MESSAGES]
+
+
+async def _send_transient(ctx, chat_id: int, text: str, **kwargs):
+    """Отправляет служебное сообщение, которое само исчезнет через минуту."""
+    msg = await ctx.bot.send_message(chat_id, text, **kwargs)
+    _track_msg(ctx, msg)
+    _schedule_delete(ctx.bot, chat_id, msg.message_id, transient=True)
+    return msg
+
+
+def _schedule_link_expiry_cleanup(ctx, chat_id: int, message_id: int, delay: int) -> None:
+    """Удаляет сообщение со ссылкой, когда TTL файла истёк (ссылка уже мертва)."""
+    if not config.DELETE_EXPIRED_LINK_MESSAGES or delay <= 0:
+        return
+    bot = ctx.bot
+
+    async def _do_delete():
+        await asyncio.sleep(delay)
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except TelegramError:
+            pass
+
+    _spawn_bg(_do_delete(), name=f"link_expiry_cleanup_{chat_id}_{message_id}")
 
 
 def _human_size(n) -> str:
@@ -3900,6 +4044,7 @@ async def _post_init(application) -> None:
             BotCommand("history", "История загрузок"),
             BotCommand("status",  "Статус бота"),
             BotCommand("cancel",  "Отменить загрузку"),
+            BotCommand("clean",   "Очистить чат от сообщений бота"),
             BotCommand("help",    "Справка"),
         ])
     except Exception as e:
@@ -4066,6 +4211,7 @@ def main():
     app.add_handler(CommandHandler("history", cmd_history))
     app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(CommandHandler("cancel", cmd_cancel))
+    app.add_handler(CommandHandler("clean", cmd_clean))
 
     # Команды администратора
     app.add_handler(CommandHandler("pending", cmd_pending))
