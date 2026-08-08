@@ -133,7 +133,7 @@ All settings are in `.env` (see `.env.example`):
 | `ALLOW_CLIPS` / `MAX_CLIP_SECONDS` | `true` / `7200` | «✂️ Отрывок» button: download a time range |
 | `ALLOW_SPLIT_CHAPTERS` | `false` | «🔖 По главам» button: split video into per-chapter files |
 | `FS_RATE_LIMIT` | `30` | File-server requests per client IP per minute |
-| `FS_TRUSTED_PROXY_CIDRS` | `10.10.2.0/24,127.0.0.1/32,::1/128` | Proxies whose client-IP headers are trusted; **add relay server IPs here**, otherwise the whole relay shares one rate-limit bucket |
+| `FS_TRUSTED_PROXY_CIDRS` | `10.10.2.0/24,127.0.0.1/32,::1/128` | Proxies whose client-IP headers are trusted. Adding relay IPs here does **not** help: nginx-ssl is the bot's peer and it overwrites `X-Real-IP` with the relay address, so a whole relay shares one bucket. Use nginx's `realip` module on nginx-ssl, or raise `FS_RATE_LIMIT` |
 | `PROXY_URL` | — | HTTP/SOCKS5 proxy URL |
 | `COOKIES_FILE` | — | Path to Netscape cookies file |
 | `ENABLE_CLOUDFLARED` | `false` | Start Cloudflare Tunnel container via `deploy.sh`; keep `false` to skip cloudflared entirely |

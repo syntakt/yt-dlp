@@ -2435,10 +2435,23 @@ async def _ask_for_clip_range(query, ctx, info: VideoInfo, url: str, format_id: 
     try:
         prompt_msg = await query.edit_message_text(prompt, parse_mode=ParseMode.HTML)
     except TelegramError:
-        # Меню было фото-сообщением: шлём новое и перепривязываем к нему сессию
+        # Меню было фото-сообщением (его нельзя отредактировать в текст): шлём
+        # новое сообщение, а старое меню убираем — иначе в чате остаётся
+        # неактуальная карточка с живыми кнопками выбора качества.
         prompt_msg = await ctx.bot.send_message(
             query.message.chat_id, prompt, parse_mode=ParseMode.HTML,
         )
+        old_chat_id, old_msg_id = query.message.chat_id, query.message.message_id
+        try:
+            await query.message.delete()
+        except TelegramError:
+            pass
+        try:
+            db.delete_session(old_chat_id, old_msg_id, user_id=query.from_user.id)
+        except sqlite3.Error as e:
+            logger.warning("Could not delete stale clip-menu session: %s", e)
+        _forget_bound_session(ctx, old_chat_id, old_msg_id)
+        ctx.user_data.pop(KEY_QUALITY_MSG, None)
     ctx.user_data[KEY_PENDING_CLIP] = {
         "message": prompt_msg,
         "format_id": format_id,

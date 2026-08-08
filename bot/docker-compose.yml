@@ -375,7 +375,11 @@ services:
         ipv4_address: 10.10.2.5
     # ports: нет — nftables DNAT на 10.10.2.5:7443 (и опционально :80)
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- --no-check-certificate https://localhost:${HTTPS_PORT:-7443}/health 2>/dev/null | grep -q 'ok' || exit 1"]
+      # Plain HTTP на loopback внутри контейнера (см. nginx.conf.template).
+      # Через HTTPS проверять нельзя: SNI=localhost попадает в catch-all с
+      # ssl_reject_handshake on и получает TLS alert 112 — контейнер вечно
+      # оставался unhealthy, хотя реальных клиентов обслуживал.
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/health 2>/dev/null | grep -q 'ok' || exit 1"]
       interval: 30s
       timeout: 5s
       retries: 5
