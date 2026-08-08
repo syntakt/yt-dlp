@@ -8,6 +8,7 @@
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -43,6 +44,53 @@ async def _run_download(**kwargs) -> dict:
                 url='https://example.com/v', format_id='best', output_dir=out, **kwargs,
             )
     return _FakeYDL.captured_opts
+
+
+class EmptyEnvValueTests(unittest.TestCase):
+    """Пустая переменная окружения не должна ронять бот.
+
+    Реальный инцидент: docker-compose подставляет "" для ${SPONSORBLOCK_MODE:-},
+    когда ключа нет в .env; os.environ.get(name, default) возвращал "" вместо
+    дефолта, validate_config() падал, и контейнер ушёл в цикл перезапусков.
+    """
+
+    def _load_config(self, env_extra: dict) -> dict:
+        env = os.environ.copy()
+        env.update({'PYTHONPATH': str(MODULE_DIR)})
+        env.update(env_extra)
+        result = subprocess.run(
+            [
+                sys.executable, '-c',
+                'import config; print(config.SPONSORBLOCK_MODE, config.REGISTRATION_MODE, '
+                'config.ALLOW_AUDIO, config.MAX_CLIP_SECONDS, ",".join(config.JS_RUNTIMES))',
+            ],
+            env=env, cwd=MODULE_DIR, capture_output=True, text=True,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sponsor, registration, audio, clip, runtimes = result.stdout.split()
+        return {
+            'sponsorblock': sponsor, 'registration': registration,
+            'audio': audio, 'clip': clip, 'runtimes': runtimes,
+        }
+
+    def test_empty_values_fall_back_to_defaults(self):
+        loaded = self._load_config({
+            'SPONSORBLOCK_MODE': '', 'REGISTRATION_MODE': '', 'USE_SPONSORBLOCK': '',
+            'ALLOW_AUDIO': '', 'MAX_CLIP_SECONDS': '', 'JS_RUNTIMES': '',
+        })
+        self.assertEqual(loaded['sponsorblock'], 'off')
+        self.assertEqual(loaded['registration'], 'closed')
+        self.assertEqual(loaded['audio'], 'True')      # default="true" не съедается пустотой
+        self.assertEqual(loaded['clip'], '7200')
+        self.assertEqual(loaded['runtimes'], 'deno')
+
+    def test_legacy_use_sponsorblock_still_maps_to_remove(self):
+        loaded = self._load_config({'USE_SPONSORBLOCK': 'true', 'SPONSORBLOCK_MODE': ''})
+        self.assertEqual(loaded['sponsorblock'], 'remove')
+
+    def test_explicit_value_wins_over_legacy_flag(self):
+        loaded = self._load_config({'USE_SPONSORBLOCK': 'true', 'SPONSORBLOCK_MODE': 'mark'})
+        self.assertEqual(loaded['sponsorblock'], 'mark')
 
 
 class JsRuntimeTests(unittest.TestCase):

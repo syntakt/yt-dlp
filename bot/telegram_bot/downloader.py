@@ -965,14 +965,23 @@ def _collect_chapter_files(output_dir: Path) -> list[Path]:
     Исходный целый файл остаётся на диске рядом — его в список не берём,
     иначе пользователь получил бы и главы, и полную копию видео.
     """
+    base_resolved = output_dir.resolve()
     parts = []
     for path in sorted(output_dir.iterdir()):
         if path.is_symlink() or not path.is_file():
             continue
         if path.suffix.lower() not in _MEDIA_EXTS:
             continue
-        if _CHAPTER_FILE_RE.match(path.name):
-            parts.append(path)
+        if not _CHAPTER_FILE_RE.match(path.name):
+            continue
+        # Defense-in-depth: имена задаёт yt-dlp по нашему шаблону, но отдаём
+        # наружу только то, что действительно лежит внутри output_dir
+        try:
+            path.resolve().relative_to(base_resolved)
+        except ValueError:
+            logger.warning("Skipping out-of-directory chapter file: %s", path)
+            continue
+        parts.append(path)
     return parts
 
 

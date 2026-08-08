@@ -9,6 +9,17 @@ from urllib.parse import urlparse
 _logger = _log.getLogger(__name__)
 
 
+def _env_str(env_var: str, default: str = "") -> str:
+    """Значение переменной окружения; ПУСТАЯ строка считается «не задано».
+
+    docker-compose подставляет пустую строку для `${VAR:-}`, когда ключа нет в
+    .env, поэтому os.environ.get(VAR, default) возвращает "" вместо default.
+    Ровно на этом бот уходил в цикл перезапусков: SPONSORBLOCK_MODE="" не
+    проходил валидацию, хотя пользователь ничего не настраивал.
+    """
+    return (os.environ.get(env_var) or "").strip() or default
+
+
 def _parse_int(
     env_var: str,
     default: int,
@@ -16,7 +27,7 @@ def _parse_int(
     minimum: int | None = None,
     maximum: int | None = None,
 ) -> int:
-    raw = os.environ.get(env_var, str(default)).strip()
+    raw = _env_str(env_var, str(default))
     try:
         value = int(raw)
     except ValueError:
@@ -37,7 +48,7 @@ def _parse_float(
     *,
     minimum: float | None = None,
 ) -> float:
-    raw = os.environ.get(env_var, str(default)).strip()
+    raw = _env_str(env_var, str(default))
     try:
         value = float(raw)
     except ValueError:
@@ -74,7 +85,7 @@ def _parse_base_url_list(env_var: str) -> list[str]:
 
 
 def _is_true(env_var: str, default: str = "false") -> bool:
-    return os.environ.get(env_var, default).strip().lower() in ("1", "true", "yes", "on")
+    return _env_str(env_var, default).lower() in ("1", "true", "yes", "on")
 
 
 # Bot configuration
@@ -162,9 +173,9 @@ USE_ARIA2C = _is_true("USE_ARIA2C", "true")
 # SponsorBlock: off | remove (вырезать) | mark (разметить главами).
 # Старый USE_SPONSORBLOCK=true продолжает работать как remove.
 USE_SPONSORBLOCK = _is_true("USE_SPONSORBLOCK")
-SPONSORBLOCK_MODE = os.environ.get(
+SPONSORBLOCK_MODE = _env_str(
     "SPONSORBLOCK_MODE", "remove" if USE_SPONSORBLOCK else "off"
-).strip().lower()
+).lower()
 
 # ── Постобработка медиа ───────────────────────────────────────────────────────
 # Обложка вшивается mutagen'ом (mp3/m4a/mp4/opus/flac) — Telegram показывает её
@@ -190,7 +201,7 @@ ALLOW_SPLIT_CHAPTERS = _is_true("ALLOW_SPLIT_CHAPTERS")
 # рантайм, включённый в yt-dlp по умолчанию).
 # Поддерживаются: deno, node, quickjs, bun. Пусто — оставить дефолт yt-dlp.
 JS_RUNTIMES = [
-    r.strip().lower() for r in os.environ.get("JS_RUNTIMES", "deno").split(",") if r.strip()
+    r.strip().lower() for r in _env_str("JS_RUNTIMES", "deno").split(",") if r.strip()
 ]
 
 # ── BitTorrent (magnet + .torrent) ────────────────────────────────────────────
@@ -253,7 +264,7 @@ PROXY_URL = os.environ.get("PROXY_URL", "")
 COOKIES_FILE = os.environ.get("COOKIES_FILE", "")
 
 # Registration mode: "open" (anyone can register) or "closed" (admin approves only)
-REGISTRATION_MODE = os.environ.get("REGISTRATION_MODE", "closed")
+REGISTRATION_MODE = _env_str("REGISTRATION_MODE", "closed").lower()
 
 # Авто-удаление сообщений бота после завершения загрузки (секунды).
 # 0 = выключено. Пример: AUTO_DELETE_SECONDS=300 → удаляет через 5 минут.
@@ -346,10 +357,8 @@ def validate_config() -> None:
                 "(supported: deno, node, quickjs, bun)"
             )
     if not JS_RUNTIMES:
-        _logger.warning(
-            "JS_RUNTIMES is empty — YouTube extraction without a JS runtime is deprecated "
-            "and some formats will be missing"
-        )
+        # Пустой список = не передаём js_runtimes в yt-dlp, а у него дефолт — deno
+        _logger.info("JS_RUNTIMES is empty — using yt-dlp's own default (deno)")
 
     if POT_PROVIDER_URL:
         parsed = urlparse(POT_PROVIDER_URL)

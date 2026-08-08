@@ -2458,6 +2458,14 @@ async def _handle_clip_reply(update: Update, ctx: ContextTypes.DEFAULT_TYPE, tex
     pending = ctx.user_data.get(KEY_PENDING_CLIP)
     if not pending:
         return False
+    # Ответ с диапазоном тоже считается «дорогим» действием: он порождает
+    # загрузку, поэтому не должен обходить анти-флуд.
+    if not _allow_user_action(update.effective_user.id):
+        await update.message.reply_text(
+            "⏳ Слишком много запросов подряд. Подождите минуту и попробуйте снова."
+        )
+        return True
+
     clip = _parse_time_range(text, pending.get("duration", 0))
     if clip is None:
         limit_min = max(1, config.MAX_CLIP_SECONDS // 60)
