@@ -19,6 +19,8 @@ set -e
 
 DOMAIN="${SSLIP_DOMAIN}"
 HTTPS_PORT="${HTTPS_PORT:-7443}"
+HTTP_PORT="${HTTP_PORT:-8080}"
+export HTTP_PORT HTTPS_PORT
 CERT_DIR="/etc/nginx/ssl"
 LE_DIR="/etc/letsencrypt/live/${DOMAIN}"
 WEBROOT="/var/www/certbot"
@@ -60,6 +62,14 @@ if [ "$HTTPS_PORT" -lt 1 ] || [ "$HTTPS_PORT" -gt 65535 ]; then
     exit 1
 fi
 
+case "$HTTP_PORT" in
+    ''|*[!0-9]*) echo "[nginx-ssl] FATAL: invalid HTTP_PORT"; exit 1 ;;
+esac
+if [ "$HTTP_PORT" -lt 1 ] || [ "$HTTP_PORT" -gt 65535 ]; then
+    echo "[nginx-ssl] FATAL: HTTP_PORT must be 1-65535"
+    exit 1
+fi
+
 if [ -n "${CERTBOT_EMAIL:-}" ]; then
     case "$CERTBOT_EMAIL" in
         *[!a-zA-Z0-9._%+@-]*|*@*@*|@*|*@)
@@ -71,7 +81,7 @@ fi
 
 # ── Генерация nginx.conf из шаблона ──────────────────────────────────────────
 # shellcheck disable=SC2016 # envsubst requires literal variable names here
-envsubst '${SSLIP_DOMAIN} ${HTTPS_PORT}' \
+envsubst '${SSLIP_DOMAIN} ${HTTPS_PORT} ${HTTP_PORT}' \
     < /etc/nginx/templates/nginx.conf.template \
     > /etc/nginx/nginx.conf
 

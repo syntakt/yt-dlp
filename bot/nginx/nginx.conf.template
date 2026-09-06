@@ -49,7 +49,7 @@ http {
 
     # ── Upstream ──────────────────────────────────────────────────────────────
     upstream fileserver {
-        server ytdlp-bot:8080;
+        server ytdlp-bot:${HTTP_PORT};
         keepalive 4;
     }
 
@@ -153,6 +153,8 @@ http {
 
         # ── /info/ — страница с кнопкой скачивания (rate limited) ─────────
         location /info/ {
+            # nginx error logs include raw request URIs and cannot redact tokens.
+            error_log /dev/null crit;
             limit_req  zone=info burst=10 nodelay;
             limit_conn perip 10;
 
@@ -175,6 +177,7 @@ http {
 
         # ── /dl/ — стриминг файла (одноразовый токен + rate limit от сканирования)
         location /dl/ {
+            error_log /dev/null crit;
             limit_req  zone=dl burst=10 nodelay;
             limit_conn perip 5;
 

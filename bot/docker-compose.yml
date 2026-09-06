@@ -46,6 +46,8 @@ services:
         # Дата сборки образа — показывается в /status, чтобы видеть, что пора пересобрать
         BUILD_DATE: "${BUILD_DATE:-}"
     container_name: ytdlp-bot
+    init: true
+    pids_limit: 512
     restart: unless-stopped
     depends_on:
       telegram-bot-api:
@@ -56,7 +58,7 @@ services:
     environment:
       BOT_TOKEN: ${BOT_TOKEN:?BOT_TOKEN is required}
       ADMIN_IDS: ${ADMIN_IDS:?ADMIN_IDS is required}
-      LOCAL_API_SERVER: ${LOCAL_API_SERVER:-http://telegram-bot-api:8081}
+      LOCAL_API_SERVER: ${LOCAL_API_SERVER-http://telegram-bot-api:8081}
       REGISTRATION_MODE: ${REGISTRATION_MODE:-closed}
       MAX_FILE_SIZE_MB: ${MAX_FILE_SIZE_MB:-10240}
       DOWNLOAD_TIMEOUT: ${DOWNLOAD_TIMEOUT:-3600}
@@ -122,6 +124,7 @@ services:
       ALLOW_GENERIC_URLS: ${ALLOW_GENERIC_URLS:-false}
       SSRF_PROTECTION: ${SSRF_PROTECTION:-true}
       TRUST_PROXY_FOR_SSRF: ${TRUST_PROXY_FOR_SSRF:-false}
+      TRUST_EXTERNAL_NETWORK_FOR_SSRF: ${TRUST_EXTERNAL_NETWORK_FOR_SSRF:-false}
       PROXY_URL: ${PROXY_URL:-}
       COOKIES_FILE: ${COOKIES_FILE:-}
       AUTO_DELETE_SECONDS: ${AUTO_DELETE_SECONDS:-0}
@@ -147,7 +150,7 @@ services:
       # - ./cookies.txt:/cookies.txt:ro
       # Shared с cloudflared: entrypoint.sh читает URL тоннеля отсюда
       # (только в quick tunnel режиме; в named tunnel PUBLIC_BASE_URL берётся из .env)
-      - cf-url:/cf-url
+      - cf-url:/cf-url:ro
       # RO-доступ к данным локального Bot API сервера — нужен ТОЛЬКО для чтения
       # загруженных пользователем .torrent-файлов (magnet работает и без этого).
       # local_mode=True отдаёт боту абсолютный путь файла на ФС API-сервера;
@@ -198,7 +201,7 @@ services:
     # Для внешнего доступа используйте Cloudflare Tunnel или вручную настроенный nginx HTTPS.
     # Раскомментировать ТОЛЬКО для локальной отладки без внешнего доступа:
     # ports:
-    #   - "${HTTP_PORT:-8080}:8080"
+    #   - "127.0.0.1:${HTTP_PORT:-8080}:${HTTP_PORT:-8080}"
 
     # ── Сеть ────────────────────────────────────────────────────────────────
     networks:
@@ -364,6 +367,7 @@ services:
     environment:
       SSLIP_DOMAIN: ${SSLIP_DOMAIN:-}
       HTTPS_PORT: ${HTTPS_PORT:-7443}
+      HTTP_PORT: ${HTTP_PORT:-8080}
       CERTBOT_EMAIL: ${CERTBOT_EMAIL:-}
       ENABLE_CERTBOT: ${ENABLE_CERTBOT:-true}
     volumes:

@@ -191,6 +191,9 @@ def move_and_register(
         os.replace(src, dest)
         moved = True
         dest.chmod(0o644)
+        # yt-dlp preserves the remote Last-Modified time. Restoration uses
+        # mtime, so start the link lifetime when it is published, not years ago.
+        os.utime(dest, None)
         real_dest = _validate_served_path(dest)
         _registry[uuid_key] = FileEntry(
             path=real_dest,
@@ -370,7 +373,7 @@ def _sanitize_header_value(name: str) -> str:
     aiohttp 3.x тоже выбрасывает исключение при \\r/\\n в заголовке, но явная
     санитизация защищает на уровне приложения независимо от версии библиотеки.
     """
-    return "".join(c for c in name if c not in "\r\n\x00")
+    return "".join(c for c in name if ord(c) >= 32 and ord(c) != 127)
 
 
 def _fmt_size(n: int) -> str:
@@ -566,7 +569,7 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
     # RFC 5987: для ASCII-имён используем filename=, для Unicode добавляем filename*=
     # SECURITY: сначала удаляем \r\n\x00 (HTTP response splitting), затем " (разрыв кавычек)
     _clean = _sanitize_header_value(entry.filename)
-    ascii_name = _clean.encode("ascii", errors="replace").decode().replace('"', "_")
+    ascii_name = _clean.encode("ascii", errors="replace").decode().replace('"', "_").replace("\\", "_")
     utf8_name = _clean.replace("\\", "").replace('"', "")
     content_disposition = (
         f'attachment; filename="{ascii_name}"; '
@@ -596,6 +599,8 @@ async def _handle_download(request: web.Request) -> web.StreamResponse:
         logger.warning("Соединение прервано при отдаче '%s' клиенту %s", entry.filename, ip)
     except asyncio.CancelledError:
         logger.warning("Запрос отменён при отдаче '%s' клиенту %s", entry.filename, ip)
+        _update_download_status(entry, "error", "file delivery cancelled")
+        raise
     except Exception as e:
         logger.error("Ошибка при отдаче '%s': %s", entry.filename, e)
     finally:
@@ -748,6 +753,15 @@ async def start(host: str = "0.0.0.0", port: int = 8080) -> web.AppRunner:
     _restore_registry()
 
     app = web.Application()
+    transfer_slots = asyncio.Semaphore(32)
+
+    async def limited_download(request):
+        if transfer_slots.locked():
+            raise web.HTTPServiceUnavailable(headers={**_SEC_HEADERS, "Retry-After": "60"})
+        async with transfer_slots:
+            # Bound slow readers even when traffic bypasses nginx.
+            async with asyncio.timeout(3600):
+                return await _handle_download(request)
     # allow_head=False: aiohttp по умолчанию вешает и HEAD на add_get. Для /dl/
     # это критично — HEAD запустил бы _handle_download, который извлекает токен
     # из реестра и удаляет файл в finally, НЕ отдав тело. Тогда превью ссылки
@@ -755,7 +769,7 @@ async def start(host: str = "0.0.0.0", port: int = 8080) -> web.AppRunner:
     # ссылку. nginx режет HEAD через limit_except, но Cloudflare-туннель и прямой
     # DNAT на :8080 идут мимо nginx — защищаемся на уровне приложения.
     app.router.add_get("/info/{token}", _handle_info, allow_head=False)
-    app.router.add_get("/dl/{token}", _handle_download, allow_head=False)
+    app.router.add_get("/dl/{token}", limited_download, allow_head=False)
     app.router.add_get("/health", _handle_health)
 
     _runner = web.AppRunner(app, access_log=None)

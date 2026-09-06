@@ -6,6 +6,12 @@
 bot/.env
 bot/data/
 *.db
+**/.env
+**/.env.*
+**/cookies.txt
+**/*.cookies.txt
+**/.venv/
+**/.ruff_cache/
 
 # Python
 **/__pycache__

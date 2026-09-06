@@ -40,7 +40,7 @@ async def _run_download(**kwargs) -> dict:
         out = Path(tmp)
         _FakeYDL.target = out / 'video.mp4'
         _FakeYDL.info = {'title': 'video'}
-        with mock.patch.object(downloader.yt_dlp, 'YoutubeDL', _FakeYDL):
+        with mock.patch.object(downloader, 'SafeYoutubeDL', _FakeYDL):
             await downloader.download_video(
                 url='https://example.com/v', format_id='best', output_dir=out, **kwargs,
             )
@@ -168,10 +168,13 @@ class PoTokenTests(unittest.TestCase):
         downloader._NETWORK_GUARD.enabled = True
         with (
             mock.patch.object(downloader, '_SSRF_ALLOWED_HOSTS', frozenset({'bgutil-pot'})),
+            mock.patch.object(downloader, 'POT_PROVIDER_URL', 'http://bgutil-pot:4416'),
             mock.patch.object(downloader, '_ORIGINAL_GETADDRINFO', return_value=private),
         ):
             # хост провайдера пропускаем
             self.assertEqual(downloader._guarded_getaddrinfo('bgutil-pot', 4416), private)
+            with self.assertRaises(socket.gaierror):
+                downloader._guarded_getaddrinfo('bgutil-pot', 8081)
             # всё остальное по-прежнему блокируется
             with self.assertRaises(socket.gaierror):
                 downloader._guarded_getaddrinfo('internal.example', 80)
@@ -241,7 +244,7 @@ class PlaylistEmbedTests(unittest.IsolatedAsyncioTestCase):
             with (
                 mock.patch.object(downloader, 'EMBED_THUMBNAIL', True),
                 mock.patch.object(downloader, 'EMBED_METADATA', True),
-                mock.patch.object(downloader.yt_dlp, 'YoutubeDL', _FakeYDL),
+                mock.patch.object(downloader, 'SafeYoutubeDL', _FakeYDL),
                 mock.patch.object(_FakeYDL, 'download', create=True, return_value=None),
             ):
                 await downloader.download_playlist(
@@ -272,7 +275,8 @@ class ClipTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(bot._parse_time_range('0-60'), (0, 60))
 
     async def test_clip_range_reaches_ytdlp(self):
-        opts = await _run_download(clip_range=(600, 750))
+        with mock.patch.object(downloader, "TRUST_EXTERNAL_NETWORK_FOR_SSRF", True):
+            opts = await _run_download(clip_range=(600, 750))
         self.assertTrue(opts['force_keyframes_at_cuts'])
         self.assertEqual(opts['download_ranges'].ranges, [(600, 750)])
 
@@ -302,7 +306,10 @@ class SplitChaptersTests(unittest.IsolatedAsyncioTestCase):
 
 class LiveTests(unittest.IsolatedAsyncioTestCase):
     async def test_live_from_start_only_for_live_videos(self):
-        with mock.patch.object(downloader, 'LIVE_FROM_START', True):
+        with (
+            mock.patch.object(downloader, 'LIVE_FROM_START', True),
+            mock.patch.object(downloader, 'TRUST_EXTERNAL_NETWORK_FOR_SSRF', True),
+        ):
             live = await _run_download(is_live=True)
             vod = await _run_download(is_live=False)
         self.assertTrue(live['live_from_start'])
@@ -324,6 +331,7 @@ class MenuTests(unittest.TestCase):
         )
         with (
             mock.patch.object(config, 'ALLOW_CLIPS', True),
+            mock.patch.object(config, 'TRUST_EXTERNAL_NETWORK_FOR_SSRF', True),
             mock.patch.object(config, 'ALLOW_SPLIT_CHAPTERS', True),
         ):
             data = self._menu_callbacks(info)
@@ -369,7 +377,8 @@ class ChatCleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_clean_deletes_tracked_messages_newest_first(self):
         ctx = self._ctx()
         ctx.chat_data[bot.KEY_BOT_MESSAGES] = [10, 11, 12]
-        ctx.user_data[bot.KEY_MAIN_MENU_MSG] = 12
+        ctx.user_data[(bot.KEY_MAIN_MENU_MSG, -100)] = 12
+        ctx.user_data[(bot.KEY_MAIN_MENU_MSG, -200)] = 42
         update = SimpleNamespace(
             effective_chat=SimpleNamespace(id=-100),
             message=mock.AsyncMock(),
@@ -388,7 +397,8 @@ class ChatCleanupTests(unittest.IsolatedAsyncioTestCase):
         # Старые id очищены; остался только сам отчёт /clean — он тоже
         # трекается и через минуту удалится сам
         self.assertEqual(len(ctx.chat_data[bot.KEY_BOT_MESSAGES]), 1)
-        self.assertNotIn(bot.KEY_MAIN_MENU_MSG, ctx.user_data)
+        self.assertNotIn((bot.KEY_MAIN_MENU_MSG, -100), ctx.user_data)
+        self.assertEqual(ctx.user_data[(bot.KEY_MAIN_MENU_MSG, -200)], 42)
 
     async def test_clean_survives_undeletable_messages(self):
         ctx = self._ctx()

@@ -24,6 +24,9 @@ COPY --from=deno /deno /usr/local/bin/deno
 
 WORKDIR /app
 
+# Keep the installer used for local source, wheels and plugins patched.
+RUN pip install --no-cache-dir --upgrade "pip>=26.2"
+
 # ── Устанавливаем yt-dlp из локального исходного кода ──────────────────────
 # При синхронизации master с upstream yt-dlp, сборка получит актуальную версию.
 # Копируем только файлы, нужные для pip install (pyproject.toml + yt_dlp/)

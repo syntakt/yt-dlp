@@ -52,6 +52,7 @@ def _connect() -> sqlite3.Connection:
         except sqlite3.Error:
             pass
         _conn = None
+        _invalidate_auth_cache()
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     _harden_db_permissions()
     old_umask = os.umask(0o077)
@@ -126,20 +127,20 @@ def _invalidate_auth_cache(user_id: Optional[int] = None) -> None:
 
 def _auth_flags(user_id: int) -> tuple[bool, bool]:
     """Возвращает (is_approved, is_banned) с коротким кэшем."""
-    now = time.monotonic()
-    cached = _auth_cache.get(user_id)
-    if cached and now - cached[0] < _AUTH_CACHE_TTL:
-        return cached[1], cached[2]
     with get_connection() as conn:
+        now = time.monotonic()
+        cached = _auth_cache.get(user_id)
+        if cached and now - cached[0] < _AUTH_CACHE_TTL:
+            return cached[1], cached[2]
         row = conn.execute(
             "SELECT is_approved, is_banned FROM users WHERE user_id = ?", (user_id,)
         ).fetchone()
-    approved = bool(row["is_approved"]) if row else False
-    banned = bool(row["is_banned"]) if row else False
-    if len(_auth_cache) > 10_000:
-        _auth_cache.clear()
-    _auth_cache[user_id] = (now, approved, banned)
-    return approved, banned
+        approved = bool(row["is_approved"]) if row else False
+        banned = bool(row["is_banned"]) if row else False
+        if len(_auth_cache) > 10_000:
+            _auth_cache.clear()
+        _auth_cache[user_id] = (now, approved, banned)
+        return approved, banned
 
 
 def init_db() -> None:
@@ -202,11 +203,11 @@ def init_db() -> None:
         """)
 
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_created ON sessions(created_at)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
         # Миграция: добавляем user_id в sessions если его нет (существующие БД)
         cols = [r[1] for r in conn.execute("PRAGMA table_info(sessions)").fetchall()]
         if "user_id" not in cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
         # Миграция: request_notified_at — троттлинг уведомлений админам о заявке
         user_cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
         if "request_notified_at" not in user_cols:

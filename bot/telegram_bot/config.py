@@ -1,5 +1,6 @@
 import logging as _log
 import ipaddress
+import math
 import os
 import re
 from pathlib import Path
@@ -47,12 +48,19 @@ def _parse_float(
     default: float,
     *,
     minimum: float | None = None,
+    maximum: float | None = None,
 ) -> float:
     raw = _env_str(env_var, str(default))
     try:
         value = float(raw)
     except ValueError:
         _logger.warning("%s=%r is not a number; using %s", env_var, raw, default)
+        return default
+    if not math.isfinite(value):
+        _logger.warning("%s must be finite; using %s", env_var, default)
+        return default
+    if maximum is not None and value > maximum:
+        _logger.warning("%s is above %s; using %s", env_var, maximum, default)
         return default
     if minimum is not None and value < minimum:
         _logger.warning("%s=%s is below %s; using %s", env_var, value, minimum, default)
@@ -141,7 +149,7 @@ if _legacy_relay_url and _legacy_relay_url not in RELAY_BASE_URLS:
 RELAY_BASE_URL = RELAY_BASE_URLS[0] if RELAY_BASE_URLS else ""
 HTTP_PORT = _parse_int("HTTP_PORT", 8080, minimum=1, maximum=65535)
 # TTL ссылки: по умолчанию 1 час (файл удаляется после скачивания ИЛИ по истечении TTL)
-FILE_TTL_SECONDS = max(300, int(_parse_float("FILE_TTL_HOURS", 1.0, minimum=0.0) * 3600))
+FILE_TTL_SECONDS = max(300, int(_parse_float("FILE_TTL_HOURS", 1.0, minimum=0.0, maximum=8760) * 3600))
 # Секретный ключ для HMAC-подписи токенов файлового сервера (рекомендуется задать)
 # Генерация: python3 -c "import secrets; print(secrets.token_hex(32))"
 SERVER_SECRET = os.environ.get("SERVER_SECRET", "")
@@ -237,6 +245,9 @@ ALLOW_GENERIC_URLS = _is_true("ALLOW_GENERIC_URLS")
 SSRF_PROTECTION = _is_true("SSRF_PROTECTION", "true")
 # Прокси резолвит целевые имена сам, поэтому должен иметь свою SSRF-фильтрацию.
 TRUST_PROXY_FOR_SSRF = _is_true("TRUST_PROXY_FOR_SSRF")
+# External downloaders cannot inherit Python's network policy. Only opt in
+# after configuring host/container egress filtering, including IPv6.
+TRUST_EXTERNAL_NETWORK_FOR_SSRF = _is_true("TRUST_EXTERNAL_NETWORK_FOR_SSRF")
 
 # ── Impersonation (curl_cffi) ─────────────────────────────────────────────────
 # Подмена TLS/JA3-отпечатка под настоящий браузер — снимает блокировки на
@@ -330,6 +341,11 @@ def validate_config() -> None:
         raise RuntimeError("REGISTRATION_MODE must be 'open' or 'closed'")
 
     if ALLOW_TORRENTS:
+        if SSRF_PROTECTION and not TRUST_EXTERNAL_NETWORK_FOR_SSRF:
+            raise RuntimeError(
+                "ALLOW_TORRENTS with SSRF_PROTECTION requires "
+                "TRUST_EXTERNAL_NETWORK_FOR_SSRF=true and external egress filtering"
+            )
         import shutil as _shutil
         if not _shutil.which("aria2c"):
             _logger.warning(
@@ -371,13 +387,17 @@ def validate_config() -> None:
 
     if POT_PROVIDER_URL:
         parsed = urlparse(POT_PROVIDER_URL)
-        if parsed.scheme not in ("http", "https") or not parsed.hostname:
-            raise RuntimeError(f"POT_PROVIDER_URL is not a valid URL: {POT_PROVIDER_URL}")
+        if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                or parsed.username or parsed.password or parsed.query or parsed.fragment):
+            raise RuntimeError("POT_PROVIDER_URL must be an HTTP(S) base URL without credentials, query or fragment")
+        _ = parsed.port
 
     if WEBHOOK_URL:
         parsed = urlparse(WEBHOOK_URL)
-        if parsed.scheme != "https" or not parsed.netloc:
+        if (parsed.scheme != "https" or not parsed.hostname or parsed.username
+                or parsed.password or parsed.query or parsed.fragment):
             raise RuntimeError("WEBHOOK_URL must be a public HTTPS URL")
+        _ = parsed.port
         if (
             len(WEBHOOK_SECRET_TOKEN) < 32
             or not re.fullmatch(r"[A-Za-z0-9_-]{32,256}", WEBHOOK_SECRET_TOKEN)
@@ -386,15 +406,22 @@ def validate_config() -> None:
                 "WEBHOOK_SECRET_TOKEN must be 32-256 chars: A-Z, a-z, 0-9, '_' or '-'"
             )
 
+    if len(RELAY_BASE_URLS) > 16:
+        raise RuntimeError("RELAY_BASE_URLS supports at most 16 relays")
+
     for name, values in {
         "PUBLIC_BASE_URL": [PUBLIC_BASE_URL] if PUBLIC_BASE_URL else [],
         "DIRECT_BASE_URL": [DIRECT_BASE_URL] if DIRECT_BASE_URL else [],
         "RELAY_BASE_URLS": RELAY_BASE_URLS,
     }.items():
         for url in values:
+            if len(url) > 512 or any(ord(c) < 33 or ord(c) == 127 for c in url):
+                raise RuntimeError(f"{name} must be at most 512 characters without whitespace or controls")
             parsed = urlparse(url)
-            if parsed.scheme not in ("http", "https") or not parsed.netloc:
-                raise RuntimeError(f"{name} contains invalid URL: {url}")
+            if (parsed.scheme not in ("http", "https") or not parsed.hostname
+                    or parsed.username or parsed.password or parsed.query or parsed.fragment):
+                raise RuntimeError(f"{name} must be an HTTP(S) base URL without credentials, query or fragment")
+            _ = parsed.port
             if parsed.scheme != "https":
                 hostname = parsed.hostname or ""
                 try:
@@ -403,7 +430,7 @@ def validate_config() -> None:
                     is_loopback = hostname == "localhost"
                 if not is_loopback:
                     raise RuntimeError(
-                        f"{name} must use HTTPS because it carries bearer download tokens: {url}"
+                        f"{name} must use HTTPS because it carries bearer download tokens"
                     )
 
 

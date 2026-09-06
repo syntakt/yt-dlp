@@ -7,6 +7,7 @@ import re
 import socket
 import threading
 import time
+import weakref
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
@@ -31,6 +32,7 @@ from config import (
     MAX_CONCURRENT_DOWNLOADS,
     MAX_FILE_SIZE_BYTES,
     MAX_PLAYLIST_TOTAL_BYTES,
+    MAX_PLAYLIST_ITEMS,
     MIN_FREE_DISK_BYTES,
     POT_PROVIDER_URL,
     PROXY_URL,
@@ -45,9 +47,29 @@ from config import (
     TORRENT_DOWNLOAD_LIMIT,
     TORRENT_TIMEOUT,
     TORRENT_MAX_TOTAL_BYTES,
+    TORRENT_FILE_MAX_BYTES,
+    TRUST_EXTERNAL_NETWORK_FOR_SSRF,
+    TRUST_IMPERSONATE_FOR_SSRF,
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _YDLBotLogger:
+    """yt-dlp otherwise writes credential-bearing errors directly to stderr."""
+
+    def debug(self, message):
+        pass
+
+    def warning(self, message):
+        logger.warning("%s", self._redact(message))
+
+    def error(self, message):
+        logger.error("%s", self._redact(message))
+
+    @staticmethod
+    def _redact(message):
+        return re.sub(r'https?://[^\s<>"\']+', "<URL>", str(message), flags=re.IGNORECASE)
 
 
 # Отдельный пул потоков для блокирующей работы yt-dlp.
@@ -60,12 +82,94 @@ _EXECUTOR = ThreadPoolExecutor(
     max_workers=max(8, MAX_CONCURRENT_DOWNLOADS * 3),
     thread_name_prefix="ytdlp",
 )
+_EXECUTOR_SLOTS = weakref.WeakKeyDictionary()
+_WORKER_DIRS: set[Path] = set()
+_WORKER_DIRS_LOCK = threading.Lock()
+_BACKGROUND_WORKERS: set[asyncio.Task] = set()
 
 
-async def run_blocking(func, *args):
+async def run_blocking(func, *args, on_finished=None):
     """Выполняет блокирующую функцию yt-dlp в выделенном пуле потоков."""
     loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(_EXECUTOR, func, *args)
+    slots = _EXECUTOR_SLOTS.setdefault(
+        loop, asyncio.Semaphore(max(8, MAX_CONCURRENT_DOWNLOADS * 3))
+    )
+    try:
+        await slots.acquire()
+    except BaseException:
+        if on_finished:
+            on_finished()
+        raise
+    try:
+        future = loop.run_in_executor(_EXECUTOR, func, *args)
+    except BaseException:
+        slots.release()
+        if on_finished:
+            on_finished()
+        raise
+    # Cancellation of an awaiter must not free a still-running worker's slot.
+    def finished(done):
+        slots.release()
+        if on_finished:
+            on_finished()
+        if not done.cancelled():
+            done.exception()
+    future.add_done_callback(finished)
+    return await asyncio.shield(future)
+
+
+def download_work_in_progress(path: Path) -> bool:
+    resolved = path.resolve()
+    with _WORKER_DIRS_LOCK:
+        return any(p == resolved or resolved in p.parents for p in _WORKER_DIRS)
+
+
+async def _run_download_worker(func, output_dir: Path, cancel_flag: list, timeout: float):
+    """Keep timed-out workers' files isolated until they actually stop."""
+    resolved = output_dir.resolve()
+    abandoned = threading.Event()
+    entered = False
+    with _WORKER_DIRS_LOCK:
+        _WORKER_DIRS.add(resolved)
+
+    def release_dir():
+        if abandoned.is_set():
+            shutil.rmtree(resolved, ignore_errors=True)
+        with _WORKER_DIRS_LOCK:
+            _WORKER_DIRS.discard(resolved)
+
+    def execute():
+        try:
+            if not cancel_flag[0]:
+                func()
+        finally:
+            release_dir()
+
+    async def run():
+        nonlocal entered
+        entered = True
+        return await run_blocking(execute, on_finished=release_dir)
+
+    worker = asyncio.create_task(run())
+    _BACKGROUND_WORKERS.add(worker)
+
+    def finished(task):
+        _BACKGROUND_WORKERS.discard(task)
+        if not task.cancelled():
+            task.exception()
+        # Submission can fail or be cancelled before execute() ever starts.
+        if not entered:
+            release_dir()
+
+    worker.add_done_callback(finished)
+    try:
+        return await asyncio.wait_for(asyncio.shield(worker), timeout=timeout)
+    except BaseException:
+        cancel_flag[0] = True
+        abandoned.set()
+        if not download_work_in_progress(resolved):
+            shutil.rmtree(resolved, ignore_errors=True)
+        raise
 
 
 def shutdown_executor() -> None:
@@ -98,19 +202,27 @@ def _ssrf_allowed_hosts() -> frozenset[str]:
 _SSRF_ALLOWED_HOSTS = _ssrf_allowed_hosts()
 
 
+def _is_public_address(address) -> bool:
+    # is_global alone also accepts multicast on supported Python versions.
+    return address.is_global and not address.is_multicast and not address.is_reserved
+
+
 def _guarded_getaddrinfo(host, *args, **kwargs):
     """Reject non-public DNS answers for guarded yt-dlp worker threads."""
     answers = _ORIGINAL_GETADDRINFO(host, *args, **kwargs)
     if not getattr(_NETWORK_GUARD, "enabled", False):
         return answers
     if isinstance(host, str) and host.lower() in _SSRF_ALLOWED_HOSTS:
-        return answers
+        provider = urlparse(POT_PROVIDER_URL)
+        port = args[0] if args else kwargs.get("port")
+        if str(port) == str(provider.port or (443 if provider.scheme == "https" else 80)):
+            return answers
     for answer in answers:
         try:
             address = ipaddress.ip_address(answer[4][0])
         except (ValueError, IndexError, TypeError) as e:
             raise socket.gaierror("blocked invalid DNS response") from e
-        if not address.is_global:
+        if not _is_public_address(address):
             raise socket.gaierror(f"blocked non-public address for {host!r}")
     return answers
 
@@ -126,6 +238,36 @@ def _guard_network():
         yield
     finally:
         _NETWORK_GUARD.enabled = previous
+
+
+class SafeYoutubeDL(yt_dlp.YoutubeDL):
+    """Apply the DNS policy at every request, including yt-dlp child threads."""
+
+    def urlopen(self, req):
+        with _guard_network():
+            return super().urlopen(req)
+
+    def build_request_director(self, handlers, preferences=None):
+        if SSRF_PROTECTION and not TRUST_IMPERSONATE_FOR_SSRF:
+            # Extractors can request curl impersonation themselves, even with
+            # IMPERSONATE empty. Only these handlers use guarded Python DNS.
+            handlers = [h for h in handlers if h.RH_KEY in {"Urllib", "Requests"}]
+        return super().build_request_director(handlers, preferences)
+
+
+async def get_thumbnail(url: str) -> bytes:
+    """Fetch bounded bytes; never give the local Bot API an untrusted path/URL."""
+    if urlparse(url).scheme not in {"http", "https"}:
+        raise ValueError("Invalid thumbnail URL")
+
+    def _fetch():
+        with SafeYoutubeDL(_base_opts()) as ydl, ydl.urlopen(url) as response:
+            data = response.read(5 * 1024 * 1024 + 1)
+            if len(data) > 5 * 1024 * 1024:
+                raise ValueError("Thumbnail too large")
+            return data
+
+    return await asyncio.wait_for(run_blocking(_fetch), timeout=INFO_TIMEOUT)
 
 
 class _DownloadCancelled(BaseException):
@@ -299,6 +441,7 @@ def _embed_postprocessors(opts: dict) -> list[dict]:
 
 def _base_opts() -> dict:
     opts: dict = {
+        "logger": _YDLBotLogger(),
         "quiet": True,
         "no_warnings": True,
         "ignoreerrors": False,
@@ -306,6 +449,9 @@ def _base_opts() -> dict:
         "retries": 3,
         "fragment_retries": 3,
         "file_access_retries": 3,
+        # An empty value disables environment/system proxies, which would
+        # otherwise resolve private destinations outside the DNS guard.
+        "proxy": PROXY_URL or "",
     }
     # JS-рантайм для n/sig-челленджей YouTube. Формат параметра — как у CLI
     # --js-runtimes (см. yt_dlp/__init__.py): {runtime: {"path": None}}.
@@ -333,6 +479,14 @@ def _base_opts() -> dict:
         opts["concurrent_fragment_downloads"] = 1 if SSRF_PROTECTION else 3
         if SSRF_PROTECTION:
             opts["hls_prefer_native"] = True
+    if SSRF_PROTECTION and not TRUST_EXTERNAL_NETWORK_FOR_SSRF:
+        # Covers FFmpeg live/clip downloads AND HLS fallback to FFmpeg.
+        # Place the whitelist before EVERY input; local postprocessing works.
+        local_protocols = ["-protocol_whitelist", "file,pipe,crypto,data"]
+        opts["external_downloader_args"] = {"ffmpeg_i": local_protocols}
+        # PP-specific argument lookup and direct ffprobe invocations bypass
+        # generic postprocessor_args. All executable paths use these wrappers.
+        opts["ffmpeg_location"] = str(Path(__file__).parent / "ffmpeg_guard")
     return opts
 
 
@@ -390,10 +544,11 @@ async def get_video_info(url: str) -> VideoInfo:
         # уровня, из-за чего у редиректных/обёрточных экстракторов возвращался
         # {"_type": "url"} без formats — меню качества выходило пустым.
         "extract_flat": "in_playlist",
+        "playlistend": MAX_PLAYLIST_ITEMS,
     })
 
     def _extract():
-        with _guard_network(), yt_dlp.YoutubeDL(opts) as ydl:
+        with _guard_network(), SafeYoutubeDL(opts) as ydl:
             return ydl.extract_info(url, download=False)
 
     try:
@@ -407,8 +562,8 @@ async def get_video_info(url: str) -> VideoInfo:
         entries = list(info.get("entries") or [])
         return VideoInfo(
             url=url,
-            title=info.get("title", "Playlist"),
-            uploader=info.get("uploader", ""),
+            title=str(info.get("title") or "Playlist")[:200],
+            uploader=str(info.get("uploader") or "")[:100],
             duration=0,
             view_count=0,
             like_count=None,
@@ -424,9 +579,9 @@ async def get_video_info(url: str) -> VideoInfo:
 
     return VideoInfo(
         url=url,
-        title=info.get("title", ""),
-        uploader=info.get("uploader", ""),
-        duration=info.get("duration", 0),
+        title=str(info.get("title") or "")[:200],
+        uploader=str(info.get("uploader") or "")[:100],
+        duration=max(0, int(info.get("duration") or 0)),
         view_count=info.get("view_count", 0),
         like_count=info.get("like_count"),
         thumbnail=info.get("thumbnail", ""),
@@ -449,6 +604,8 @@ def _parse_formats(raw_formats: list) -> list[FormatInfo]:
 
     for f in raw_formats:
         fid = f.get("format_id", "")
+        if not isinstance(fid, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,59}", fid):
+            continue
         vcodec = f.get("vcodec", "none") or "none"
         acodec = f.get("acodec", "none") or "none"
         ext = f.get("ext", "")
@@ -590,6 +747,13 @@ async def download_video(
     split_chapters: bool = False,
     is_live: bool = False,
 ) -> DownloadResult:
+    if SSRF_PROTECTION and not TRUST_EXTERNAL_NETWORK_FOR_SSRF and (clip_range or is_live):
+        return DownloadResult(success=False, error=(
+            "Отрывки и прямые эфиры отключены сетевой политикой сервера. "
+            "Попробуйте скачать запись целиком."
+        ))
+    if cancel_flag is None:
+        cancel_flag = [False]
     output_dir.mkdir(parents=True, exist_ok=True)
     output_template = str(output_dir / "%(title).80s.%(ext)s")
 
@@ -601,8 +765,7 @@ async def download_video(
     # Нативный загрузчик с 3 потоками даёт полноценный прогресс на каждом фрагменте.
     if progress_callback and USE_ARIA2C:
         opts.pop("external_downloader", None)
-        opts.pop("external_downloader_args", None)
-        opts["concurrent_fragment_downloads"] = 3
+        opts["concurrent_fragment_downloads"] = 1 if SSRF_PROTECTION else 3
 
     loop = asyncio.get_running_loop()
     tracker = ProgressTracker(progress_callback, loop)
@@ -657,8 +820,8 @@ async def download_video(
                     "preferredquality": "192",
                 }],
                 # -threads 0 → FFmpeg использует все доступные ядра CPU
-                "postprocessor_args": {"ffmpeg": ["-threads", "0"]},
             })
+            opts.setdefault("postprocessor_args", {})["ffmpeg"] = ["-threads", "0"]
     else:
         # Combine selected video with best audio.
         # max_height приходит из FormatInfo.resolution вызывающей стороны.
@@ -747,10 +910,10 @@ async def download_video(
 
     def _download():
         try:
-            with _guard_network(), yt_dlp.YoutubeDL(opts) as ydl:
+            with _guard_network(), SafeYoutubeDL(opts) as ydl:
                 info = ydl.extract_info(url, download=True)
                 filename = ydl.prepare_filename(info)
-                result_holder["title"] = info.get("title", "")
+                result_holder["title"] = str(info.get("title") or "")[:200]
                 result_holder["has_subtitles"] = bool(info.get("requested_subtitles"))
                 if audio_only:
                     ext = ".opus" if audio_format == "opus" else ".wav" if audio_format == "wav" else ".mp3"
@@ -772,9 +935,8 @@ async def download_video(
             # so it doesn't leak out of the executor thread.
             result_holder["error"] = str(e)
 
-    worker = asyncio.ensure_future(run_blocking(_download))
     try:
-        await asyncio.wait_for(asyncio.shield(worker), timeout=DOWNLOAD_TIMEOUT + 60)
+        await _run_download_worker(_download, output_dir, cancel_flag, DOWNLOAD_TIMEOUT + 60)
     except asyncio.TimeoutError:
         timed_out[0] = True
         if cancel_flag is not None:
@@ -788,7 +950,10 @@ async def download_video(
             return DownloadResult(success=False, error="Insufficient free disk space")
         if cancel_flag and cancel_flag[0]:
             return DownloadResult(success=False, error="CANCELLED")
-        return DownloadResult(success=False, error=result_holder["error"])
+        error = result_holder["error"]
+        if SSRF_PROTECTION and not TRUST_EXTERNAL_NETWORK_FOR_SSRF and "whitelist" in error.lower():
+            error = "Этот поток требует сетевого доступа FFmpeg, отключённого на сервере."
+        return DownloadResult(success=False, error=error)
 
     if cancel_flag and cancel_flag[0]:
         return DownloadResult(success=False, error="CANCELLED")
@@ -798,6 +963,10 @@ async def download_video(
         # Если у видео глав не оказалось, yt-dlp ничего не разрезал — отдаём целый файл.
         parts = _collect_chapter_files(output_dir)
         if parts:
+            if sum(p.stat().st_size for p in parts) > MAX_PLAYLIST_TOTAL_BYTES:
+                return DownloadResult(success=False, error="Chapters exceeded aggregate limit")
+            if any(p.stat().st_size > MAX_FILE_SIZE_BYTES for p in parts):
+                return DownloadResult(success=False, error="File too large: chapter exceeds limit")
             first = parts[0]
             return DownloadResult(
                 success=True,
@@ -810,14 +979,18 @@ async def download_video(
     file_path: Path = result_holder.get("file_path")
     if not file_path or not file_path.exists():
         # Try to find the downloaded file, preferring known media extensions
-        all_candidates = sorted(output_dir.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-        media_candidates = [p for p in all_candidates if p.suffix.lower() in _MEDIA_EXTS]
-        candidates = media_candidates if media_candidates else all_candidates
+        candidates = sorted(
+            (p for p in output_dir.iterdir()
+             if not p.is_symlink() and p.is_file() and p.suffix.lower() in _MEDIA_EXTS),
+            key=lambda p: p.stat().st_mtime, reverse=True,
+        )
         if candidates:
             file_path = candidates[0]
         else:
             return DownloadResult(success=False, error="Downloaded file not found")
 
+    if file_path.is_symlink() or not file_path.is_file():
+        return DownloadResult(success=False, error="Download path validation failed")
     # CRITICAL-2: path traversal guard — reject files outside output_dir
     try:
         file_path.resolve().relative_to(output_dir.resolve())
@@ -849,6 +1022,8 @@ async def download_playlist(
     max_items: int = 10,
     cancel_flag: Optional[list] = None,
 ) -> list[DownloadResult]:
+    if cancel_flag is None:
+        cancel_flag = [False]
     output_dir.mkdir(parents=True, exist_ok=True)
     opts = _base_opts()
     if format_id == "bestaudio":
@@ -877,6 +1052,8 @@ async def download_playlist(
         opts["postprocessors"] = embed_pps
 
     results = []
+    completed: list[Path] = []
+    opts["post_hooks"] = [lambda filename: completed.append(Path(filename))]
     error_holder: dict = {}
     timeout = DOWNLOAD_TIMEOUT * max(1, max_items)
     deadline = time.monotonic() + timeout
@@ -900,16 +1077,15 @@ async def download_playlist(
 
     def _download():
         try:
-            with _guard_network(), yt_dlp.YoutubeDL(opts) as ydl:
+            with _guard_network(), SafeYoutubeDL(opts) as ydl:
                 ydl.download([url])
         except _DownloadCancelled as e:
             error_holder["error"] = str(e) or "CANCELLED"
         except Exception as e:
             error_holder["error"] = str(e)
 
-    worker = asyncio.ensure_future(run_blocking(_download))
     try:
-        await asyncio.wait_for(asyncio.shield(worker), timeout=timeout + 60)
+        await _run_download_worker(_download, output_dir, cancel_flag, timeout + 60)
     except asyncio.TimeoutError as e:
         if cancel_flag is not None:
             cancel_flag[0] = True
@@ -930,9 +1106,11 @@ async def download_playlist(
     # Если плейлист не скачал ни одного файла и была ошибка — пробрасываем
     if error and not any(output_dir.iterdir()):
         raise RuntimeError(error)
+    if _output_size(output_dir) > MAX_PLAYLIST_TOTAL_BYTES:
+        raise RuntimeError("Playlist exceeded aggregate limit")
 
     base_resolved = output_dir.resolve()
-    for f in sorted(output_dir.iterdir()):
+    for f in sorted(set(completed)):
         # HIGH-5: skip symlinks and files outside output_dir
         if f.is_symlink():
             logger.warning("Skipping symlink in playlist output: %s", f)
@@ -947,6 +1125,8 @@ async def download_playlist(
             logger.warning("Skipping out-of-directory file in playlist: %s", f)
             continue
         size = f.stat().st_size
+        if size > MAX_FILE_SIZE_BYTES:
+            continue
         results.append(DownloadResult(
             success=True,
             file_path=f,
@@ -1024,7 +1204,7 @@ def _is_ssrf_url(url: str) -> bool:
             # not is_global покрывает loopback/private/link-local/multicast/
             # reserved/unspecified, а также CGNAT 100.64.0.0/10 и 6to4-релеи,
             # которые перечисление отдельных флагов пропускало.
-            if not ip.is_global:
+            if not _is_public_address(ip):
                 return True
         return False
     except Exception:
@@ -1081,7 +1261,10 @@ def _bdecode_at(data: bytes, i: int, depth: int = 0):
     c = data[i:i + 1]
     if c == b"i":
         end = data.index(b"e", i)
-        return int(data[i + 1:end]), end + 1
+        raw = data[i + 1:end]
+        if not re.fullmatch(rb"0|-?[1-9][0-9]*", raw):
+            raise _BencodeError("invalid integer")
+        return int(raw), end + 1
     if c == b"l":
         i += 1
         out = []
@@ -1101,11 +1284,16 @@ def _bdecode_at(data: bytes, i: int, depth: int = 0):
             if data[i:i + 1] == b"e":
                 return out, i + 1
             k, i = _bdecode_at(data, i, depth + 1)
+            if not isinstance(k, bytes) or k in out:
+                raise _BencodeError("invalid or duplicate dictionary key")
             v, i = _bdecode_at(data, i, depth + 1)
             out[k] = v
     if c.isdigit():
         colon = data.index(b":", i)
-        length = int(data[i:colon])
+        raw = data[i:colon]
+        if not re.fullmatch(rb"0|[1-9][0-9]*", raw):
+            raise _BencodeError("invalid string length")
+        length = int(raw)
         if length < 0:
             raise _BencodeError("negative string length")
         start = colon + 1
@@ -1118,7 +1306,9 @@ def _bdecode_at(data: bytes, i: int, depth: int = 0):
 
 def _bdecode(data: bytes):
     try:
-        value, _ = _bdecode_at(data, 0)
+        value, end = _bdecode_at(data, 0)
+        if end != len(data):
+            raise _BencodeError("trailing bencode data")
     except (ValueError, IndexError) as e:
         raise _BencodeError(str(e)) from e
     return value
@@ -1172,33 +1362,78 @@ def parse_magnet(uri: str) -> TorrentMeta:
 
 def parse_torrent_file(path) -> TorrentMeta:
     """Парсит .torrent-файл (bencode). Бросает ValueError при некорректном формате."""
-    data = Path(path).read_bytes()
+    with Path(path).open("rb") as stream:
+        data = stream.read(TORRENT_FILE_MAX_BYTES + 1)
+    if len(data) > TORRENT_FILE_MAX_BYTES:
+        raise ValueError("Torrent metadata too large")
     meta = _bdecode(data)
     if not isinstance(meta, dict):
         raise ValueError("invalid torrent: top-level is not a dict")
     info = meta.get(b"info")
     if not isinstance(info, dict):
         raise ValueError("invalid torrent: missing info dict")
-    name = _b2s(info.get(b"name", b"")) or "torrent"
+    def component(value):
+        if not isinstance(value, bytes):
+            raise ValueError("Invalid torrent path component")
+        name = value.decode("utf-8", "strict")
+        if name in {"", ".", ".."} or any(c in name for c in "/\\\x00"):
+            raise ValueError("Unsafe torrent path")
+        return name
+
+    def length(value):
+        if type(value) is not int or value < 0:
+            raise ValueError("Invalid torrent file length")
+        return value
+
+    name = component(info.get(b"name"))
+    if b"name.utf-8" in info:
+        if component(info[b"name.utf-8"]) != name:
+            raise ValueError("Ambiguous torrent name")
     files: list[str] = []
     total = 0
-    if isinstance(info.get(b"files"), list):
+    if b"files" in info:
+        if not isinstance(info[b"files"], list) or not info[b"files"] or b"length" in info:
+            raise ValueError("Invalid torrent files")
         # multi-file: каждый файл лежит внутри папки name/
         for f in info[b"files"]:
             if not isinstance(f, dict):
-                continue
-            total += int(f.get(b"length", 0) or 0)
-            parts = [_b2s(p) for p in (f.get(b"path") or [])]
-            files.append("/".join(parts) if parts else "")
+                raise ValueError("Invalid torrent file entry")
+            total += length(f.get(b"length"))
+            raw_parts = f.get(b"path")
+            if not isinstance(raw_parts, list) or not raw_parts:
+                raise ValueError("Invalid torrent path")
+            parts = [component(p) for p in raw_parts]
+            if b"path.utf-8" in f:
+                if not isinstance(f[b"path.utf-8"], list) or not f[b"path.utf-8"]:
+                    raise ValueError("Invalid torrent UTF-8 path")
+                if [component(p) for p in f[b"path.utf-8"]] != parts:
+                    raise ValueError("Ambiguous torrent path")
+            files.append("/".join(parts))
     else:
-        total = int(info.get(b"length", 0) or 0)
+        total = length(info.get(b"length"))
         files.append(name)
     trackers: list[str] = []
     if b"announce" in meta:
+        if not isinstance(meta[b"announce"], bytes):
+            raise ValueError("Invalid torrent announce")
         trackers.append(_b2s(meta[b"announce"]))
-    for tier in (meta.get(b"announce-list") or []):
-        if isinstance(tier, list):
-            trackers.extend(_b2s(tr) for tr in tier)
+    tiers = meta.get(b"announce-list", [])
+    if not isinstance(tiers, list):
+        raise ValueError("Invalid torrent announce-list")
+    for tier in tiers:
+        if not isinstance(tier, list) or any(not isinstance(tr, bytes) for tr in tier):
+            raise ValueError("Invalid torrent tracker tier")
+        trackers.extend(_b2s(tr) for tr in tier)
+    if len(set(files)) != len(files):
+        raise ValueError("Duplicate torrent paths")
+    # aria2 also contacts web seeds; apply the same checks as to trackers.
+    for key in (b"url-list", b"httpseeds"):
+        seeds = meta.get(key, [])
+        if isinstance(seeds, bytes):
+            seeds = [seeds]
+        if not isinstance(seeds, list) or any(not isinstance(s, bytes) for s in seeds):
+            raise ValueError("Invalid torrent web seeds")
+        trackers.extend(_b2s(s) for s in seeds)
     return TorrentMeta(
         name=name, total_size=total, files=files, trackers=trackers,
         source=str(path), is_magnet=False,
@@ -1218,9 +1453,9 @@ def _host_is_public(hostname: str) -> bool:
             ip = ipaddress.ip_address(sockaddr[0])
         except (ValueError, IndexError):
             return False
-        if not ip.is_global:
+        if not _is_public_address(ip):
             return False
-    return True
+    return bool(addrs)
 
 
 def _torrent_trackers_are_safe(trackers: list[str]) -> bool:
@@ -1232,9 +1467,14 @@ def _torrent_trackers_are_safe(trackers: list[str]) -> bool:
     if not SSRF_PROTECTION:
         return True
     for tr in trackers:
-        host = urlparse(tr).hostname
-        if not host:
-            continue
+        try:
+            parsed = urlparse(tr)
+            host = parsed.hostname
+            if parsed.scheme not in {"http", "https", "udp"} or not host:
+                return False
+            _ = parsed.port
+        except ValueError:
+            return False
         if not _host_is_public(host):
             logger.warning("Blocked torrent tracker on non-public host: %s", host)
             return False
@@ -1290,7 +1530,7 @@ def _build_aria2c_args(
         args += ["--bt-metadata-only=true", "--bt-save-metadata=true"]
     if select_indices:
         args.append("--select-file=" + ",".join(str(i) for i in select_indices))
-    args.append(source)
+    args.extend(["--", source])
     return args
 
 
@@ -1322,6 +1562,7 @@ async def _terminate_proc(proc) -> None:
             proc.kill()
         except ProcessLookupError:
             pass
+        await proc.wait()
 
 
 _ARIA2_PCT_RE = re.compile(r"\((\d+)%\)")
@@ -1368,6 +1609,11 @@ async def fetch_magnet_metadata(magnet: str, meta_dir: Path) -> TorrentMeta:
     except asyncio.TimeoutError as e:
         await _terminate_proc(proc)
         raise TimeoutError("Magnet metadata request timed out") from e
+    except BaseException:
+        await _terminate_proc(proc)
+        raise
+    if proc.returncode != 0:
+        raise RuntimeError(f"Magnet metadata download failed (exit {proc.returncode})")
 
     saved = sorted(meta_dir.glob("*.torrent"))
     if not saved:
@@ -1511,6 +1757,11 @@ async def download_torrent(
             f"Torrent exceeded aggregate limit: {_human_size(TORRENT_MAX_TOTAL_BYTES)}"
         )
 
+    if proc.returncode != 0:
+        raise RuntimeError(f"Torrent download failed (exit {proc.returncode})")
+    if _dir_size_recursive(output_dir) > TORRENT_MAX_TOTAL_BYTES:
+        raise RuntimeError("Torrent exceeded aggregate limit")
+
     return _collect_torrent_results(output_dir, media_only)
 
 
@@ -1523,6 +1774,8 @@ def _collect_torrent_results(output_dir: Path, media_only: bool) -> list[Downloa
             continue
         # Служебные файлы aria2c и сохранённые метаданные пропускаем
         if f.suffix.lower() in (".aria2", ".torrent"):
+            continue
+        if f.with_name(f.name + ".aria2").exists():
             continue
         if media_only and f.suffix.lower() not in _MEDIA_EXTS:
             continue

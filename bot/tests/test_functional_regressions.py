@@ -62,7 +62,7 @@ class SubtitleDeliveryTests(unittest.IsolatedAsyncioTestCase):
             out = Path(tmp)
             _FakeYDL.target = out / 'video.mp4'
             _FakeYDL.info = {'title': 'video', **info_extra}
-            with mock.patch.object(downloader.yt_dlp, 'YoutubeDL', _FakeYDL):
+            with mock.patch.object(downloader, 'SafeYoutubeDL', _FakeYDL):
                 result = await downloader.download_video(
                     url='https://example.com/v',
                     format_id='best',
@@ -100,7 +100,7 @@ class FormatSelectionTests(unittest.IsolatedAsyncioTestCase):
             out = Path(tmp)
             _FakeYDL.target = out / 'video.mp4'
             _FakeYDL.info = {'title': 'video'}
-            with mock.patch.object(downloader.yt_dlp, 'YoutubeDL', _FakeYDL):
+            with mock.patch.object(downloader, 'SafeYoutubeDL', _FakeYDL):
                 await downloader.download_video(
                     url='https://example.com/v', format_id='137',
                     output_dir=out, max_height=1080,
