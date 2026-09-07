@@ -469,3 +469,25 @@ def test_http_resume_completion_survives_restart(tmp_path):
                 await fileserver.stop()
                 fileserver.unregister(token, delete_file=True)
     asyncio.run(run())
+
+
+def test_subtitle_only_ignores_video_size_estimate(tmp_path):
+    async def run():
+        query, ctx, _ = context()
+        bot._save_session_safe(1, 10, URL, info(), 1, ctx=ctx)
+        store.preferences(1, {'quality': 'auto', 'subtitle_language': 'zh-Hans-orig', 'subtitle_format': 'txt'})
+        async def download(**kwargs):
+            assert kwargs['subtitle_lang'] == 'zh-Hans-orig'
+            assert kwargs['subtitle_format'] == 'txt'
+            path = kwargs['output_dir'] / 'subtitles.txt'
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text('Текст субтитров')
+            return downloader.DownloadResult(True, path, file_size=path.stat().st_size)
+        with mock.patch.object(config, 'DOWNLOAD_DIR', tmp_path), \
+                mock.patch.object(config, 'ALLOW_SUBTITLES', True), \
+                mock.patch.object(bot, 'disk_has_capacity', return_value=True), \
+                mock.patch.object(bot, 'download_video', side_effect=download) as worker:
+            await bot._handle_download_callback(query, ctx, 'dl:s:zh-Hans-orig')
+            worker.assert_awaited_once()
+            assert store.queue(1)[0]['status'] == 'ready'
+    asyncio.run(run())

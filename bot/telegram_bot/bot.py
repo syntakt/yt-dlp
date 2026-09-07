@@ -2806,7 +2806,7 @@ async def _handle_download_callback(query, ctx, data: str):
         subtitle_lang = user_options['subtitle_language'] or None
     if dl_type == "s":
         # SEC: validate subtitle_lang (callback_data is user-controllable)
-        if not subtitle_lang or not re.match(r'^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)?$', subtitle_lang):
+        if not subtitle_lang or not media_options.language(subtitle_lang):
             logger.warning("Invalid subtitle_lang %r from user %s", subtitle_lang, query.from_user.id)
             db.update_download(dl_id, status="error", error="invalid subtitle lang")
             await query.answer("❌ Некорректный язык субтитров.", show_alert=True)
@@ -2839,7 +2839,8 @@ async def _handle_download_callback(query, ctx, data: str):
         quality_label += f" · отрывок {_fmt_clock(clip_range[0])}–{_fmt_clock(clip_range[1])}"
 
     max_height = height_from_resolution(fmt_obj.resolution) if fmt_obj else None
-    if format_id == 'best' and not audio_only and user_options['quality'] != 'best':
+    standalone_subtitles = bool(subtitle_lang and user_options['subtitle_format'] != 'embed')
+    if format_id == 'best' and not audio_only and not standalone_subtitles and user_options['quality'] != 'best':
         if user_options['quality'] == 'auto':
             chosen = media_options.auto_format(info, min(config.TELEGRAM_UPLOAD_LIMIT_BYTES, config.MAX_FILE_SIZE_BYTES),
                                                user_options['audio_language'], user_options['compatible'])
@@ -2892,7 +2893,7 @@ async def _handle_download_callback(query, ctx, data: str):
     # Для форматов без точного filesize оцениваем по TBR × длительность.
     _est_size = _estimate_download_size(
         fmt_obj, info.duration or 0, audio_only, audio_format
-    )
+    ) if not standalone_subtitles else 0
     if _est_size and _est_size > config.MAX_FILE_SIZE_BYTES:
         _known = fmt_obj and fmt_obj.filesize
         _label = _human_size(_est_size) + ("" if _known else " (оценка)")
