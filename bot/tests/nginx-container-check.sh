@@ -18,3 +18,6 @@ if [ "$ready" != true ]; then
 fi
 docker exec "$name" nginx -t
 docker exec "$name" sh -c 'openssl s_client -connect 127.0.0.1:1443 -servername example.com -brief </dev/null'
+# Validate the actual Alpine timeout command and Certbot's noninteractive flags.
+# No certificates are registered here, so renew performs no ACME request.
+docker exec "$name" timeout -k 10 30 certbot renew --non-interactive --no-random-sleep-on-renew

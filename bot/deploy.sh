@@ -15,8 +15,20 @@
 #   ./deploy.sh logs bot       — логи бота (follow)
 #   ./deploy.sh logs nginx     — логи nginx-ssl (follow)
 #   ./deploy.sh logs nginx 50  — последние 50 строк nginx-ssl
+#   ./deploy.sh renew-cert [--dry-run] — ручное продление внутри nginx-ssl
 set -euo pipefail
 cd "$(dirname "$0")"
+
+# Renewal uses the running container's environment and certificate volumes.
+# No build, Compose dotenv parsing or host Certbot installation is needed.
+if [ "${1:-}" = "renew-cert" ]; then
+    shift
+    if [ "$#" -gt 1 ] || { [ "$#" -eq 1 ] && [ "$1" != "--dry-run" ]; }; then
+        echo "Использование: $0 renew-cert [--dry-run]" >&2
+        exit 1
+    fi
+    exec docker exec nginx-ssl /renew-certificate.sh "$@"
+fi
 
 export GIT_COMMIT BUILD_DATE
 GIT_COMMIT=$(git rev-parse --short=7 HEAD 2>/dev/null || echo "dev")
@@ -177,7 +189,7 @@ case "${1:-all}" in
         echo "Done. Version commit: $GIT_COMMIT"
         ;;
     *)
-        echo "Usage: $0 {build|up|restart|down|logs} [service] [tail-lines]" >&2
+        echo "Usage: $0 {build|up|restart|down|logs|renew-cert} [service|--dry-run] [tail-lines]" >&2
         exit 1
         ;;
 esac

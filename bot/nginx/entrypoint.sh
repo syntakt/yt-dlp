@@ -7,13 +7,14 @@
 #   2. Применяет nginx.conf из шаблона (envsubst)
 #   3. Пытается получить Let's Encrypt сертификат через HTTP-01 challenge
 #      (нужен порт 80, маршрутизированный через nftables DNAT)
-#   4. Запускает nginx как PID 1 + фоновый renewal loop
+#   4. При сохранённом LE cert проверяет продление после запуска nginx
+#      (один раз на запуск контейнера, без периодического цикла)
 #
 # Переменные окружения:
-#   SSLIP_DOMAIN   — обязательно (например: 150-241-90-145.sslip.io)
+#   SSLIP_DOMAIN   — любой DNS-домен (историческое имя, не только sslip.io)
 #   HTTPS_PORT     — порт HTTPS (по умолчанию 1443)
 #   CERTBOT_EMAIL  — email для Let's Encrypt (пусто → без email, --register-unsafely-without-email)
-#   ENABLE_CERTBOT — "true" для включения certbot (по умолчанию true)
+#   ENABLE_CERTBOT — "true": выпуск/проверка продления при старте (по умолчанию true)
 # ══════════════════════════════════════════════════════════════════════════════
 set -e
 
@@ -85,7 +86,7 @@ envsubst '${SSLIP_DOMAIN} ${HTTPS_PORT} ${HTTP_PORT}' \
     < /etc/nginx/templates/nginx.conf.template \
     > /etc/nginx/nginx.conf
 
-echo "[nginx-ssl] Конфигурация: https://${DOMAIN}:${HTTPS_PORT} → ytdlp-bot:8080"
+echo "[nginx-ssl] Конфигурация: https://${DOMAIN}:${HTTPS_PORT} → ytdlp-bot:${HTTP_PORT}"
 
 # ── Сертификат: проверяем наличие LE cert в volume ────────────────────────────
 # Если LE cert уже получен ранее (persisted в volume) — копируем его.
@@ -111,7 +112,7 @@ else
     echo "[nginx-ssl] Используется существующий сертификат"
 fi
 
-# ── Certbot: получение Let's Encrypt сертификата (фоновый процесс) ────────────
+# ── Certbot: выпуск или проверка продления при старте ─────────────────────────
 # Запускается ПОСЛЕ nginx (нужен webroot на порту 80 для ACME challenge).
 # Требования:
 #   - ENABLE_CERTBOT=true (по умолчанию)
@@ -132,14 +133,14 @@ if [ "$ENABLE_CERTBOT" = "true" ]; then
             # Формируем команду certbot без word splitting
             if [ -n "$CERTBOT_EMAIL" ]; then
                 CERTBOT_RESULT=0
-                certbot certonly --webroot -w "$WEBROOT" \
+                timeout -k 10 300 certbot certonly --webroot -w "$WEBROOT" \
                     -d "$DOMAIN" \
                     --email "$CERTBOT_EMAIL" --agree-tos --non-interactive \
                     --preferred-challenges http 2>&1 || CERTBOT_RESULT=$?
             else
                 echo "[nginx-ssl] Email: не задан (--register-unsafely-without-email)"
                 CERTBOT_RESULT=0
-                certbot certonly --webroot -w "$WEBROOT" \
+                timeout -k 10 300 certbot certonly --webroot -w "$WEBROOT" \
                     -d "$DOMAIN" \
                     --agree-tos --register-unsafely-without-email --non-interactive \
                     --preferred-challenges http 2>&1 || CERTBOT_RESULT=$?
@@ -149,6 +150,7 @@ if [ "$ENABLE_CERTBOT" = "true" ]; then
                 cp -f "$LE_DIR/fullchain.pem" "$CERT_DIR/fullchain.pem"
                 cp -f "$LE_DIR/privkey.pem"   "$CERT_DIR/privkey.pem"
                 chmod 600 "$CERT_DIR/privkey.pem"
+                nginx -t
                 nginx -s reload
                 echo "[nginx-ssl] ✓ Let's Encrypt сертификат установлен!"
                 openssl x509 -in "$CERT_DIR/fullchain.pem" -noout \
@@ -162,14 +164,25 @@ if [ "$ENABLE_CERTBOT" = "true" ]; then
                 echo "[nginx-ssl]   и перезапустите: docker restart nginx-ssl"
                 echo ""
             fi
+        else
+            echo "[nginx-ssl] Проверяю срок продления сертификата для ${DOMAIN}..."
+            if ! /renew-certificate.sh; then
+                echo "[nginx-ssl] ⚠ Продление не выполнено; Nginx продолжает работать с загруженным сертификатом"
+                echo "[nginx-ssl] Проверьте DNS, DNAT/FORWARD для HTTP-01 на порту 80 и повторите: docker exec nginx-ssl /renew-certificate.sh"
+            fi
         fi
 
     ) &
-    echo "[nginx-ssl] Первичный запрос Certbot запущен; продление только вручную: /renew-certificate.sh"
+    if [ "$HAVE_LE" = "0" ]; then
+        echo "[nginx-ssl] Первичный запрос Certbot запущен в фоне"
+    else
+        echo "[nginx-ssl] Проверка продления Certbot запущена в фоне; свежий сертификат принудительно не перевыпускается"
+    fi
 else
-    echo "[nginx-ssl] ENABLE_CERTBOT=false — Let's Encrypt отключён"
-    echo "[nginx-ssl] HTTPS работает с self-signed сертификатом"
+    echo "[nginx-ssl] ENABLE_CERTBOT=false — выпуск и проверка продления при старте отключены"
 fi
+echo "[nginx-ssl] Продление вручную с хоста: docker exec nginx-ssl /renew-certificate.sh"
+echo "[nginx-ssl] Проверка маршрута HTTP-01: docker exec nginx-ssl /renew-certificate.sh --dry-run"
 
 # ── Вывод информации о сертификате перед стартом nginx ────────────────────────
 echo "[nginx-ssl] ── Информация о сертификате ──────────────────────────────"

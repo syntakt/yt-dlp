@@ -372,10 +372,11 @@ services:
   # 5. Удалить старый HTTP DNAT (порт 8080 больше не нужен снаружи):
   #   # fib daddr type local tcp dport $FILESERVER_INPUT dnat to $YTDLP_IP:$FILESERVER_OUTPUT
   #
-  # 6. Let's Encrypt (вручную, временно на время получения/обновления cert):
+  # 6. Let's Encrypt (маршрут нужен при старте nginx-ssl и при ручном продлении):
   #   Заменить правило DNAT для порта 80 в prerouting/output:
   #     fib daddr type local tcp dport 80 dnat to $NGINX_SSL_IP:80
-  #   Продление ручное: на время процедуры снова откройте порт 80 / ACME route.
+  #   При ENABLE_CERTBOT=true проверка продления выполняется при каждом старте.
+  #   HTTP-01 должен быть заранее разрешён в DNAT и FORWARD, независимо от ASN.
   #   При другом frontend Nginx проксируйте /.well-known/acme-challenge/ сюда.
   #   ⚠ Для ACME challenge порт 80 должен быть открыт всем (LE серверы не из $ASN)
   #
