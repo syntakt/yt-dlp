@@ -5,7 +5,7 @@
   • UUID4-токен (122 бит энтропии — практически неугадываемый)
   • Необязательная HMAC-SHA256 подпись каждого токена через SERVER_SECRET (.env)
   • Rate-limiting: не более FS_RATE_LIMIT запросов с одного IP в минуту
-  • Токен однократного использования — файл удаляется сразу после скачивания
+  • Одна активная передача на токен; ограниченные повторы и докачка до TTL
   • TTL: ссылка и файл удаляются через час если никто не скачал
   • Стандартные security-заголовки (X-Content-Type-Options, X-Frame-Options, …)
   • Токен не содержит пути на диске; перебор невозможен даже без HMAC
@@ -22,13 +22,14 @@ import asyncio
 import hashlib
 import hmac as _hmac_mod
 import ipaddress
+import json
 import logging
 import os
 import re
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 from urllib.parse import quote as _urlquote
@@ -52,7 +53,7 @@ _HEX48_RE = re.compile(r"[0-9a-f]{48}")
 
 
 def _parse_trusted_proxy_cidrs() -> list[ipaddress._BaseNetwork]:
-    raw = os.environ.get("FS_TRUSTED_PROXY_CIDRS", "10.10.2.0/24,127.0.0.1/32,::1/128")
+    raw = os.environ.get("FS_TRUSTED_PROXY_CIDRS", "10.10.2.4/32,10.10.2.5/32,127.0.0.1/32,::1/128")
     networks: list[ipaddress._BaseNetwork] = []
     for item in raw.split(","):
         item = item.strip()
@@ -76,6 +77,11 @@ class FileEntry:
     file_size: int
     expires_at: float   # unix timestamp
     download_id: int | None = None
+    attempts: int = 0
+    bytes_sent: int = 0
+    completed: bool = False
+    busy: bool = False
+    ranges: list = field(default_factory=list)
 
 
 # uuid_key (32 hex) → FileEntry
@@ -126,6 +132,33 @@ def _verify_token(token: str) -> Optional[str]:
         return token
 
 
+def token_for_key(uuid_key):
+    if _SERVER_SECRET:
+        return uuid_key + _hmac_mod.new(_SERVER_SECRET, uuid_key.encode(), hashlib.sha256).hexdigest()[:16]
+    return uuid_key
+
+
+def _persist(uuid_key, entry):
+    import database as db
+    db.save_delivery(uuid_key, entry.path, entry.expires_at, entry.download_id,
+                     attempts=entry.attempts, bytes_sent=entry.bytes_sent, completed=entry.completed, ranges=entry.ranges)
+
+
+def claim(full_token):
+    entry = get_entry(full_token)
+    if not entry or entry.busy:
+        return None
+    entry.busy = True
+    return entry
+
+
+def release(full_token):
+    key = _verify_token(full_token)
+    entry = _registry.get(key)
+    if entry:
+        entry.busy = False
+
+
 # ── Публичный API ────────────────────────────────────────────────────────────────
 
 def _fileserver_root() -> Path:
@@ -156,6 +189,11 @@ def register_file(
         expires_at=time.time() + ttl_seconds,
         download_id=download_id,
     )
+    try:
+        _persist(uuid_key, _registry[uuid_key])
+    except BaseException:
+        _registry.pop(uuid_key, None)
+        raise
     logger.info("Зарегистрирован '%s' → %s… (TTL=%ds)", real_path.name, uuid_key[:8], ttl_seconds)
     return full_token
 
@@ -202,6 +240,7 @@ def move_and_register(
             expires_at=time.time() + ttl_seconds,
             download_id=download_id,
         )
+        _persist(uuid_key, _registry[uuid_key])
     except BaseException:
         _registry.pop(uuid_key, None)
         if moved and dest.exists() and not src.exists():
@@ -223,7 +262,7 @@ def get_entry(full_token: str) -> Optional[FileEntry]:
     if not uuid_key:
         return None
     entry = _registry.get(uuid_key)
-    if entry and time.time() >= entry.expires_at:
+    if entry and not entry.busy and time.time() >= entry.expires_at:
         _remove(uuid_key, "TTL истёк (get_entry)")
         return None
     return entry
@@ -242,6 +281,8 @@ def unregister(full_token: str, *, delete_file: bool = False) -> None:
     entry = _registry.pop(uuid_key, None)
     if entry is None:
         return
+    import database as db
+    db.delete_delivery(uuid_key)
     if delete_file:
         _delete_entry_file(entry)
         logger.debug("Токен %s… отозван + файл удалён", uuid_key[:8])
@@ -252,10 +293,15 @@ def unregister(full_token: str, *, delete_file: bool = False) -> None:
 # ── Внутренние утилиты ───────────────────────────────────────────────────────────
 
 def _remove(uuid_key: str, reason: str = "") -> None:
+    if _registry.get(uuid_key) and _registry[uuid_key].busy:
+        return
     entry = _registry.pop(uuid_key, None)
     if entry:
+        import database as db
+        db.delete_delivery(uuid_key)
         _delete_entry_file(entry)
-        _update_download_status(entry, "error", reason or "file link expired")
+        if not entry.completed:
+            _update_download_status(entry, "error", reason or "file link expired")
         logger.info("Файл '%s' удалён (%s)", entry.filename, reason)
 
 
@@ -437,12 +483,12 @@ _INFO_TEMPLATE = """\
   <p class="meta">
     📦 {size_str}<br>
     ⏱ Ссылка истекает через <strong>{ttl_str}</strong><br>
-    🗑 Файл удаляется после скачивания
+    🗑 Файл удаляется по истечении срока ссылки
   </p>
   <a class="btn" href="/dl/{token}">⬇️ Скачать</a>
   <div class="warn">
-    ⚠️ Ссылка одноразовая — после первого скачивания файл будет автоматически удалён.
-    Убедитесь, что скачиваете в надёжное место.
+    Сохраните ссылку до окончания загрузки. Доступна докачка и ограниченное число повторов.
+    Одновременно поддерживается одно соединение. Не передавайте ссылку другим людям.
   </div>
 </div>
 </body>
@@ -507,115 +553,101 @@ async def _handle_info(request: web.Request) -> web.Response:
     )
 
 
+def _byte_range(header, size):
+    if not header:
+        return 0, max(0, size - 1), False
+    match = re.fullmatch(r"bytes=(\d*)-(\d*)", header)
+    if not match or not size or not any(match.groups()):
+        raise ValueError("Invalid range")
+    first, last = match.groups()
+    if not first:
+        count = int(last)
+        if count <= 0:
+            raise ValueError("Invalid suffix")
+        return max(0, size - count), size - 1, True
+    start = int(first)
+    end = min(int(last), size - 1) if last else size - 1
+    if start >= size or start > end:
+        raise ValueError("Unsatisfiable range")
+    return start, end, True
+
+
 async def _handle_download(request: web.Request) -> web.StreamResponse:
-    """Стриминг файла клиенту с последующим удалением."""
+    """One active transfer per token; bounded retries and HTTP Range until TTL."""
+    import database as db
     token = request.match_info["token"]
-    ip = _client_ip(request)
-
-    if not _check_rate_limit(ip):
-        logger.warning("Rate limit exceeded: %s /dl/%s…", ip, token[:8])
-        raise web.HTTPTooManyRequests(
-            text="Слишком много запросов.",
-            content_type="text/plain",
-            headers=_SEC_HEADERS,
-        )
-
-    uuid_key = _verify_token(token)
-    if uuid_key is None:
+    if not _check_rate_limit(_client_ip(request)):
+        raise web.HTTPTooManyRequests(headers=_SEC_HEADERS)
+    key = _verify_token(token)
+    if key is None:
         raise web.HTTPNotFound(headers=_SEC_HEADERS)
-
-    # SECURITY TOCTOU: атомарно извлекаем запись из реестра ДО начала стриминга.
-    # _registry.pop — атомарная операция в asyncio (однопоточный event loop), поэтому
-    # два одновременных запроса с одним токеном не могут оба получить entry.
-    # Первый получает entry, второй получает None → 410 Gone.
-    entry = _registry.pop(uuid_key, None)
+    entry = get_entry(token)
     if entry is None:
-        raise web.HTTPGone(
-            text="Файл не найден или ссылка уже использована.",
-            content_type="text/plain",
-            headers=_SEC_HEADERS,
-        )
-
-    if time.time() >= entry.expires_at:
-        # TTL истёк — удаляем файл с диска (из реестра уже вынули выше)
-        _delete_entry_file(entry)
-        _update_download_status(entry, "error", "file link expired")
-        logger.info("Файл '%s' удалён (TTL истёк на /dl/)", entry.filename)
-        raise web.HTTPGone(
-            text="Срок действия ссылки истёк.",
-            content_type="text/plain",
-            headers=_SEC_HEADERS,
-        )
-
-    if not entry.path.exists():
-        _update_download_status(entry, "error", "file missing before delivery")
-        raise web.HTTPNotFound(
-            text="Файл не найден на диске.",
-            content_type="text/plain",
-            headers=_SEC_HEADERS,
-        )
-
-    # Defense-in-depth: реестр наполняется только внутренним кодом, но перед
-    # отдачей проверяем, что путь реально внутри fileserver-каталога и это не
-    # симлинк наружу (страховка от будущего бага/повреждённого реестра).
+        raise web.HTTPGone(headers=_SEC_HEADERS)
+    if entry.busy:
+        raise web.HTTPConflict(text="Файл уже передаётся. Повторите позже.", headers=_SEC_HEADERS)
     try:
-        entry.path = _validate_served_path(entry.path)
-    except (ValueError, OSError):
-        logger.error("Отклонена отдача файла вне fileserver-каталога: %s", entry.path)
-        _update_download_status(entry, "error", "file path validation failed")
+        path = _validate_served_path(entry.path)
+        size = path.stat().st_size
+    except (OSError, ValueError):
         raise web.HTTPNotFound(headers=_SEC_HEADERS)
-
-    file_size = entry.path.stat().st_size
-    # RFC 5987: для ASCII-имён используем filename=, для Unicode добавляем filename*=
-    # SECURITY: сначала удаляем \r\n\x00 (HTTP response splitting), затем " (разрыв кавычек)
-    _clean = _sanitize_header_value(entry.filename)
-    ascii_name = _clean.encode("ascii", errors="replace").decode().replace('"', "_").replace("\\", "_")
-    utf8_name = _clean.replace("\\", "").replace('"', "")
-    content_disposition = (
-        f'attachment; filename="{ascii_name}"; '
-        f"filename*=UTF-8''{_urlquote(utf8_name, safe='')}"
-    )
-
-    response = web.StreamResponse(
-        headers={
-            "Content-Disposition": content_disposition,
-            "Content-Type": "application/octet-stream",
-            "Content-Length": str(file_size),
-            **_SEC_HEADERS,
-        }
-    )
-    downloaded_ok = False
+    etag = '"' + key + '"'
+    range_header = request.headers.get('Range')
+    if request.headers.get('If-Range') not in (None, etag):
+        range_header = None
     try:
+        start, end, partial = _byte_range(range_header, size)
+    except ValueError:
+        raise web.HTTPRequestRangeNotSatisfiable(headers={**_SEC_HEADERS, 'Content-Range': f'bytes */{size}'})
+    length = end - start + 1 if size else 0
+    if entry.attempts >= 16 or entry.bytes_sent + length > max(1, size) * 3:
+        raise web.HTTPTooManyRequests(text="Лимит повторных скачиваний исчерпан.", headers=_SEC_HEADERS)
+    entry.busy = True
+    entry.attempts += 1
+    # Reserve the full response before streaming, so restart cannot reset the budget.
+    entry.bytes_sent += length
+    response = None
+    sent = 0
+    try:
+        _persist(key, entry)
+        clean = _sanitize_header_value(entry.filename).replace('"', '_').replace("\\", '_')
+        headers = {
+            **_SEC_HEADERS, 'Content-Type': 'application/octet-stream',
+            'Content-Length': str(length), 'Accept-Ranges': 'bytes', 'ETag': etag,
+            'Content-Disposition': f"attachment; filename*=UTF-8''{_urlquote(clean, safe='')}",
+        }
+        if partial:
+            headers['Content-Range'] = f'bytes {start}-{end}/{size}'
+        response = web.StreamResponse(status=206 if partial else 200, headers=headers)
         await response.prepare(request)
-        with entry.path.open("rb") as fh:
-            while True:
-                chunk = fh.read(524288)  # 512 KB chunks
+        with path.open('rb') as stream:
+            stream.seek(start)
+            while sent < length:
+                chunk = stream.read(min(524288, length - sent))
                 if not chunk:
-                    break
+                    raise OSError('File changed during delivery')
                 await response.write(chunk)
+                sent += len(chunk)
         await response.write_eof()
-        downloaded_ok = True
-    except ConnectionResetError:
-        logger.warning("Соединение прервано при отдаче '%s' клиенту %s", entry.filename, ip)
-    except asyncio.CancelledError:
-        logger.warning("Запрос отменён при отдаче '%s' клиенту %s", entry.filename, ip)
-        _update_download_status(entry, "error", "file delivery cancelled")
+        merged = []
+        for lower, upper in sorted([*entry.ranges, [start, start + length]]):
+            if merged and lower <= merged[-1][1]:
+                merged[-1][1] = max(merged[-1][1], upper)
+            else:
+                merged.append([lower, upper])
+        entry.ranges = merged
+        entry.completed = merged == [[0, size]]
+        _persist(key, entry)
+        if entry.completed:
+            if entry.download_id and db.all_delivered(entry.download_id):
+                _update_download_status(entry, 'done')
+        return response
+    except (ConnectionError, asyncio.CancelledError):
         raise
-    except Exception as e:
-        logger.error("Ошибка при отдаче '%s': %s", entry.filename, e)
     finally:
-        # Токен одноразовый и уже извлечён из реестра. Удаляем файл после любой
-        # первой попытки /dl, включая обрыв соединения и ошибки prepare/write.
-        _delete_entry_file(entry)
+        entry.busy = False
+        # Keep the reservation on failure; a retry has a finite transfer budget.
 
-    if downloaded_ok:
-        _update_download_status(entry, "done")
-        logger.info("Файл '%s' успешно отдан клиенту %s и удалён", entry.filename, ip)
-    else:
-        _update_download_status(entry, "error", "file delivery interrupted")
-        logger.warning("Файл '%s' удалён после неуспешной попытки скачивания клиентом %s", entry.filename, ip)
-
-    return response
 
 
 async def _handle_health(request: web.Request) -> web.Response:
@@ -667,8 +699,12 @@ def _restore_registry() -> None:
     """
     from config import DOWNLOAD_DIR, FILE_TTL_SECONDS
 
+    import database as db
+    records = db.list_deliveries()
     fs_root = DOWNLOAD_DIR / "fileserver"
     if not fs_root.exists():
+        for key in records:
+            db.delete_delivery(key)
         return
 
     now = time.time()
@@ -710,7 +746,10 @@ def _restore_registry() -> None:
         for extra in files[1:]:
             extra.unlink(missing_ok=True)
         # TTL отсчитываем от момента записи файла на диск (mtime)
-        expires_at = f.stat().st_mtime + FILE_TTL_SECONDS
+        record = records.get(uuid_key, {})
+        if record and record['path'] != str(f):
+            record = {}
+        expires_at = record.get('expires_at', f.stat().st_mtime + FILE_TTL_SECONDS)
 
         if expires_at < now:
             # Срок истёк — убираем с диска
@@ -728,8 +767,16 @@ def _restore_registry() -> None:
             filename=f.name,
             file_size=f.stat().st_size,
             expires_at=expires_at,
+            download_id=record.get('download_id'),
+            attempts=record.get('attempts', 0), bytes_sent=record.get('bytes_sent', 0),
+            completed=bool(record.get('completed', False)),
+            ranges=json.loads(record.get('ranges', '[]')),
         )
+        _persist(uuid_key, _registry[uuid_key])
         restored += 1
+
+    for key in records.keys() - _registry.keys():
+        db.delete_delivery(key)
 
     if restored or expired_removed:
         logger.info(

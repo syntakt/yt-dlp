@@ -1,8 +1,8 @@
-FROM cloudflare/cloudflared:2026.3.0 AS cloudflared-src
+FROM cloudflare/cloudflared:2026.8.3 AS cloudflared-src
 
 # cloudflare/cloudflared — scratch-образ без shell.
 # Берём только бинарник cloudflared и запускаем его в alpine (есть /bin/sh, grep, seq...).
-FROM alpine:3.23.4
+FROM alpine:3.23.5
 
 # ca-certificates нужны cloudflared для TLS-соединения с Cloudflare
 RUN apk add --no-cache ca-certificates

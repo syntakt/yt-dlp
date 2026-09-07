@@ -150,8 +150,9 @@ class PoTokenTests(unittest.TestCase):
             mock.patch.object(downloader, 'YOUTUBE_PO_TOKEN', 'web.gvs+AAA,web.player+BBB'),
             mock.patch.object(downloader, 'YOUTUBE_PLAYER_CLIENT', 'default,-web'),
         ):
-            args = downloader._base_opts()['extractor_args']['youtube']
-        self.assertEqual(args['getpot_bgutil_baseurl'], ['http://bgutil-pot:4416'])
+            extractors = downloader._base_opts()['extractor_args']
+            args = extractors['youtube']
+        self.assertEqual(extractors['youtubepot-bgutilhttp']['base_url'], ['http://bgutil-pot:4416'])
         self.assertEqual(args['po_token'], ['web.gvs+AAA', 'web.player+BBB'])
         self.assertEqual(args['player_client'], ['default', '-web'])
 

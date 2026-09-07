@@ -175,7 +175,7 @@ http {
             proxy_set_header   Connection        "";
         }
 
-        # ── /dl/ — стриминг файла (одноразовый токен + rate limit от сканирования)
+        # ── /dl/ — стриминг с докачкой (ограниченный TTL и rate limit)
         location /dl/ {
             error_log /dev/null crit;
             limit_req  zone=dl burst=10 nodelay;

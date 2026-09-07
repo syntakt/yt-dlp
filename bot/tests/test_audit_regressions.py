@@ -348,7 +348,7 @@ class CallbackPolicyTests(unittest.IsolatedAsyncioTestCase):
                 await bot._handle_deliver_callback(query, ctx, "deliver:1:link")
         self.assertIs(ctx.user_data["_deliveries"][1], pending)
 
-    async def test_cancelled_telegram_delivery_removes_unregistered_file(self):
+    async def test_cancelled_telegram_delivery_keeps_file_retryable(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             source = root / "video.mp4"
@@ -369,9 +369,10 @@ class CallbackPolicyTests(unittest.IsolatedAsyncioTestCase):
                 ):
                     with self.assertRaises(asyncio.CancelledError):
                         await bot._handle_deliver_callback(query, ctx, "deliver:1:tg")
-                self.assertIsNone(fileserver.get_entry(token))
-                self.assertFalse(entry.path.exists())
-                self.assertFalse(entry.path.parent.exists())
+                self.assertIsNotNone(fileserver.get_entry(token))
+                self.assertTrue(entry.path.exists())
+                self.assertFalse(entry.busy)
+                fileserver.unregister(token, delete_file=True)
 
     async def test_full_metadata_queue_updates_waiting_message_without_spawning_task(self):
         ctx = SimpleNamespace(bot_data={"_pending_tasks": {1: 16}}, application=mock.Mock())
@@ -439,6 +440,7 @@ class CallbackPolicyTests(unittest.IsolatedAsyncioTestCase):
 
     def test_session_metadata_does_not_store_thumbnail_or_page_credentials(self):
         info = _video_info()
+        info.url = 'https://www.youtube.com/watch?v=abcdefghijk'
         info.thumbnail = "https://example.com/image?token=private"
         info.webpage_url = "https://user:password@example.com/video"
         with mock.patch.object(database, "save_session") as save:
@@ -487,7 +489,7 @@ class TorrentProcessTests(unittest.IsolatedAsyncioTestCase):
 
 
 class HttpDeliveryTests(unittest.IsolatedAsyncioTestCase):
-    async def test_preview_and_head_preserve_token_and_get_consumes_it(self):
+    async def test_preview_head_and_bounded_retries_preserve_file(self):
         from aiohttp import ClientSession
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -509,8 +511,12 @@ class HttpDeliveryTests(unittest.IsolatedAsyncioTestCase):
                         async with client.get(f"{base}/dl/{token}") as response:
                             self.assertEqual(response.status, 200)
                             self.assertEqual(await response.read(), b"payload")
-                        async with client.get(f"{base}/dl/{token}") as response:
-                            self.assertEqual(response.status, 410)
+                        async with client.get(f"{base}/dl/{token}", headers={'Range': 'bytes=3-'}) as response:
+                            self.assertEqual(response.status, 206)
+                            self.assertEqual(await response.read(), b'load')
+                            self.assertEqual(response.headers['Content-Range'], 'bytes 3-6/7')
+                        async with client.get(f"{base}/dl/{token}", headers={'Range': 'bytes=999-'}) as response:
+                            self.assertEqual(response.status, 416)
                 finally:
                     await fileserver.stop()
                     fileserver._registry.clear()

@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""Container healthcheck for the bot and its optional file server."""
+"""Read readiness from the running process, not from a fresh import."""
 
 from http.client import HTTPConnection
+import json
+import os
+import time
 
-import config
-import yt_dlp  # noqa: F401 - verifies that the runtime dependency imports
+from runtime import health_path
 
-
-# Проверяем /health ровно в тех условиях, при которых бот реально поднимает
-# файловый сервер (см. bot._post_init) — то есть когда задан хотя бы один
-# внешний URL раздачи. Раньше сюда входил и quick-tunnel режим: пока cloudflared
-# не отдал URL, PUBLIC_BASE_URL пуст, сервер не стартует, а healthcheck всё
-# равно стучался в порт и навсегда оставлял контейнер unhealthy.
-if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS:
-    connection = HTTPConnection('127.0.0.1', config.HTTP_PORT, timeout=5)
-    try:
-        connection.request('GET', '/health')
-        response = connection.getresponse()
-        if response.status != 200 or response.read(16).strip() != b'ok':
-            raise SystemExit(1)
-    finally:
-        connection.close()
+try:
+    state = json.loads(health_path().read_text())
+    now = time.time()
+    if not 0 <= now - state['heartbeat'] <= 30 or not 0 <= now - state['telegram_ok_at'] <= 120:
+        raise SystemExit(1)
+    os.kill(state['pid'], 0)
+    if state['fileserver']:
+        connection = HTTPConnection('127.0.0.1', state['http_port'], timeout=5)
+        try:
+            connection.request('GET', '/health')
+            response = connection.getresponse()
+            if response.status != 200 or response.read(16).strip() != b'ok':
+                raise SystemExit(1)
+        finally:
+            connection.close()
+except (OSError, ValueError, KeyError):
+    raise SystemExit(1)

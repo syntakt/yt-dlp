@@ -2,9 +2,12 @@ import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import ipaddress
+import json
 import logging
+import os
 import re
 import socket
+import tempfile
 import threading
 import time
 import weakref
@@ -15,6 +18,8 @@ from urllib.parse import urlparse, parse_qs
 
 import yt_dlp
 from yt_dlp.utils import download_range_func
+from media_options import language, playlist_indices, selector, subtitle_text
+from safe_urls import canonical_url
 
 import shutil
 
@@ -243,6 +248,34 @@ def _guard_network():
 class SafeYoutubeDL(yt_dlp.YoutubeDL):
     """Apply the DNS policy at every request, including yt-dlp child threads."""
 
+    def __init__(self, params=None, *args, **kwargs):
+        params = dict(params or {})
+        self._cookie_copy = None
+        if params.get("cookiefile"):
+            self._cookie_copy = tempfile.TemporaryDirectory(prefix="ytdlp-cookies-")
+            target = Path(self._cookie_copy.name) / "cookies.txt"
+            try:
+                shutil.copyfile(params["cookiefile"], target)
+                target.chmod(0o600)
+                params["cookiefile"] = str(target)
+            except BaseException:
+                self._cookie_copy.cleanup()
+                raise
+        try:
+            super().__init__(params, *args, **kwargs)
+        except BaseException:
+            if self._cookie_copy:
+                self._cookie_copy.cleanup()
+            raise
+
+    def close(self):
+        try:
+            super().close()
+        finally:
+            if self._cookie_copy:
+                self._cookie_copy.cleanup()
+                self.params.pop("cookiefile", None)
+
     def urlopen(self, req):
         with _guard_network():
             return super().urlopen(req)
@@ -297,6 +330,7 @@ class FormatInfo:
     filesize: Optional[int]
     tbr: Optional[float]  # total bitrate kbps
     note: str = ""
+    language: str = ""
 
     @property
     def is_video(self) -> bool:
@@ -346,6 +380,9 @@ class VideoInfo:
     # У полей есть дефолты, поэтому старые сессии из БД десериализуются без ошибок.
     chapter_count: int = 0
     is_live: bool = False
+    subtitles: dict = field(default_factory=dict)
+    automatic_subtitles: dict = field(default_factory=dict)
+    playlist_entries: list = field(default_factory=list)
 
     @property
     def duration_str(self) -> str:
@@ -376,6 +413,7 @@ class DownloadResult:
     has_subtitles: bool = False
     # Файлы-части при разбиении по главам (пусто, если разбиения не было)
     parts: list[Path] = field(default_factory=list)
+    streamable: bool = False
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────────────
@@ -407,9 +445,6 @@ def _impersonate_target():
 def _youtube_extractor_args() -> dict:
     """extractor_args для YouTube: PO-токены и выбор клиентов."""
     args: dict[str, list[str]] = {}
-    if POT_PROVIDER_URL:
-        # Плагин bgutil-ytdlp-pot-provider читает базовый URL отсюда
-        args["getpot_bgutil_baseurl"] = [POT_PROVIDER_URL]
     if YOUTUBE_PO_TOKEN:
         args["po_token"] = [t.strip() for t in YOUTUBE_PO_TOKEN.split(",") if t.strip()]
     if YOUTUBE_PLAYER_CLIENT:
@@ -463,6 +498,10 @@ def _base_opts() -> dict:
     yt_args = _youtube_extractor_args()
     if yt_args:
         opts["extractor_args"] = {"youtube": yt_args}
+    if POT_PROVIDER_URL:
+        opts.setdefault("extractor_args", {})["youtubepot-bgutilhttp"] = {
+            "base_url": [POT_PROVIDER_URL],
+        }
     if PROXY_URL:
         opts["proxy"] = PROXY_URL
     if COOKIES_FILE and Path(COOKIES_FILE).exists():
@@ -487,6 +526,8 @@ def _base_opts() -> dict:
         # PP-specific argument lookup and direct ffprobe invocations bypass
         # generic postprocessor_args. All executable paths use these wrappers.
         opts["ffmpeg_location"] = str(Path(__file__).parent / "ffmpeg_guard")
+    if os.environ.get('YTDLP_WORKER_SANDBOX') == '1':
+        opts['ffmpeg_location'] = str(Path(__file__).parent / 'ffmpeg_guard')
     return opts
 
 
@@ -533,6 +574,31 @@ def _redact_url(url: str) -> str:
 
 # ── Info extraction ─────────────────────────────────────────────────────────────
 
+def _apple_show_id(url):
+    public = canonical_url(url)
+    if public and urlparse(public).hostname == 'podcasts.apple.com' and not urlparse(public).query:
+        return re.search(r'/id(\d+)/?$', public).group(1)
+    return None
+
+
+def _apple_playlist(ydl, url):
+    """Apple's public lookup API provides stable episode identifiers, never feed credentials."""
+    show_id = _apple_show_id(url)
+    with ydl.urlopen(f'https://itunes.apple.com/lookup?id={show_id}&entity=podcastEpisode&limit=200') as response:
+        body = response.read(4 * 1024 * 1024 + 1)
+    if len(body) > 4 * 1024 * 1024:
+        raise ValueError('Podcast metadata exceeds size limit')
+    results = json.loads(body).get('results') or []
+    title = str(next((r.get('collectionName') for r in results if r.get('collectionName')), 'Подкаст'))[:200]
+    entries = []
+    for item in results:
+        episode_url = canonical_url(item.get('trackViewUrl') or item.get('episodeUrl') or '')
+        if item.get('kind') == 'podcast-episode' and episode_url and urlparse(episode_url).query:
+            entries.append({'_type': 'url', 'url': episode_url, 'title': str(item.get('trackName') or 'Выпуск')[:150]})
+    return {'_type': 'playlist', 'id': show_id, 'title': title, 'webpage_url': url,
+            'extractor': 'Apple Podcasts', 'entries': entries[:200]}
+
+
 async def get_video_info(url: str) -> VideoInfo:
     """Extract metadata + available formats (no download)."""
     opts = _base_opts()
@@ -544,11 +610,13 @@ async def get_video_info(url: str) -> VideoInfo:
         # уровня, из-за чего у редиректных/обёрточных экстракторов возвращался
         # {"_type": "url"} без formats — меню качества выходило пустым.
         "extract_flat": "in_playlist",
-        "playlistend": MAX_PLAYLIST_ITEMS,
+        "playlistend": 200,
     })
 
     def _extract():
         with _guard_network(), SafeYoutubeDL(opts) as ydl:
+            if _apple_show_id(url):
+                return _apple_playlist(ydl, url)
             return ydl.extract_info(url, download=False)
 
     try:
@@ -570,7 +638,10 @@ async def get_video_info(url: str) -> VideoInfo:
             thumbnail=info.get("thumbnail", ""),
             description="",
             is_playlist=True,
-            playlist_count=len(entries),
+            playlist_count=info.get('playlist_count') or len(entries),
+            playlist_entries=[{'index': i, 'title': str(entry.get('title') or 'Недоступно')[:150],
+                               'url': canonical_url(entry.get('webpage_url') or entry.get('url') or '') or ''}
+                              for i, entry in enumerate(entries, 1) if isinstance(entry, dict)],
             webpage_url=info.get("webpage_url", url),
             extractor=info.get("extractor", ""),
         )
@@ -591,6 +662,10 @@ async def get_video_info(url: str) -> VideoInfo:
         extractor=info.get("extractor", ""),
         chapter_count=len(info.get("chapters") or []),
         is_live=bool(info.get("is_live")),
+        subtitles={key: str((value[0] if value else {}).get('name') or key)[:80]
+                   for key, value in (info.get('subtitles') or {}).items() if language(key)},
+        automatic_subtitles={key: str((value[0] if value else {}).get('name') or key)[:80]
+                             for key, value in (info.get('automatic_captions') or {}).items() if language(key)},
     )
 
 
@@ -644,6 +719,7 @@ def _parse_formats(raw_formats: list) -> list[FormatInfo]:
             filesize=filesize,
             tbr=tbr,
             note=f.get("format_note", ""),
+            language=f.get('language') or '',
         )
 
         if res == "audio only":
@@ -651,7 +727,7 @@ def _parse_formats(raw_formats: list) -> list[FormatInfo]:
             result.append(candidate)
             continue
 
-        dedup_key = (res, ext, vcodec != "none", acodec != "none")
+        dedup_key = (res, ext, vcodec, acodec, candidate.language)
         current = best.get(dedup_key)
         if current is None or (candidate.tbr or 0) > (current.tbr or 0):
             best[dedup_key] = candidate
@@ -746,6 +822,11 @@ async def download_video(
     clip_range: Optional[tuple[float, float]] = None,
     split_chapters: bool = False,
     is_live: bool = False,
+    audio_language: str = '',
+    compatible: bool = False,
+    subtitle_source: str = 'manual',
+    subtitle_format: str = 'embed',
+    sponsorblock: str = 'default',
 ) -> DownloadResult:
     if SSRF_PROTECTION and not TRUST_EXTERNAL_NETWORK_FOR_SSRF and (clip_range or is_live):
         return DownloadResult(success=False, error=(
@@ -758,6 +839,12 @@ async def download_video(
     output_template = str(output_dir / "%(title).80s.%(ext)s")
 
     opts = _base_opts()
+    if subtitle_lang and (not language(subtitle_lang) or subtitle_source not in ('manual', 'auto')):
+        return DownloadResult(success=False, error='Некорректные параметры субтитров')
+    if subtitle_format not in ('embed', 'srt', 'vtt', 'txt'):
+        return DownloadResult(success=False, error='Некорректный формат субтитров')
+    if subtitle_lang and subtitle_format != 'embed':
+        return await download_subtitles(url, output_dir, subtitle_lang, subtitle_source, subtitle_format, cancel_flag)
 
     # Когда ждём прогресс — используем нативный загрузчик yt-dlp:
     # aria2c как внешний загрузчик вызывает progress_hook только при старте/финише,
@@ -781,6 +868,8 @@ async def download_video(
         """
         if cancel_flag and cancel_flag[0]:
             raise _DownloadCancelled("CANCELLED")
+        if (d.get("downloaded_bytes") or 0) > MAX_FILE_SIZE_BYTES:
+            raise _DownloadCancelled("File exceeded download size limit")
         if time.monotonic() >= deadline:
             timed_out[0] = True
             raise _DownloadCancelled("TIMEOUT")
@@ -838,11 +927,17 @@ async def download_video(
         opts["format"] = fmt
         opts["merge_output_format"] = "mp4"
 
+    if audio_language or compatible or (max_height and format_id == 'best'):
+        opts['format'] = selector(format_id, audio_only=audio_only, audio_language=audio_language,
+                                  max_height=max_height, compatible=compatible and not audio_only)
+    if compatible and not audio_only:
+        # Select H.264/AAC instead of silently transcoding an arbitrarily large video.
+        opts.setdefault('postprocessor_args', {})['merger+ffmpeg_o'] = ['-movflags', '+faststart']
     if subtitle_lang:
         opts.update({
-            "writesubtitles": True,
+            "writesubtitles": subtitle_source == 'manual',
             "subtitleslangs": [subtitle_lang],
-            "writeautomaticsub": True,
+            "writeautomaticsub": subtitle_source == 'auto',
         })
 
     # ── Постпроцессоры ────────────────────────────────────────────────────────
@@ -852,7 +947,10 @@ async def download_video(
     # (ModifyChapters обязан идти до Metadata, иначе главы уедут).
     pps: list[dict] = []
     sponsor_categories = ["sponsor", "selfpromo", "interaction"]
-    sponsorblock_on = SPONSORBLOCK_MODE in ("remove", "mark") and not audio_only
+    sponsor_mode = SPONSORBLOCK_MODE if sponsorblock == 'default' else sponsorblock
+    if sponsor_mode not in ('off', 'mark', 'remove'):
+        return DownloadResult(success=False, error='Некорректный режим SponsorBlock')
+    sponsorblock_on = sponsor_mode in ("remove", "mark") and not audio_only
     if sponsorblock_on:
         pps.append({
             "key": "SponsorBlock",
@@ -871,8 +969,8 @@ async def download_video(
     if sponsorblock_on:
         pps.append({
             "key": "ModifyChapters",
-            "remove_sponsor_segments": sponsor_categories if SPONSORBLOCK_MODE == "remove" else [],
-            "force_keyframes": SPONSORBLOCK_MODE == "remove",
+            "remove_sponsor_segments": sponsor_categories if sponsor_mode == "remove" else [],
+            "force_keyframes": sponsor_mode == "remove",
         })
 
     pps.extend(_embed_postprocessors(opts))
@@ -897,7 +995,7 @@ async def download_video(
     if is_live and LIVE_FROM_START:
         opts["live_from_start"] = True
 
-    hooks = [tracker.hook, _cancel_hook]
+    hooks = [_cancel_hook, tracker.hook]
     opts.update({
         "progress_hooks": hooks,
         "postprocessor_hooks": [_cancel_hook],
@@ -915,6 +1013,7 @@ async def download_video(
                 filename = ydl.prepare_filename(info)
                 result_holder["title"] = str(info.get("title") or "")[:200]
                 result_holder["has_subtitles"] = bool(info.get("requested_subtitles"))
+                result_holder['streamable'] = bool(not audio_only and compatible)
                 if audio_only:
                     ext = ".opus" if audio_format == "opus" else ".wav" if audio_format == "wav" else ".mp3"
                     filename = Path(filename).with_suffix(ext)
@@ -1012,7 +1111,51 @@ async def download_video(
         title=result_holder.get("title", ""),
         file_size=file_size,
         has_subtitles=bool(result_holder.get("has_subtitles")),
+        streamable=bool(result_holder.get('streamable')) and file_path.suffix == '.mp4',
     )
+
+
+async def download_subtitles(url, output_dir, subtitle_lang, source, extension, cancel_flag):
+    opts = _base_opts()
+    opts.update(skip_download=True, noplaylist=True, writesubtitles=source == 'manual',
+                writeautomaticsub=source == 'auto', subtitleslangs=[subtitle_lang],
+                subtitlesformat='vtt', outtmpl=str(output_dir / '%(id)s.%(ext)s'))
+    if extension == 'srt':
+        opts['postprocessors'] = [{'key': 'FFmpegSubtitlesConvertor', 'format': 'srt'}]
+    def extract():
+        with _guard_network(), SafeYoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=True)
+    try:
+        await _run_download_worker(extract, output_dir, cancel_flag, DOWNLOAD_TIMEOUT)
+        if cancel_flag and cancel_flag[0]:
+            return DownloadResult(success=False, error='CANCELLED')
+        files = [p for p in output_dir.glob('*.srt' if extension == 'srt' else '*.vtt')
+                 if not p.is_symlink() and p.is_file() and 0 < p.stat().st_size <= 5 * 1024 * 1024]
+        if len(files) != 1:
+            return DownloadResult(success=False, error='Субтитры не найдены или превышают 5 МБ')
+        path = files[0]
+        if extension == 'txt':
+            text = subtitle_text(path.read_text(encoding='utf-8-sig'))
+            path = path.with_suffix('.txt')
+            path.write_text(text, encoding='utf-8')
+        return DownloadResult(success=True, file_path=path, title=path.stem, file_size=path.stat().st_size)
+    except Exception as exc:
+        return DownloadResult(success=False, error=_YDLBotLogger._redact(exc))
+
+
+async def search_videos(query):
+    query = query.strip()
+    if not query or len(query) > 200 or any(ord(char) < 32 for char in query):
+        raise ValueError('Запрос поиска: от 1 до 200 символов')
+    opts = _base_opts()
+    opts.update(skip_download=True, extract_flat=True, playlistend=5)
+    def extract():
+        with _guard_network(), SafeYoutubeDL(opts) as ydl:
+            return ydl.extract_info('ytsearch5:' + query, download=False)
+    info = await asyncio.wait_for(run_blocking(extract), INFO_TIMEOUT)
+    return [{'title': str(entry.get('title') or 'Видео')[:150], 'url': canonical_url(entry.get('url') or '')}
+            for entry in (info.get('entries') or []) if isinstance(entry, dict)
+            and canonical_url(entry.get('url') or '')][:5]
 
 
 async def download_playlist(
@@ -1021,6 +1164,10 @@ async def download_playlist(
     output_dir: Path,
     max_items: int = 10,
     cancel_flag: Optional[list] = None,
+    playlist_items: str = '',
+    max_height: Optional[int] = None,
+    audio_language: str = '',
+    compatible: bool = False,
 ) -> list[DownloadResult]:
     if cancel_flag is None:
         cancel_flag = [False]
@@ -1045,6 +1192,12 @@ async def download_playlist(
         "ignoreerrors": True,  # не прерываем плейлист на недоступном видео
         "max_filesize": MAX_FILE_SIZE_BYTES,
     })
+    if playlist_items:
+        opts.pop('playlistend', None)
+        opts['playlist_items'] = playlist_indices(playlist_items, min(max_items, MAX_PLAYLIST_ITEMS))
+    if max_height or audio_language or compatible:
+        opts['format'] = selector(format_id, audio_only=format_id == 'bestaudio',
+                                  max_height=max_height, audio_language=audio_language, compatible=compatible)
     # Обложки и теги — как у одиночных загрузок, иначе треки из плейлиста
     # приходили бы в Telegram без картинки, а из одиночной загрузки — с ней
     embed_pps = _embed_postprocessors(opts)
@@ -1062,6 +1215,8 @@ async def download_playlist(
     def _deadline_hook(d: dict) -> None:
         if cancel_flag and cancel_flag[0]:
             raise _DownloadCancelled("CANCELLED")
+        if (d.get("downloaded_bytes") or 0) > MAX_FILE_SIZE_BYTES:
+            raise _DownloadCancelled("FILE_SIZE_LIMIT")
         if time.monotonic() >= deadline:
             raise _DownloadCancelled("TIMEOUT")
         now = time.monotonic()
@@ -1078,7 +1233,10 @@ async def download_playlist(
     def _download():
         try:
             with _guard_network(), SafeYoutubeDL(opts) as ydl:
-                ydl.download([url])
+                if _apple_show_id(url):
+                    ydl.process_ie_result(_apple_playlist(ydl, url), download=True)
+                else:
+                    ydl.download([url])
         except _DownloadCancelled as e:
             error_holder["error"] = str(e) or "CANCELLED"
         except Exception as e:
@@ -1098,6 +1256,8 @@ async def download_playlist(
         raise DownloadCancelledError("CANCELLED")
     if error == "DISK_FULL":
         raise RuntimeError("Insufficient free disk space")
+    if error == "FILE_SIZE_LIMIT":
+        raise RuntimeError("File exceeded download size limit")
     if error == "PLAYLIST_TOTAL_LIMIT":
         raise RuntimeError(
             f"Playlist exceeded aggregate limit: {_human_size(MAX_PLAYLIST_TOTAL_BYTES)}"
@@ -1132,6 +1292,7 @@ async def download_playlist(
             file_path=f,
             title=f.stem,
             file_size=size,
+            streamable=compatible and format_id != 'bestaudio' and f.suffix == '.mp4',
         ))
     return results
 
@@ -1220,6 +1381,8 @@ def is_supported_url(url: str) -> bool:
     if SSRF_PROTECTION and _is_ssrf_url(url):
         logger.warning("Blocked SSRF attempt: %s", _redact_url(url))
         return False
+    if _apple_show_id(url):
+        return True
     if _EXTRACTORS is None:
         with _EXTRACTORS_LOCK:
             if _EXTRACTORS is None:

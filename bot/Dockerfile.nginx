@@ -1,9 +1,10 @@
-FROM nginx:1.29.8-alpine
+FROM nginx:1.30.4-alpine
 
 RUN apk add --no-cache certbot openssl
 
 COPY bot/nginx/nginx.conf.template /etc/nginx/templates/nginx.conf.template
 COPY bot/nginx/entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY bot/nginx/renew-certificate.sh /renew-certificate.sh
+RUN chmod +x /entrypoint.sh /renew-certificate.sh
 
 ENTRYPOINT ["/entrypoint.sh"]

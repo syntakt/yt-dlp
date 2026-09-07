@@ -136,7 +136,7 @@ INFO_TIMEOUT = _parse_int("INFO_TIMEOUT", 120, minimum=15, maximum=900)
 PUBLIC_BASE_URL = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
 # Прямая ссылка на сервер (без Cloudflare Tunnel), через nginx-ssl.
 # ТОЛЬКО https:// — ссылка несёт bearer-токен скачивания, validate_config()
-# отклоняет http:// для всего, кроме loopback. Пример: https://1-2-3-4.sslip.io:7443
+# отклоняет http:// для всего, кроме loopback. Пример: https://1-2-3-4.sslip.io:1443
 # Если задан — добавляется кнопка «Прямая ссылка (IP)» в меню доставки.
 DIRECT_BASE_URL = os.environ.get("DIRECT_BASE_URL", "").rstrip("/")
 # Relay-сервер — резервный путь для пользователей с заблокированным Cloudflare/IP.

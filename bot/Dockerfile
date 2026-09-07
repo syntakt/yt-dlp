@@ -3,9 +3,9 @@
 # выпадает из списка по умолчанию, часть форматов пропадает, а сам режим «без
 # рантайма» объявлен deprecated. Берём готовый статический бинарник deno —
 # единственный рантайм, включённый в yt-dlp по умолчанию (npm не нужен).
-FROM denoland/deno:bin-2.9.5 AS deno
+FROM denoland/deno:bin-2.9.6 AS deno
 
-FROM python:3.12.13-slim
+FROM python:3.12.14-slim
 
 # Устанавливаем системные зависимости + gosu для безопасного снижения привилегий
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -52,7 +52,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # добывает PO-токены — лечит «Sign in to confirm you're not a bot» на серверных
 # IP. Сам по себе плагин ничего не делает, пока не задан POT_PROVIDER_URL.
 # Версия плагина обязана совпадать с версией контейнера-провайдера.
-RUN pip install --no-cache-dir bgutil-ytdlp-pot-provider==1.3.1
+# Версия плагина закреплена в requirements.txt вместе с runtime-зависимостями.
 
 # ── Копируем код бота ──────────────────────────────────────────────────────
 COPY bot/telegram_bot/ /app/

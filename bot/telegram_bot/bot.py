@@ -12,6 +12,7 @@ import shutil
 import sqlite3
 import time
 import uuid
+from contextlib import asynccontextmanager
 from dataclasses import asdict
 from datetime import datetime, timezone
 import html as _html
@@ -47,6 +48,13 @@ from telegram.ext import (
 import config
 import database as db
 import fileserver
+import worker_rpc
+import runtime
+import feature_store
+import features
+import media_options
+from safe_urls import canonical_url
+from worker_rpc import download_video, download_work_in_progress, get_video_info, get_thumbnail, download_torrent, fetch_magnet_metadata
 from downloader import (
     DownloadCancelledError,
     DownloadResult,
@@ -55,15 +63,8 @@ from downloader import (
     TorrentMeta,
     VideoInfo,
     disk_has_capacity,
-    download_torrent,
-    download_video,
-    download_work_in_progress,
-    fetch_magnet_metadata,
     get_best_video_formats,
-    get_video_info,
-    get_thumbnail,
     height_from_resolution,
-    is_supported_url,
     parse_torrent_file,
     run_blocking,
     shutdown_executor,
@@ -932,14 +933,10 @@ def _extract_urls(text: str) -> list[str]:
 
 
 async def _filter_supported_urls(urls: list[str], limit: int = 5) -> list[str]:
-    candidates = urls[:limit]
-    # run_blocking, а не asyncio.to_thread: первый вызов инстанциирует ~2000
-    # экстракторов yt-dlp, и держать это в default-пуле asyncio нельзя (там же
-    # выполняется loop.getaddrinfo всего процесса).
-    checks = await asyncio.gather(*(
-        run_blocking(is_supported_url, url) for url in candidates
-    ))
-    return [url for url, supported in zip(candidates, checks) if supported]
+    try:
+        return await worker_rpc.supported_urls(urls[:limit])
+    except (RuntimeError, TimeoutError):
+        return []
 
 
 def _strip_playlist_param(url: str) -> str:
@@ -954,15 +951,8 @@ def _strip_playlist_param(url: str) -> str:
 
 
 def _redact_url_for_storage(url: str) -> str:
-    """Keep history useful without storing credentials, query tokens or fragments."""
-    try:
-        parsed = urlparse(url)
-        netloc = parsed.hostname or ""
-        if parsed.port:
-            netloc = f"{netloc}:{parsed.port}"
-        return urlunparse(parsed._replace(netloc=netloc, query="", fragment=""))
-    except Exception:
-        return "<invalid-url>"
+    """Unknown URLs can carry credentials in paths and even hostnames."""
+    return canonical_url(url) or '<private-source>'
 
 
 def _safe_error_text(error: object) -> str:
@@ -973,42 +963,8 @@ def _safe_error_text(error: object) -> str:
     return re.sub(r'https?://[^\s<>"\']+', "<URL>", text, flags=re.IGNORECASE)
 
 
-_SENSITIVE_QUERY_MARKERS = (
-    "access_token",
-    "auth",
-    "authorization",
-    "credential",
-    "cookie",
-    "jwt",
-    "oauth",
-    "password",
-    "policy",
-    "refresh_token",
-    "secret",
-    "session",
-    "signature",
-    "token",
-)
-
-
 def _session_url_for_storage(url: str) -> Optional[str]:
-    """Return a DB-safe session URL, or None when it likely contains credentials."""
-    try:
-        parsed = urlparse(url)
-        if parsed.username or parsed.password:
-            return None
-
-        for key in parse_qs(parsed.query, keep_blank_values=True):
-            normalized = key.lower().replace("-", "_")
-            if any(marker in normalized for marker in _SENSITIVE_QUERY_MARKERS):
-                return None
-
-        netloc = parsed.hostname or ""
-        if parsed.port:
-            netloc = f"{netloc}:{parsed.port}"
-        return urlunparse(parsed._replace(netloc=netloc, fragment=""))
-    except Exception:
-        return None
+    return canonical_url(url)
 
 
 def _save_session_safe(
@@ -1057,6 +1013,9 @@ async def handle_url(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
     text = update.message.text.strip()
+    feature_ui = ctx.bot_data.get('_features')
+    if feature_ui and await feature_ui.handle_input(update, ctx):
+        return
 
     # Ждём интервал отрывка — тогда это не ссылка, а ответ на запрос бота
     if await _handle_clip_reply(update, ctx, text):
@@ -1544,7 +1503,7 @@ async def _handle_torrent_callback(query, ctx: ContextTypes.DEFAULT_TYPE, token:
                 )
             except TelegramError:
                 pass
-        async with sem:
+        async with _download_slot(sem, cancel_flag):
             if cancel_flag[0]:
                 raise DownloadCancelledError("CANCELLED")
             results = await download_torrent(
@@ -1569,12 +1528,12 @@ async def _handle_torrent_callback(query, ctx: ContextTypes.DEFAULT_TYPE, token:
             await status_msg.edit_text("⚠️ В раздаче не оказалось медиа-файлов для отправки.")
             return
 
-        sent, skipped = await _deliver_results_batch(query.message.chat_id, results, ctx)
+        sent, skipped = await _deliver_results_batch(query.message.chat_id, results, ctx, download_id=dl_id)
         final_status = "partial" if skipped else ("ready" if _has_fileserver() else "done")
         db.update_download(dl_id, title=meta.name, status=final_status)
         summary = f"✅ Торрент обработан. Отправлено файлов: {sent}"
         if skipped:
-            summary += f" (пропущено {skipped} — превышен лимит размера)"
+            summary += f" (пропущено {skipped} — лимит размера или ошибка; готовые файлы доступны в /queue)"
         try:
             await status_msg.edit_text(summary)
             _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
@@ -1645,7 +1604,7 @@ async def _send_link_lines(ctx, chat_id: int, header: str, lines: list[str]) -> 
         await send()
 
 
-async def _deliver_results_batch(chat_id: int, results: list[DownloadResult], ctx) -> tuple[int, int]:
+async def _deliver_results_batch(chat_id: int, results: list[DownloadResult], ctx, download_id=None) -> tuple[int, int]:
     """Доставляет пачку файлов: ссылки файлового сервера одним сообщением или файлы в Telegram.
 
     Используется торрентами и разбиением по главам — оба дают несколько файлов.
@@ -1653,48 +1612,46 @@ async def _deliver_results_batch(chat_id: int, results: list[DownloadResult], ct
     """
     sent = 0
     skipped = 0
-    fs_lines: list[str] = []
-    ttl = config.ttl_label()
-    for r in results:
-        if not (r.success and r.file_path and r.file_path.exists()):
-            continue
-        if r.file_size > config.MAX_FILE_SIZE_BYTES:
+    prepared = []
+    # Register the whole batch before the first network await. Shutdown or a
+    # Telegram outage must not discard files still waiting for their turn.
+    for result in results:
+        if not (result.success and result.file_path and result.file_path.exists()):
             skipped += 1
             continue
+        if result.file_size > config.MAX_FILE_SIZE_BYTES or (
+                not _has_fileserver() and not _fits_telegram(result.file_size)):
+            skipped += 1
+            continue
+        token = fileserver.move_and_register(result.file_path, config.FILE_TTL_SECONDS, download_id=download_id)
+        result.file_path = fileserver.get_entry(token).path
+        prepared.append((result, token))
+    fs_lines = []
+    for result, token in prepared:
         if _has_fileserver():
-            try:
-                token = fileserver.move_and_register(r.file_path, config.FILE_TTL_SECONDS)
-                links: dict[str, str] = {}
-                if config.DIRECT_BASE_URL:
-                    links["server"] = f"{config.DIRECT_BASE_URL}/info/{token}"
-                if config.PUBLIC_BASE_URL:
-                    links["cf"] = f"{config.PUBLIC_BASE_URL}/info/{token}"
-                for i, relay_url in enumerate(config.RELAY_BASE_URLS, 1):
-                    links[f"relay{i}"] = f"{relay_url}/info/{token}"
-                primary = next(iter(links.values()))
-                title = r.title or r.file_path.stem
-                fs_lines.append(
-                    f'{len(fs_lines)+1}. <a href="{_html.escape(primary, quote=True)}">'
-                    f'{_esc(title[:60])}</a>  {_human_size(r.file_size)}'
-                )
-                sent += 1
-                continue
-            except Exception as fs_err:
-                logger.warning("torrent fileserver item failed: %s — fallback TG", fs_err)
-        # Прямая отправка в Telegram
-        if not _fits_telegram(r.file_size):
-            # Telegram отклонит такой файл — не тратим время на заливку
+            base = config.DIRECT_BASE_URL or config.PUBLIC_BASE_URL or config.RELAY_BASE_URLS[0]
+            link = f'{base}/info/{token}'
+            title = result.title or result.file_path.stem
+            fs_lines.append(f'{len(fs_lines)+1}. <a href="{_html.escape(link, quote=True)}">'
+                            f'{_esc(title[:60])}</a>  {_human_size(result.file_size)}')
+            sent += 1
+            continue
+        entry = fileserver.claim(token)
+        if not entry:
             skipped += 1
             continue
         try:
-            await _deliver_file(chat_id, r, ctx.bot)
-            sent += 1
-            await asyncio.sleep(1)
-        except Exception as e:
-            logger.warning("torrent TG delivery failed: %s", _safe_error_text(e))
+            await _deliver_file(chat_id, result, ctx.bot, keep_file=True)
+        except TelegramError as exc:
+            logger.warning('Batch delivery retained for retry: %s', _safe_error_text(exc))
             skipped += 1
+        else:
+            fileserver.unregister(token, delete_file=True)
+            sent += 1
+        finally:
+            fileserver.release(token)
     if fs_lines:
-        header = f"🔗 <b>Ссылки для скачивания</b> (действуют {ttl}):\n"
+        header = f'🔗 <b>Ссылки для скачивания</b> (действуют {config.ttl_label()}):\n'
         await _send_link_lines(ctx, chat_id, header, fs_lines)
     return sent, skipped
 
@@ -1730,6 +1687,7 @@ def _build_quality_menu(info: VideoInfo) -> tuple[str, InlineKeyboardMarkup]:
         label = f"🎥 {f.resolution}{fps_hint} MP4{size_hint}{warn}"
         buttons.append([InlineKeyboardButton(label, callback_data=f"dl:v:{f.format_id}")])
     buttons.append([InlineKeyboardButton("⚡ Лучшее качество (авто)", callback_data="dl:v:best")])
+    buttons.append([InlineKeyboardButton('⚙️ Параметры · языки · авторазмер', callback_data='fx:options')])
     if config.ALLOW_AUDIO:
         buttons.append([InlineKeyboardButton("🎵 Аудио MP3 (192 kbps)", callback_data="dl:a:best")])
         # Альтернативные аудио-форматы объединяем в одну строку
@@ -1741,10 +1699,7 @@ def _build_quality_menu(info: VideoInfo) -> tuple[str, InlineKeyboardMarkup]:
         if _alt_audio:
             buttons.append(_alt_audio)
     if config.ALLOW_SUBTITLES:
-        buttons.append([
-            InlineKeyboardButton("📄 + Субтитры RU", callback_data="dl:s:ru"),
-            InlineKeyboardButton("📄 + Субтитры EN", callback_data="dl:s:en"),
-        ])
+        buttons.append([InlineKeyboardButton('📄 Выбрать субтитры / текст', callback_data='fx:options')])
     _extra: list[InlineKeyboardButton] = []
     if config.ALLOW_CLIPS and _external_network_allowed() and info.duration and not info.is_live:
         _extra.append(InlineKeyboardButton("✂️ Отрывок", callback_data="dl:clip:best"))
@@ -1814,6 +1769,7 @@ async def _show_playlist_menu(msg: Message, info: VideoInfo, ctx: ContextTypes.D
     _pl_max = config.MAX_PLAYLIST_ITEMS
     _pl_half = max(1, _pl_max // 2)
     keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton('⚙️ Выбрать элементы, качество и язык', callback_data='fx:options')],
         [InlineKeyboardButton(f"📥 Первые {_pl_half} видео (лучшее качество)", callback_data=f"pl:{_pl_half}:best")],
         [InlineKeyboardButton(f"📥 Первые {_pl_max} видео (лучшее качество)", callback_data=f"pl:{_pl_max}:best")],
         [InlineKeyboardButton(f"🎵 Только аудио — первые {_pl_half}", callback_data=f"pl:{_pl_half}:audio")],
@@ -1855,6 +1811,9 @@ def _release_download(ctx, user_id: int, chat_id: int, message_id: int) -> None:
 
 
 async def _spawn_update_task(update: Update, ctx, coro, name: str, status_message=None) -> None:
+    if ctx.bot_data.get('_stopping'):
+        coro.close()
+        return
     pending = ctx.bot_data.setdefault("_pending_tasks", {})
     uid = update.effective_user.id
     is_metadata = name.startswith(("metadata_", "magnet_", "refresh_", "resolve_", "deliver_"))
@@ -1870,6 +1829,7 @@ async def _spawn_update_task(update: Update, ctx, coro, name: str, status_messag
     pending[uid] = pending.get(uid, 0) + 1
 
     def finished(_task):
+        ctx.bot_data.get('_update_tasks', set()).discard(_task)
         remaining = pending.get(uid, 1) - 1
         if remaining:
             pending[uid] = remaining
@@ -1878,11 +1838,40 @@ async def _spawn_update_task(update: Update, ctx, coro, name: str, status_messag
 
     try:
         task = ctx.application.create_task(coro, update=update, name=name)
+        ctx.bot_data.setdefault('_update_tasks', set()).add(task)
     except BaseException:
         coro.close()
         finished(None)
         raise
     task.add_done_callback(finished)
+
+
+@asynccontextmanager
+async def _download_slot(sem, cancel_flag):
+    acquired = False
+    try:
+        while not cancel_flag[0]:
+            try:
+                await asyncio.wait_for(sem.acquire(), .2)
+                acquired = True
+                break
+            except asyncio.TimeoutError:
+                continue
+        yield
+    finally:
+        if acquired:
+            sem.release()
+
+
+class ManagedApplication(Application):
+    async def stop(self):
+        self.bot_data['_stopping'] = True
+        tasks = list(self.bot_data.get('_update_tasks', ()))
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await worker_rpc.shutdown()
+        await super().stop()
 
 
 class _MessageQuery:
@@ -2812,6 +2801,9 @@ async def _handle_download_callback(query, ctx, data: str):
         _session_key(query.message.chat_id, query.message.message_id), None
     )
     subtitle_lang = format_id if dl_type == "s" else None
+    user_options = features.options(ctx, query.message, user.id)
+    if not subtitle_lang and config.ALLOW_SUBTITLES:
+        subtitle_lang = user_options['subtitle_language'] or None
     if dl_type == "s":
         # SEC: validate subtitle_lang (callback_data is user-controllable)
         if not subtitle_lang or not re.match(r'^[a-zA-Z]{2,3}(-[a-zA-Z0-9]+)?$', subtitle_lang):
@@ -2845,6 +2837,56 @@ async def _handle_download_callback(query, ctx, data: str):
 
     if clip_range:
         quality_label += f" · отрывок {_fmt_clock(clip_range[0])}–{_fmt_clock(clip_range[1])}"
+
+    max_height = height_from_resolution(fmt_obj.resolution) if fmt_obj else None
+    if format_id == 'best' and not audio_only and user_options['quality'] != 'best':
+        if user_options['quality'] == 'auto':
+            chosen = media_options.auto_format(info, min(config.TELEGRAM_UPLOAD_LIMIT_BYTES, config.MAX_FILE_SIZE_BYTES),
+                                               user_options['audio_language'], user_options['compatible'])
+            if chosen is None:
+                db.update_download(dl_id, status='error', error='no size estimate fits Telegram')
+                await query.message.reply_text('Не удалось надёжно оценить формат под лимит Telegram. Выберите качество вручную.')
+                return
+            format_id, fmt_obj = chosen.format_id, chosen
+            max_height = height_from_resolution(chosen.resolution)
+            quality_label = f'Авто под Telegram: {chosen.resolution} (оценка)'
+        else:
+            max_height = int(user_options['quality'])
+            quality_label = f'До {max_height}p'
+    download_options = {'audio_only': audio_only, 'audio_format': audio_format, 'subtitle_lang': subtitle_lang,
+                        'max_height': max_height, 'clip_range': clip_range, 'split_chapters': split_chapters,
+                        'is_live': info.is_live, 'audio_language': user_options['audio_language'],
+                        'compatible': user_options['compatible'], 'subtitle_source': user_options['subtitle_source'],
+                        'subtitle_format': user_options['subtitle_format'], 'sponsorblock': user_options['sponsorblock']}
+    cache_options = dict(download_options, format_id=format_id,
+                         server_sponsorblock=config.SPONSORBLOCK_MODE, embed_metadata=config.EMBED_METADATA,
+                         embed_thumbnail=config.EMBED_THUMBNAIL, embed_chapters=config.EMBED_CHAPTERS)
+    cache_key = media_options.cache_key(url, cache_options, live=info.is_live,
+                                         cookies=bool(config.COOKIES_FILE) or split_chapters)
+    ready = feature_store.ready_delivery(user.id, cache_key) if user_options['skip_duplicates'] else None
+    if ready:
+        entry = fileserver.get_entry(fileserver.token_for_key(ready['token_key']))
+        if entry:
+            await query.message.reply_text('Этот файл уже готов. Выберите доставку:',
+                reply_markup=InlineKeyboardMarkup(_build_delivery_buttons(ready['download_id'], entry.file_size)))
+            with db.get_connection() as conn:
+                conn.execute("DELETE FROM download_history WHERE id=? AND user_id=? AND status='pending'", (dl_id, user.id))
+            return
+    feature_store.save_job(dl_id, user.id, url, {'data': data, 'options': user_options, 'clip_range': clip_range})
+    cached = feature_store.cached(user.id, cache_key) if user_options['skip_duplicates'] else None
+    if cached and _fits_telegram(cached['size']) and cached['size'] <= config.MAX_FILE_SIZE_BYTES:
+        try:
+            send = getattr(ctx.bot, 'send_' + cached['kind'])
+            await send(query.message.chat_id, **{cached['kind']: cached['file_id']}, caption=info.title[:200])
+            db.update_download(dl_id, title=info.title, status='done', file_size=cached['size'], quality='Повтор из Telegram')
+            return
+        except TelegramError as exc:
+            # Only invalid file identifiers invalidate cache; network errors should remain retryable.
+            if 'file' not in str(exc).lower() and 'identifier' not in str(exc).lower():
+                db.update_download(dl_id, status='error', error='Telegram temporarily unavailable')
+                await query.message.reply_text('Telegram временно недоступен. Повторите отправку позднее.')
+                return
+            feature_store.forget_file(user.id, cache_key)
 
     # Проверяем размер файла ДО начала загрузки (экономит трафик и время).
     # Для форматов без точного filesize оцениваем по TBR × длительность.
@@ -2881,134 +2923,138 @@ async def _handle_download_callback(query, ctx, data: str):
         )
         return
 
-    db.update_download(dl_id, title=info.title, format_id=format_id, quality=quality_label, status="downloading")
+    db.update_download(dl_id, title=info.title, format_id=format_id, quality=quality_label, status="queued")
 
-    cancel_flag = [False]
-    cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]])
-
+    _active_dir = None
+    status_msg = query.message
     try:
-        status_msg = await query.edit_message_text(
-            f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
-            f"Качество: {quality_label}\n\n"
-            "⏳ Пожалуйста, подождите…",
-            parse_mode=ParseMode.HTML,
-            reply_markup=cancel_kb,
-        )
-    except TelegramError:
-        # Фото-сообщение нельзя отредактировать в текст — удаляем и отправляем новое
+        cancel_flag = [False]
+        ctx.bot_data.setdefault('_jobs_live', {})[dl_id] = (user.id, cancel_flag)
+        cancel_kb = InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Отменить", callback_data="cancel")]])
+
         try:
-            await query.message.delete()
+            status_msg = await query.edit_message_text(
+                f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
+                f"Качество: {quality_label}\n\n"
+                "⏳ Пожалуйста, подождите…",
+                parse_mode=ParseMode.HTML,
+                reply_markup=cancel_kb,
+            )
         except TelegramError:
-            pass
-        status_msg = await ctx.bot.send_message(
-            query.message.chat_id,
-            f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
-            f"Качество: {quality_label}\n\n"
-            "⏳ Пожалуйста, подождите…",
-            parse_mode=ParseMode.HTML,
-            reply_markup=cancel_kb,
-        )
+            # Фото-сообщение нельзя отредактировать в текст — удаляем и отправляем новое
+            try:
+                await query.message.delete()
+            except TelegramError:
+                pass
+            status_msg = await ctx.bot.send_message(
+                query.message.chat_id,
+                f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
+                f"Качество: {quality_label}\n\n"
+                "⏳ Пожалуйста, подождите…",
+                parse_mode=ParseMode.HTML,
+                reply_markup=cancel_kb,
+            )
 
-    # Регистрируем флаг отмены по message_id статусного сообщения — у каждой
-    # параллельной загрузки свой флаг, кнопка «Отменить» останавливает именно её.
-    ctx.user_data.setdefault("_cancel_flags", {})[_session_key(status_msg.chat_id, status_msg.message_id)] = cancel_flag
+        # Регистрируем флаг отмены по message_id статусного сообщения — у каждой
+        # параллельной загрузки свой флаг, кнопка «Отменить» останавливает именно её.
+        ctx.user_data.setdefault("_cancel_flags", {})[_session_key(status_msg.chat_id, status_msg.message_id)] = cancel_flag
 
-    async def _on_progress(tracker: ProgressTracker) -> None:
-        if cancel_flag[0]:
-            return
-        if tracker.status == "finished":
-            # Загрузка потока завершена — идёт пост-обработка (FFmpeg).
-            # Для аудио: конвертация в MP3.
-            # Для видео: слияние видео+аудио потоков (fired дважды — после каждого потока).
-            if not audio_only:
-                proc_str = "🔄 Обрабатываю (FFmpeg)..."
-            elif audio_format == "opus":
-                proc_str = "🔄 Извлекаю OPUS..."
-            elif audio_format == "wav":
-                proc_str = "🔄 Конвертирую в WAV..."
+        async def _on_progress(tracker: ProgressTracker) -> None:
+            if cancel_flag[0]:
+                return
+            if tracker.status == "finished":
+                db.update_download(dl_id, status="processing")
+                # Загрузка потока завершена — идёт пост-обработка (FFmpeg).
+                # Для аудио: конвертация в MP3.
+                # Для видео: слияние видео+аудио потоков (fired дважды — после каждого потока).
+                if not audio_only:
+                    proc_str = "🔄 Обрабатываю (FFmpeg)..."
+                elif audio_format == "opus":
+                    proc_str = "🔄 Извлекаю OPUS..."
+                elif audio_format == "wav":
+                    proc_str = "🔄 Конвертирую в WAV..."
+                else:
+                    proc_str = "🔄 Конвертирую в MP3..."
+                try:
+                    await status_msg.edit_text(
+                        f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
+                        f"Качество: {quality_label}\n\n"
+                        f"{proc_str}",
+                        parse_mode=ParseMode.HTML,
+                        reply_markup=cancel_kb,
+                    )
+                except TelegramError:
+                    pass
+                return
+            speed_str = f"{tracker.speed / 1_048_576:.1f} МБ/с" if tracker.speed else "—"
+            if tracker.eta:
+                m, s = divmod(int(tracker.eta), 60)
+                eta_str = f"{m}м {s:02d}с" if m else f"{s}с"
             else:
-                proc_str = "🔄 Конвертирую в MP3..."
+                eta_str = "—"
+            if tracker.total:
+                pct = tracker.downloaded / tracker.total * 100
+                dl_str = f"⏳ {pct:.1f}% • {speed_str} • ETA: {eta_str}"
+            else:
+                # Размер неизвестен (HLS/DASH фрагменты, aria2c) — показываем скачанное
+                dl_str = f"⏳ {_human_size(tracker.downloaded)} • {speed_str}"
+                if eta_str != "—":
+                    dl_str += f" • ETA: {eta_str}"
             try:
                 await status_msg.edit_text(
                     f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
                     f"Качество: {quality_label}\n\n"
-                    f"{proc_str}",
+                    f"{dl_str}",
                     parse_mode=ParseMode.HTML,
                     reply_markup=cancel_kb,
                 )
             except TelegramError:
                 pass
+
+        try:
+            await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
+        except TelegramError:
+            pass
+
+        # Перепривязываем сессию к текущему сообщению (если меню было фото и удалено)
+        try:
+            _save_session_safe(
+                status_msg.chat_id, status_msg.message_id, url, info,
+                user_id=user.id, ctx=ctx,
+            )
+            if _session_msg_id != status_msg.message_id:
+                db.delete_session(_session_chat_id, _session_msg_id, user_id=user.id)
+                _forget_bound_session(ctx, _session_chat_id, _session_msg_id)
+        except Exception as e:
+            logger.warning("re-key session failed: %s", e)
+
+        tmp_dir = config.DOWNLOAD_DIR / f"user_{user.id}" / f"dl_{dl_id}"
+        # MEDIUM-4: ensure tmp_dir is inside DOWNLOAD_DIR before use
+        try:
+            tmp_dir.resolve().relative_to(config.DOWNLOAD_DIR.resolve())
+        except ValueError:
+            logger.error("Download dir path traversal: %s is outside %s", tmp_dir, config.DOWNLOAD_DIR)
+            db.update_download(dl_id, status="error", error="download dir validation failed")
+            ctx.user_data.get("_cancel_flags", {}).pop(_session_key(status_msg.chat_id, status_msg.message_id), None)
+            await query.answer("❌ Внутренняя ошибка.", show_alert=True)
             return
-        speed_str = f"{tracker.speed / 1_048_576:.1f} МБ/с" if tracker.speed else "—"
-        if tracker.eta:
-            m, s = divmod(int(tracker.eta), 60)
-            eta_str = f"{m}м {s:02d}с" if m else f"{s}с"
-        else:
-            eta_str = "—"
-        if tracker.total:
-            pct = tracker.downloaded / tracker.total * 100
-            dl_str = f"⏳ {pct:.1f}% • {speed_str} • ETA: {eta_str}"
-        else:
-            # Размер неизвестен (HLS/DASH фрагменты, aria2c) — показываем скачанное
-            dl_str = f"⏳ {_human_size(tracker.downloaded)} • {speed_str}"
-            if eta_str != "—":
-                dl_str += f" • ETA: {eta_str}"
-        try:
-            await status_msg.edit_text(
-                f"⬇️ Загружаю: <b>{_esc(info.title)}</b>\n"
-                f"Качество: {quality_label}\n\n"
-                f"{dl_str}",
-                parse_mode=ParseMode.HTML,
-                reply_markup=cancel_kb,
-            )
-        except TelegramError:
-            pass
+        # Защищаем каталог от часовой очистки на время загрузки
+        _active_dir = _mark_dir_active(tmp_dir)
+        # Если все слоты заняты — уведомляем пользователя и ждём в очереди.
+        _need_queue = sem.locked()
+        if _need_queue:
+            try:
+                await status_msg.edit_text(
+                    f"⏳ <b>В очереди загрузок</b>\n"
+                    f"{_esc(info.title)}\n\n"
+                    f"Все {config.MAX_CONCURRENT_DOWNLOADS} слота заняты — загрузка начнётся автоматически.",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=cancel_kb,
+                )
+            except TelegramError:
+                pass
 
-    try:
-        await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
-    except TelegramError:
-        pass
-
-    # Перепривязываем сессию к текущему сообщению (если меню было фото и удалено)
-    try:
-        _save_session_safe(
-            status_msg.chat_id, status_msg.message_id, url, info,
-            user_id=user.id, ctx=ctx,
-        )
-        if _session_msg_id != status_msg.message_id:
-            db.delete_session(_session_chat_id, _session_msg_id, user_id=user.id)
-            _forget_bound_session(ctx, _session_chat_id, _session_msg_id)
-    except Exception as e:
-        logger.warning("re-key session failed: %s", e)
-
-    tmp_dir = config.DOWNLOAD_DIR / f"user_{user.id}" / f"dl_{dl_id}"
-    # MEDIUM-4: ensure tmp_dir is inside DOWNLOAD_DIR before use
-    try:
-        tmp_dir.resolve().relative_to(config.DOWNLOAD_DIR.resolve())
-    except ValueError:
-        logger.error("Download dir path traversal: %s is outside %s", tmp_dir, config.DOWNLOAD_DIR)
-        db.update_download(dl_id, status="error", error="download dir validation failed")
-        ctx.user_data.get("_cancel_flags", {}).pop(_session_key(status_msg.chat_id, status_msg.message_id), None)
-        await query.answer("❌ Внутренняя ошибка.", show_alert=True)
-        return
-    # Защищаем каталог от часовой очистки на время загрузки
-    _active_dir = _mark_dir_active(tmp_dir)
-    # Если все слоты заняты — уведомляем пользователя и ждём в очереди.
-    _need_queue = sem.locked()
-    if _need_queue:
-        try:
-            await status_msg.edit_text(
-                f"⏳ <b>В очереди загрузок</b>\n"
-                f"{_esc(info.title)}\n\n"
-                f"Все {config.MAX_CONCURRENT_DOWNLOADS} слота заняты — загрузка начнётся автоматически.",
-                parse_mode=ParseMode.HTML,
-                reply_markup=cancel_kb,
-            )
-        except TelegramError:
-            pass
-
-    try:
-        async with sem:
+        async with _download_slot(sem, cancel_flag):
             if cancel_flag[0]:
                 db.update_download(dl_id, status="cancelled", error="CANCELLED")
                 _unmark_dir_active(_active_dir)
@@ -3032,18 +3078,13 @@ async def _handle_download_callback(query, ctx, data: str):
                     )
                 except TelegramError:
                     pass
+            db.update_download(dl_id, status="downloading")
             try:
                 result: DownloadResult = await download_video(
                     url=url,
                     format_id=format_id,
                     output_dir=tmp_dir,
-                    audio_only=audio_only,
-                    audio_format=audio_format,
-                    subtitle_lang=subtitle_lang,
-                    max_height=height_from_resolution(fmt_obj.resolution) if fmt_obj else None,
-                    clip_range=clip_range,
-                    split_chapters=split_chapters,
-                    is_live=info.is_live,
+                    **download_options,
                     progress_callback=_on_progress,
                     cancel_flag=cancel_flag,
                 )
@@ -3110,7 +3151,7 @@ async def _handle_download_callback(query, ctx, data: str):
                         except OSError:
                             continue
                     sent_count, skipped_count = await _deliver_results_batch(
-                        query.message.chat_id, batch, ctx
+                        query.message.chat_id, batch, ctx, download_id=dl_id
                     )
                     db.update_download(
                         dl_id,
@@ -3121,7 +3162,7 @@ async def _handle_download_callback(query, ctx, data: str):
                     )
                     summary = f"✅ Разбито по главам. Отправлено файлов: {sent_count}"
                     if skipped_count:
-                        summary += f" (пропущено {skipped_count} — превышен лимит размера)"
+                        summary += f" (пропущено {skipped_count} — лимит размера или ошибка; готовые файлы доступны в /queue)"
                     try:
                         await status_msg.edit_text(summary)
                         _schedule_delete(ctx.bot, status_msg.chat_id, status_msg.message_id)
@@ -3130,21 +3171,20 @@ async def _handle_download_callback(query, ctx, data: str):
                     return
 
                 fs_token = None
-                if _has_fileserver():
-                    # Файловый сервер включён — предлагаем выбор доставки.
-                    # Регистрация вынесена в отдельный try: раньше падение
-                    # ЛЮБОГО следующего шага (в т.ч. edit_text по удалённому
-                    # сообщению) удаляло уже скачанный файл и отдавало
-                    # «Неожиданная ошибка» — результат часовой загрузки терялся.
-                    try:
-                        fs_token = fileserver.move_and_register(
-                            result.file_path,
-                            config.FILE_TTL_SECONDS,
-                            download_id=dl_id,
-                        )
-                    except Exception as e:
-                        logger.error("fileserver.move_and_register failed: %s", e)
-                        fs_token = None
+                # Keep every completed file retryable until its TTL.
+                # Регистрация вынесена в отдельный try: раньше падение
+                # ЛЮБОГО следующего шага (в т.ч. edit_text по удалённому
+                # сообщению) удаляло уже скачанный файл и отдавало
+                # «Неожиданная ошибка» — результат часовой загрузки терялся.
+                try:
+                    fs_token = fileserver.move_and_register(
+                        result.file_path,
+                        config.FILE_TTL_SECONDS,
+                        download_id=dl_id,
+                    )
+                except Exception as e:
+                    logger.error("fileserver.move_and_register failed: %s", e)
+                    fs_token = None
 
                 if fs_token:
                     # Привязываем delivery к dl_id (не к глобальному user_data),
@@ -3164,7 +3204,15 @@ async def _handle_download_callback(query, ctx, data: str):
                         "url": url,
                         "file_size": result.file_size,
                         "title": result.title or info.title,
+                        'cache_key': cache_key, 'streamable': result.streamable,
                     }
+                    stored_info = asdict(info)
+                    for field in ('url', 'webpage_url', 'thumbnail'):
+                        stored_info[field] = canonical_url(stored_info.get(field, '')) or ''
+                    db.set_delivery_context(fs_token[:32], json.dumps({
+                        'info': stored_info, 'url': canonical_url(url) or '',
+                        'cache_key': cache_key, 'streamable': result.streamable,
+                    }))
                     ready_text = (
                         f"✅ <b>{_esc(result.title or info.title)}</b>\n"
                         f"📦 {_human_size(result.file_size)}\n"
@@ -3211,9 +3259,10 @@ async def _handle_download_callback(query, ctx, data: str):
                 else:
                     # Прямая отправка в Telegram
                     await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
-                    await _deliver_file_with_progress(
+                    sent_message = await _deliver_file_with_progress(
                         query.message.chat_id, result, ctx.bot, status_msg
                     )
+                    feature_store.remember_file(user.id, cache_key, sent_message)
                     _caption, _keyboard = _build_quality_menu(info)
                     try:
                         await status_msg.edit_text(
@@ -3267,6 +3316,16 @@ async def _handle_download_callback(query, ctx, data: str):
         db.update_download(dl_id, status="cancelled", error="CANCELLED")
         _unmark_dir_active(_active_dir)
         raise
+
+    except Exception as exc:
+        db.update_download(dl_id, status="error", error=_safe_error_text(exc))
+        raise
+
+    finally:
+        ctx.bot_data.get("_jobs_live", {}).pop(dl_id, None)
+
+        _unmark_dir_active(_active_dir)
+        ctx.user_data.get("_cancel_flags", {}).pop(_session_key(status_msg.chat_id, status_msg.message_id), None)
 
 
 async def _notify_link_expiry(bot: Bot, chat_id: int, title: str, info_url: str, token: str, delay: int) -> None:
@@ -3322,6 +3381,24 @@ async def _handle_deliver_callback(query, ctx, data: str):
 
     deliveries = ctx.user_data.get("_deliveries", {})
     pd = deliveries.get(cb_dl_id)
+    if not pd:
+        saved = db.get_delivery(cb_dl_id, query.from_user.id)
+        if saved:
+            context = json.loads(saved['context'])
+            payload = context.get('info')
+            if payload:
+                payload['formats'] = [FormatInfo(**item) for item in payload.get('formats', [])]
+                restored_info = VideoInfo(**payload)
+            else:
+                restored_info = VideoInfo(url='', title=saved['title'] or '', uploader='', duration=0,
+                                          view_count=0, like_count=None, thumbnail='', description='')
+            pd = {'token': fileserver.token_for_key(saved['token_key']), 'dl_id': cb_dl_id,
+                  'info': restored_info, 'url': context.get('url', ''),
+                  'cache_key': context.get('cache_key'), 'streamable': context.get('streamable', False),
+                  'file_size': 0, 'title': saved['title'] or restored_info.title}
+            restored_entry = fileserver.get_entry(pd['token'])
+            if restored_entry:
+                pd['file_size'] = restored_entry.file_size
 
     if not pd:
         await query.answer(
@@ -3377,7 +3454,7 @@ async def _handle_deliver_callback(query, ctx, data: str):
             f"🔗 <b>Ссылка для скачивания ({via_label}):</b>\n"
             f'<a href="{_html.escape(info_url, quote=True)}">{_esc(info_url)}</a>\n\n'
             f"📦 {_human_size(file_size)}\n"
-            f"⏱ Действует <b>{ttl}</b> (удаляется после первого скачивания)\n\n"
+            f"⏱ Действует <b>{ttl}</b> (докачка и повторы доступны до истечения срока)\n\n"
             + _caption
         )
         delivery_message = query.message
@@ -3444,15 +3521,17 @@ async def _handle_deliver_callback(query, ctx, data: str):
             )
             return
 
-        # Снимаем с учёта файлового сервера ДО отправки (чтобы TTL-cleanup не удалил файл)
-        fileserver.unregister(token, delete_file=False)
-        deliveries.pop(cb_dl_id, None)
+        entry = fileserver.claim(token)
+        if not entry:
+            await query.answer('⏳ Файл уже передаётся. Повторите позже.', show_alert=True)
+            return
 
         result = DownloadResult(
             success=True,
             file_path=entry.path,
             title=title,
             file_size=entry.file_size,
+            streamable=pd.get('streamable', False),
         )
 
         try:
@@ -3464,27 +3543,28 @@ async def _handle_deliver_callback(query, ctx, data: str):
                 await ctx.bot.send_chat_action(query.message.chat_id, ChatAction.UPLOAD_DOCUMENT)
             except TelegramError:
                 pass
-            await _deliver_file_with_progress(query.message.chat_id, result, ctx.bot, query.message)
+            sent_message = await _deliver_file_with_progress(query.message.chat_id, result, ctx.bot, query.message, keep_file=True)
+            feature_store.remember_file(query.from_user.id, pd.get('cache_key'), sent_message)
         except asyncio.CancelledError:
-            db.update_download(dl_id, status="cancelled", error="delivery cancelled")
+            db.update_download(dl_id, status="ready", error="delivery interrupted; retry available")
             raise
         except Exception as e:
             safe_error = _safe_error_text(e)
-            logger.error("Telegram delivery failed, cleaning up: %s", safe_error)
-            db.update_download(dl_id, status="error", error=safe_error)
-            await query.answer("❌ Не удалось отправить файл. Скачайте заново.", show_alert=True)
+            logger.error("Telegram delivery failed: %s", safe_error)
+            db.update_download(dl_id, status="ready", error=safe_error)
+            await query.edit_message_text('❌ Не удалось отправить. Файл сохранён — повторите доставку.',
+                                          reply_markup=InlineKeyboardMarkup(_build_delivery_buttons(dl_id, entry.file_size)))
             return
         finally:
-            # The token was removed before the first await, so registry TTL
-            # cleanup cannot collect a failed or cancelled Telegram upload.
-            entry.path.unlink(missing_ok=True)
-            try:
-                entry.path.parent.rmdir()
-            except OSError:
-                pass
+            fileserver.release(token)
 
-        db.update_download(dl_id, status="done")
+        fileserver.unregister(token, delete_file=True)
+        deliveries.pop(cb_dl_id, None)
+        pending = not db.all_delivered(dl_id)
+        db.update_download(dl_id, status="ready" if pending else "done")
         _caption, _keyboard = _build_quality_menu(info)
+        if pending:
+            _caption = "В пачке остались файлы. Продолжить выдачу: /queue\n\n" + _caption
         try:
             await query.message.edit_text(
                 f"✅ <b>{_esc(title)}</b>  {_human_size(entry.file_size)}\n\n" + _caption,
@@ -3525,13 +3605,20 @@ async def _handle_playlist_callback(query, ctx, data: str):
     if not info or not url:
         await query.edit_message_text("❌ Сессия истекла.")
         return
+    user_options = features.options(ctx, query.message, user.id)
+    playlist_items = ctx.user_data.get('_playlist_items', {}).get((query.message.chat_id, query.message.message_id), '')
+    if playlist_items:
+        playlist_items = media_options.playlist_indices(playlist_items, max_items)
+    height = user_options['quality']
+    max_height = 480 if height == 'auto' else int(height) if height.isdigit() else None
     dl_id = db.add_download(user.id, _redact_url_for_storage(url))
+    feature_store.save_job(dl_id, user.id, url, {'data': data, 'options': user_options, 'playlist_items': playlist_items})
     db.update_download(
         dl_id,
         title=info.title,
         format_id="bestaudio" if audio_only else "best",
         quality="Аудио" if audio_only else "Лучшее качество",
-        status="downloading",
+        status="queued",
     )
 
     if not disk_has_capacity(config.DOWNLOAD_DIR):
@@ -3541,22 +3628,25 @@ async def _handle_playlist_callback(query, ctx, data: str):
         )
         return
 
-    cancel_flag = [False]
-    cancel_kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("🛑 Отменить", callback_data="cancel")
-    ]])
-
-    status_msg = await query.edit_message_text(
-        f"⬇️ Загружаю плейлист: <b>{_esc(info.title)}</b>\n"
-        f"До {max_items} видео\n\n⏳ Это может занять несколько минут…",
-        parse_mode=ParseMode.HTML,
-        reply_markup=cancel_kb,
-    )
-    ctx.user_data.setdefault("_cancel_flags", {})[_session_key(status_msg.chat_id, status_msg.message_id)] = cancel_flag
-
     tmp_dir = config.DOWNLOAD_DIR / f"user_{user.id}" / f"pl_{dl_id}"
-    _active_dir = _mark_dir_active(tmp_dir)
+    _active_dir = None
+    status_msg = query.message
     try:
+        cancel_flag = [False]
+        ctx.bot_data.setdefault("_jobs_live", {})[dl_id] = (user.id, cancel_flag)
+        cancel_kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("🛑 Отменить", callback_data="cancel")
+        ]])
+
+        status_msg = await query.edit_message_text(
+            f"⬇️ Загружаю плейлист: <b>{_esc(info.title)}</b>\n"
+            f"До {max_items} видео\n\n⏳ Это может занять несколько минут…",
+            parse_mode=ParseMode.HTML,
+            reply_markup=cancel_kb,
+        )
+        ctx.user_data.setdefault("_cancel_flags", {})[_session_key(status_msg.chat_id, status_msg.message_id)] = cancel_flag
+
+        _active_dir = _mark_dir_active(tmp_dir)
         sem: asyncio.Semaphore = ctx.bot_data["_download_sem"]
         if sem.locked():
             await status_msg.edit_text(
@@ -3566,15 +3656,18 @@ async def _handle_playlist_callback(query, ctx, data: str):
                 parse_mode=ParseMode.HTML,
                 reply_markup=cancel_kb,
             )
-        async with sem:
+        async with _download_slot(sem, cancel_flag):
             if cancel_flag[0]:
                 raise DownloadCancelledError("CANCELLED")
-            from downloader import download_playlist
+            db.update_download(dl_id, status="downloading")
+            from worker_rpc import download_playlist
             results = await download_playlist(
                 url=url,
                 format_id="bestaudio" if audio_only else "best",
                 output_dir=tmp_dir,
                 max_items=max_items,
+                playlist_items=playlist_items, max_height=max_height,
+                audio_language=user_options['audio_language'], compatible=user_options['compatible'],
                 cancel_flag=cancel_flag,
             )
 
@@ -3593,88 +3686,21 @@ async def _handle_playlist_callback(query, ctx, data: str):
                 )
             return
 
-        sent = 0
-        skipped = 0
-        fs_links: list[tuple[str, str, dict[str, str]]] = []  # (title, size_str, channel -> url)
+        sent, skipped = await _deliver_results_batch(query.message.chat_id, results, ctx, download_id=dl_id)
 
-        for r in results:
-            if r.success and r.file_path and r.file_path.exists():
-                # Без файлового сервера файл уходит в Telegram, поэтому потолок
-                # здесь — минимум из MAX_FILE_SIZE_BYTES и лимита загрузки Telegram
-                size_cap = (
-                    config.MAX_FILE_SIZE_BYTES if _has_fileserver()
-                    else min(config.MAX_FILE_SIZE_BYTES, config.TELEGRAM_UPLOAD_LIMIT_BYTES)
-                )
-                if r.file_size <= size_cap:
-                    if _has_fileserver():
-                        # Файловый сервер включён — регистрируем файл и собираем ссылки.
-                        # move_and_register перемещает файл из tmp_dir → папку fileserver,
-                        # поэтому shutil.rmtree в finally не затронет его.
-                        try:
-                            token = fileserver.move_and_register(
-                                r.file_path, config.FILE_TTL_SECONDS
-                            )
-                            # Собираем ссылки через все доступные каналы
-                            item_links: dict[str, str] = {}
-                            if config.DIRECT_BASE_URL:
-                                item_links["server"] = f"{config.DIRECT_BASE_URL}/info/{token}"
-                            if config.PUBLIC_BASE_URL:
-                                item_links["cf"] = f"{config.PUBLIC_BASE_URL}/info/{token}"
-                            for relay_idx, relay_url in enumerate(config.RELAY_BASE_URLS, 1):
-                                item_links[f"relay{relay_idx}"] = f"{relay_url}/info/{token}"
-                            fs_links.append((
-                                r.title or r.file_path.stem,
-                                _human_size(r.file_size),
-                                item_links,
-                            ))
-                        except Exception as fs_err:
-                            logger.warning("fileserver playlist item failed: %s — fallback to TG", fs_err)
-                            if not _fits_telegram(r.file_size):
-                                skipped += 1
-                                continue
-                            await _deliver_file(query.message.chat_id, r, ctx.bot)
-                    else:
-                        await _deliver_file(query.message.chat_id, r, ctx.bot)
-                    sent += 1
-                    await asyncio.sleep(1)
-                else:
-                    skipped += 1
-
-        # Отправляем все ссылки одним сообщением (только в режиме файлового сервера)
-        if fs_links:
-            lines = [f"🔗 <b>Ссылки для скачивания</b> (действуют {config.ttl_label()}):\n"]
-            for i, (title, size_str, item_links) in enumerate(fs_links, 1):
-                # Основная ссылка (первая доступная)
-                primary_url = next(iter(item_links.values()))
-                lines.append(f'{i}. <a href="{_html.escape(primary_url, quote=True)}">{_esc(title[:60])}</a>  {size_str}')
-                # Дополнительные каналы доставки
-                alt_parts: list[str] = []
-                if "server" in item_links:
-                    alt_parts.append(f'<a href="{_html.escape(item_links["server"], quote=True)}">сервер</a>')
-                if "cf" in item_links:
-                    alt_parts.append(f'<a href="{_html.escape(item_links["cf"], quote=True)}">CF</a>')
-                relay_keys = sorted(
-                    (k for k in item_links if k.startswith("relay")),
-                    key=lambda k: int(k.removeprefix("relay") or "0"),
-                )
-                for relay_key in relay_keys:
-                    alt_parts.append(f'<a href="{_html.escape(item_links[relay_key], quote=True)}">{relay_key}</a>')
-                if len(alt_parts) > 1:
-                    lines.extend(f"   └ {part}" for part in alt_parts)
-            await _send_link_lines(ctx, query.message.chat_id, lines[0] + "\n", lines[1:])
-
-        expected = min(max_items, info.playlist_count) if info.playlist_count else max_items
+        expected = len(playlist_items.split(",")) if playlist_items else (
+            min(max_items, info.playlist_count) if info.playlist_count else len(results))
         is_partial = skipped > 0 or sent < expected
         if is_partial:
             final_status = "partial"
-        elif fs_links:
+        elif not db.all_delivered(dl_id):
             final_status = "ready"
         else:
             final_status = "done"
         db.update_download(dl_id, title=info.title, status=final_status)
         summary = f"✅ Плейлист обработан. Доступно: {sent}/{expected}"
         if skipped:
-            summary += f" (пропущено {skipped} — превышен лимит размера)"
+            summary += f" (пропущено {skipped} — лимит размера или ошибка; готовые файлы доступны в /queue)"
         # Редактируем статусное сообщение, а не шлём новое рядом с ним
         try:
             await status_msg.edit_text(summary)
@@ -3688,6 +3714,9 @@ async def _handle_playlist_callback(query, ctx, data: str):
             await status_msg.edit_text("⛔ Загрузка плейлиста отменена.")
         except TelegramError:
             pass
+    except asyncio.CancelledError:
+        db.update_download(dl_id, status="cancelled", error="CANCELLED")
+        raise
     except Exception as e:
         err_str = _safe_error_text(e)
         logger.error("Playlist error: %s", err_str)
@@ -3709,6 +3738,7 @@ async def _handle_playlist_callback(query, ctx, data: str):
                 ctx, query.message.chat_id, user_msg, parse_mode=ParseMode.HTML,
             )
     finally:
+        ctx.bot_data.get("_jobs_live", {}).pop(dl_id, None)
         _unmark_dir_active(_active_dir)
         ctx.user_data.get("_cancel_flags", {}).pop(_session_key(status_msg.chat_id, status_msg.message_id), None)
         if not download_work_in_progress(tmp_dir):
@@ -3716,54 +3746,37 @@ async def _handle_playlist_callback(query, ctx, data: str):
 
 
 async def _deliver_file(chat_id: int, result: DownloadResult, bot: Bot, keep_file: bool = False):
-    """Отправляет файл напрямую через Telegram Bot API.
-
-    Используется в двух случаях:
-    - Режим Telegram API (LOCAL_API_SERVER): локальный сервер читает файл
-      с диска через общий том — нет ограничения 50 МБ, лимит до 2 ГБ.
-    - Режим файлового сервера: вызывается только когда пользователь выбрал
-      «📤 Отправить в Telegram» в _handle_deliver_callback() или при ошибке
-      fileserver.move_and_register(). Регистрация в fileserver и выдача
-      ссылок происходит в _handle_download_callback() / _handle_playlist_callback().
-    """
+    """Send compatible MP4 as video; retain the file whenever delivery fails."""
+    from telegram.error import BadRequest
     fp = result.file_path
     caption = f"📁 {fp.stem[:200]}  ({_human_size(result.file_size)})"
-    is_audio = fp.suffix.lower() in (".mp3", ".ogg", ".m4a", ".flac", ".wav", ".opus", ".aac")
+    kind = 'video' if result.streamable and fp.suffix.lower() == '.mp4' else (
+        'audio' if fp.suffix.lower() in ('.mp3', '.m4a') else 'document')
 
+    async def send(value):
+        kwargs = {'supports_streaming': True} if kind == 'video' else {}
+        return await getattr(bot, 'send_' + kind)(chat_id, **{kind: value}, caption=caption, **kwargs)
+
+    message = None
     if config.LOCAL_API_SERVER:
-        # local_mode=True: передаём абсолютный путь — локальный Bot API сервер
-        # читает файл напрямую с диска через общий том /downloads.
-        # Если API сервер не может stat() файл (например, права доступа),
-        # падаем на чтение содержимого через bot-контейнер (fallback).
-        fp_path = fp.resolve()
         try:
-            if is_audio:
-                await bot.send_audio(chat_id, audio=fp_path, caption=caption)
-            else:
-                await bot.send_document(chat_id, document=fp_path, caption=caption)
-            if not keep_file:
-                fp.unlink(missing_ok=True)
-            return
-        except TelegramError as exc:
-            exc_lower = str(exc).lower()
-            # Если ошибка связана с доступом к файлу (stat, path, bad request) —
-            # fallback на прямую загрузку через multipart (бот читает файл сам).
-            # Иначе пробрасываем (ошибка сети, невалидный токен и т.д.)
-            if not any(kw in exc_lower for kw in ("stat", "bad request", "find", "path", "file")):
+            message = await send(fp.resolve())
+        except BadRequest:
+            # Retry via multipart; an inaccessible local path must not lose the file.
+            pass
+    if message is None:
+        try:
+            with fp.open('rb') as fh:
+                message = await send(InputFile(fh, filename=fp.name, read_file_handle=False))
+        except BadRequest:
+            if kind != 'video':
                 raise
-            logger.warning(
-                "_deliver_file: local API can't access file (%s), falling back to direct upload", exc
-            )
-            # Продолжаем ниже — читаем файл и шлём как multipart
-
-    with fp.open("rb") as fh:
-        if is_audio:
-            await bot.send_audio(chat_id, audio=InputFile(fh, filename=fp.name, read_file_handle=False), caption=caption)
-        else:
-            await bot.send_document(chat_id, document=InputFile(fh, filename=fp.name, read_file_handle=False), caption=caption)
-
+            with fp.open('rb') as fh:
+                message = await bot.send_document(chat_id, document=InputFile(fh, filename=fp.name,
+                                                  read_file_handle=False), caption=caption)
     if not keep_file:
         fp.unlink(missing_ok=True)
+    return message
 
 
 async def _deliver_file_with_progress(
@@ -3771,6 +3784,7 @@ async def _deliver_file_with_progress(
     result: DownloadResult,
     bot: Bot,
     status_msg: Message,
+    keep_file: bool = False,
 ) -> None:
     """Обёртка над _deliver_file: каждые 3 с обновляет статусное сообщение
     с анимированным спиннером и таймером, чтобы пользователь видел прогресс."""
@@ -3805,7 +3819,7 @@ async def _deliver_file_with_progress(
 
     spin_task = asyncio.create_task(_spin())
     try:
-        await _deliver_file(chat_id, result, bot)
+        return await _deliver_file(chat_id, result, bot, keep_file=keep_file)
     finally:
         stop_event.set()
         spin_task.cancel()
@@ -4156,7 +4170,9 @@ async def _post_init(application) -> None:
     )
 
     # Файловый HTTP-сервер: запускается если задан любой внешний URL раздачи.
-    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS:
+    runtime.refresh_tunnel()
+    enable_http = bool(config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS or runtime.QUICK_TUNNEL)
+    if enable_http:
         await fileserver.start(port=config.HTTP_PORT)
         urls = []
         if config.PUBLIC_BASE_URL:
@@ -4170,7 +4186,13 @@ async def _post_init(application) -> None:
             config.HTTP_PORT, " | ".join(urls),
         )
     else:
+        fileserver._restore_registry()
+        _spawn_bg(fileserver._cleanup_loop(), name='delivery_cleanup')
         logger.info("URL раздачи файлов не заданы — файловый сервер отключён")
+
+    _spawn_bg(runtime.monitor(application, enable_http), name='runtime_health')
+    if application.bot_data.get('_features'):
+        _spawn_bg(application.bot_data['_features'].monitor(application), name='subscriptions')
 
     task = asyncio.create_task(_cleanup_loop(application.bot))
     application.bot_data["_cleanup_task"] = task
@@ -4181,6 +4203,12 @@ async def _post_init(application) -> None:
             BotCommand("start",   "Главное меню"),
             BotCommand("menu",    "Все команды"),
             BotCommand("history", "История загрузок"),
+            BotCommand('settings', 'Мои настройки загрузки'),
+            BotCommand('queue', 'Очередь, доставка и повтор'),
+            BotCommand('retry', 'Повторить загрузку по номеру'),
+            BotCommand('search', 'Поиск видео на YouTube'),
+            BotCommand('subscribe', 'Подписаться на новые выпуски'),
+            BotCommand('subscriptions', 'Управление подписками'),
             BotCommand("status",  "Статус бота"),
             BotCommand("cancel",  "Отменить загрузку"),
             BotCommand("clean",   "Очистить чат от сообщений бота"),
@@ -4204,8 +4232,7 @@ async def _post_shutdown(application) -> None:
         except asyncio.CancelledError:
             pass
     # Останавливаем файловый сервер
-    if config.PUBLIC_BASE_URL or config.DIRECT_BASE_URL or config.RELAY_BASE_URLS:
-        await fileserver.stop()
+    await fileserver.stop()
     shutdown_executor()
     db.close_connection()
 
@@ -4310,6 +4337,8 @@ def main():
 
     builder = (
         Application.builder()
+        .application_class(ManagedApplication)
+        .concurrent_updates(8)
         .token(config.BOT_TOKEN)
         .post_init(_post_init)
         .post_shutdown(_post_shutdown)
@@ -4347,6 +4376,8 @@ def main():
         ))
 
     app = builder.build()
+    import sys
+    features.Features(sys.modules[__name__]).install(app)
 
     # Команды
     app.add_handler(CommandHandler("start", cmd_start))

@@ -49,7 +49,7 @@ nano .env
 ### 4. Create data directories
 
 ```bash
-mkdir -p bot/data/downloads bot/data/db
+mkdir -p data/downloads data/db
 ```
 
 ### 5. Build & run
@@ -137,7 +137,7 @@ All settings are in `.env` (see `.env.example`):
 | `ALLOW_CLIPS` / `MAX_CLIP_SECONDS` | `true` / `7200` | «✂️ Отрывок» button: download a time range |
 | `ALLOW_SPLIT_CHAPTERS` | `false` | «🔖 По главам» button: split video into per-chapter files |
 | `FS_RATE_LIMIT` | `30` | File-server requests per client IP per minute |
-| `FS_TRUSTED_PROXY_CIDRS` | `10.10.2.0/24,127.0.0.1/32,::1/128` | Proxies whose client-IP headers are trusted. Adding relay IPs here does **not** help: nginx-ssl is the bot's peer and it overwrites `X-Real-IP` with the relay address, so a whole relay shares one bucket. Use nginx's `realip` module on nginx-ssl, or raise `FS_RATE_LIMIT` |
+| `FS_TRUSTED_PROXY_CIDRS` | `10.10.2.4/32,10.10.2.5/32,127.0.0.1/32,::1/128` | Proxies whose client-IP headers are trusted. Adding relay IPs here does **not** help: nginx-ssl is the bot's peer and it overwrites `X-Real-IP` with the relay address, so a whole relay shares one bucket. Use nginx's `realip` module on nginx-ssl, or raise `FS_RATE_LIMIT` |
 | `PROXY_URL` | — | HTTP/SOCKS5 proxy URL |
 | `COOKIES_FILE` | — | Path to Netscape cookies file |
 | `ENABLE_CLOUDFLARED` | `false` | Start Cloudflare Tunnel container via `deploy.sh`; keep `false` to skip cloudflared entirely |
@@ -290,33 +290,78 @@ enforced by several layers:
 Verify: `docker exec ytdlp-bot ss -ltnp` (port bound only to the container IP);
 `nmap -Pn -p 51413 <server_ip>` from outside during an active download → filtered.
 
-### Outbound SSRF hardening (required when enabling torrents)
+### Исходящий трафик и изоляция обработчиков
 
-`aria2c` is a **subprocess** and does **not** inherit the Python SSRF guard used
-for yt-dlp. Peer/tracker IPs from a malicious torrent could point at internal
-services (e.g. `telegram-bot-api` at `10.10.2.3`, the host gateway). The bot
-rejects trackers that resolve to non-public IPs, but it cannot filter peer IPs —
-so you **must** block the container's access to private ranges with host nftables
-egress rules. Add this in the `forward` chain **before** the generic
-`docker_nets accept`:
+Для обработки медиа требуется Linux с Landlock ABI 3 или новее (обычно ядро
+5.19+ с включённым Landlock). Политика устанавливается до запуска потоков и
+наследуется дочерними процессами. На неподдерживаемом ядре/при запрете syscall
+обработка завершается с ошибкой; не отключайте seccomp целиком для обхода этой
+проверки. Обновите ядро или используйте профиль seccomp, допускающий только
+нужные Landlock syscalls. Основной бот и БД не передаются worker-процессу;
+FFmpeg получает доступ только к файлам текущей операции и системным библиотекам.
 
-```nft
-define YTDLP_IP  = 10.10.2.2
-define TG_API_IP = 10.10.2.3
+Landlock здесь ограничивает файловую систему, а не IP-адреса. Python SSRF guard
+проверяет DNS-ответы и редиректы нативного загрузчика. Внешние `aria2c`, FFmpeg
+с сетевыми входами, сторонний прокси и curl impersonation требуют отдельной
+проверенной границы исходящего трафика. Без неё оставьте `TRUST_*_FOR_SSRF=false`;
+торренты, clips/live и соответствующие способы обхода Python guard ограничены
+по умолчанию.
 
-# Allow only the internal service the bot legitimately needs:
-ip saddr $YTDLP_IP ip daddr $TG_API_IP tcp dport 8081 accept
-# Block the container from reaching ANY private range (SSRF pivot defense):
-ip saddr $YTDLP_IP ip daddr { 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, \
-    127.0.0.0/8, 169.254.0.0/16, 100.64.0.0/10 } \
-    counter log prefix "[nft] ytdlp->private BLOCKED " drop
-# Public internet keeps working through the existing MASQUERADE/accept rules.
-# The torrent port is NOT forwarded: no ports:, no DNAT.
-```
+При включении внешних загрузчиков используйте отдельное сетевое окружение
+без доступа к Bot API, хосту, соседним контейнерам и metadata endpoints.
+Проверяйте одновременно IPv4 и IPv6, host INPUT и FORWARD, loopback и
+same-bridge traffic. Правила только в IPv4 FORWARD не покрывают эти случаи.
+Разрешение Bot API для всего контейнера не изолирует от него aria2c из того же
+контейнера; разделите сетевые окружения управляющего процесса и загрузчика.
 
-Verify: `docker exec ytdlp-bot sh -c 'wget -qO- http://10.10.2.3:8081; echo rc=$?'`
-should be blocked (nft log line appears), while `wget -qO- https://ifconfig.me`
-still works.
+Compose не устанавливает правила nftables на хосте. После настройки проверьте
+запрет private/link-local/loopback/CGNAT/multicast и IPv6 ULA из окружения
+внешнего загрузчика; доступ управляющего процесса к Bot API, напротив, должен
+сохраниться. Проверка общедоступного HTTPS-источника должна проходить.
+POT-провайдер допускается только по отдельному внутреннему адресу/порту и
+никогда не публикуется наружу.
+
+### Продление TLS-сертификатов
+
+Продление выполняется **вручную**; фонового renewal loop нет. Первый выпуск
+при старте по-прежнему управляется `ENABLE_CERTBOT`.
+
+1. На время процедуры направьте внешний TCP/80 на `10.10.2.5:80` и разрешите
+   этот DNAT в FORWARD для серверов ACME независимо от ASN. Уберите конфликтующее
+   правило DNAT порта 80 на другой Nginx. Если есть общий HTTP frontend,
+   можно направить только `/.well-known/acme-challenge/` к этому контейнеру.
+2. Проверьте маршрут и тестовое продление:
+   `docker compose --profile ssl exec nginx-ssl /renew-certificate.sh --dry-run`.
+3. Выполните продление:
+   `docker compose --profile ssl exec nginx-ssl /renew-certificate.sh`.
+   Скрипт устанавливает сертификат из Certbot, проверяет конфигурацию и
+   перечитывает её в Nginx. Приватный ключ не выводится.
+4. Проверьте сертификат с клиентской стороны и восстановите обычный маршрут
+   порта 80, если открывали его временно.
+
+Healthcheck требует не менее семи дней до истечения сертификата. Статус
+`unhealthy` сам по себе не продлевает сертификат и не перезапускает контейнер.
+Самоподписанный fallback не заменяет доверенный сертификат для пользователей.
+Требования проверки: [HTTP-01, Let's Encrypt](https://letsencrypt.org/docs/challenge-types/#http-01-challenge).
+
+Если nftables использует `1443 → 10.10.2.5:1443`, задайте `HTTPS_PORT=1443` и
+`DIRECT_BASE_URL=https://<домен>:1443`. Это значение по умолчанию совпадает с конфигурацией проекта. При переопределении
+порта изменяйте обе стороны согласованно.
+
+### Повторная доставка и диагностика
+
+Готовые файлы, владелец и состояние доставки сохраняются в SQLite. Ссылки живут
+до TTL, поддерживают HTTP Range и одно одновременное соединение на токен.
+Ограничение повторов: 16 запросов и суммарный бюджет до трёх размеров файла;
+в бюджет входит зарезервированный ответ даже при обрыве. Telegram-доставка
+после ошибки сохраняет файл для повторной попытки, успешная — удаляет его.
+Сохраняйте постоянный SERVER_SECRET, чтобы старые ссылки переживали рестарт.
+
+Quick Tunnel публикует `ready_url` только при готовом соединении; бот обновляет
+адрес во время работы. Старый адрес перестаёт предлагаться при потере lease.
+Для постоянного сервиса удобнее named tunnel. Healthcheck читает heartbeat
+основного процесса и проверяет доступность Bot API; при включённом fileserver
+дополнительно проверяется его HTTP health.
 
 ### `.torrent` file uploads
 
@@ -367,3 +412,39 @@ a separate opt-in: set `ENABLE_CLOUDFLARE_QUICK_TUNNEL=true` and leave
 `CLOUDFLARE_TUNNEL_TOKEN` empty. If you serve files through manually configured
 nginx/direct HTTPS, keep both flags `false` and use `DIRECT_BASE_URL` or
 `RELAY_BASE_URLS`.
+
+### Настройки, поиск и очередь
+
+Кнопка «Параметры» под ссылкой открывает выбор языка аудио, авторских или
+автоматических субтитров, формата SRT/VTT/TXT либо встраивания в видео.
+Профиль «Плеер MP4» выбирает H.264/AAC; если источник не предлагает такой
+профиль, выберите обычный режим. Подходящее видео отправляется через плеер
+Telegram с поддержкой потокового воспроизведения; при отказе API — документом.
+
+`/settings` показывает сохранённые настройки и допустимые значения.
+Например: `/settings quality auto`, `/settings audio_language ru`,
+`/settings compatible on`. Ручной выбор качества под видео имеет приоритет
+над качеством по умолчанию. Авто оценивает общий размер видео и аудио с запасом;
+фактический размер проверяется отдельно, оценка не гарантирует размер результата.
+В плейлисте можно выбрать номера и диапазоны из первых 200 элементов,
+например `1,3,7-10`; действует серверный лимит числа элементов и общего размера.
+
+`/queue` показывает активные задания и архив, позиции ожидания, отмену,
+готовые доставки и повтор. `/retry <номер>` восстанавливает сохранённые
+параметры публичной ссылки. После перезапуска незавершённые загрузки отмечаются
+прерванными: повтор запускается пользователем. Готовые файлы доступны до TTL.
+Параметры ссылок с авторизацией не сохраняются; их нужно отправить заново.
+
+Уже готовый файл предлагается повторно без скачивания. Успешная отправка в
+Telegram сохраняет `file_id` на семь дней (до 200 записей на пользователя).
+Кэш учитывает все параметры обработки и владельца; не используется для эфиров,
+глав, неизвестных приватных URL и при включённых cookies.
+`/settings skip_duplicates off` принудительно загружает источник заново.
+
+`/search <запрос>` ищет до пяти видео на YouTube и открывает обычное меню
+загрузки. `/subscribe <URL>` в личном чате включает уведомления о новых
+выпусках канала/плейлиста YouTube или Apple Podcasts. Максимум три подписки
+на пользователя и 500 на сервер, проверка каждые шесть часов, до пяти ссылок
+за проверку. Старые выпуски при подписке пропускаются; автоматической загрузки
+и массовой рассылки нет. `/subscriptions` позволяет удалить подписку.
+Apple Podcasts использует [публичный lookup API Apple](https://performance-partners.apple.com/resources/documentation/itunes-store-web-service-search-api/).

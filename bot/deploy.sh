@@ -38,28 +38,19 @@ show_source_freshness() {
 }
 
 read_env_value() {
-    local key="$1"
-    local line value
-
+    # Let Compose handle quoting, interpolation, comments and duplicate keys.
+    # Only these non-secret switches may be returned; never dump the environment.
+    local key="$1" line
+    case "$key" in
+        COMPOSE_PROFILES|ENABLE_CLOUDFLARED|ENABLE_CLOUDFLARE_QUICK_TUNNEL|ENABLE_POT_PROVIDER) ;;
+        *) return 1 ;;
+    esac
     [ -f .env ] || return 0
-    while IFS= read -r line || [ -n "$line" ]; do
-        line="${line#"${line%%[![:space:]]*}"}"
+    docker compose config --environment | while IFS= read -r line; do
         case "$line" in
-            ""|\#*) continue ;;
-            export\ *) line="${line#export }" ;;
+            "$key="*) printf '%s' "${line#*=}" ;;
         esac
-        case "$line" in
-            "$key="*)
-                value="${line#*=}"
-                case "$value" in
-                    \"*\") value="${value#\"}"; value="${value%\"}" ;;
-                    \'*\') value="${value#\'}"; value="${value%\'}" ;;
-                esac
-                printf '%s' "$value"
-                return 0
-                ;;
-        esac
-    done < .env
+    done
 }
 
 is_true() {
@@ -90,7 +81,7 @@ if has_profile ssl || [ "${1:-}" = "nginx-ssl" ] || [ "${2:-}" = "nginx-ssl" ]; 
     ACTIVE_PROFILES+=(ssl)
 fi
 
-if is_true "$ENABLE_POT_PROVIDER" || [ "${1:-}" = "bgutil-pot" ] || [ "${2:-}" = "bgutil-pot" ]; then
+if has_profile pot || is_true "$ENABLE_POT_PROVIDER" || [ "${1:-}" = "bgutil-pot" ] || [ "${2:-}" = "bgutil-pot" ]; then
     ACTIVE_PROFILES+=(pot)
 fi
 
@@ -114,9 +105,9 @@ case "${1:-all}" in
         show_source_freshness
         echo "Building with GIT_COMMIT=$GIT_COMMIT ..."
         if [ -n "${2:-}" ]; then
-            "${COMPOSE[@]}" build "$2"
+            "${COMPOSE[@]}" build --pull "$2"
         else
-            "${COMPOSE[@]}" build
+            "${COMPOSE[@]}" build --pull
         fi
         ;;
     up)
@@ -181,7 +172,8 @@ case "${1:-all}" in
     all|"")
         show_source_freshness
         echo "Building with GIT_COMMIT=$GIT_COMMIT ..."
-        "${COMPOSE[@]}" up -d --build
+        "${COMPOSE[@]}" build --pull
+        "${COMPOSE[@]}" up -d
         echo "Done. Version commit: $GIT_COMMIT"
         ;;
     *)

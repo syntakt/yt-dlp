@@ -4,11 +4,17 @@ on:
     branches: ['tgbot']
     paths:
       - 'bot/**'
+      - 'yt_dlp/**'
+      - 'pyproject.toml'
+      - '.dockerignore'
       - '.github/workflows/bot-test.yml'
   pull_request:
     branches: ['**']
     paths:
       - 'bot/**'
+      - 'yt_dlp/**'
+      - 'pyproject.toml'
+      - '.dockerignore'
       - '.github/workflows/bot-test.yml'
   workflow_dispatch:
 
@@ -41,7 +47,7 @@ jobs:
         # extras `default` — как в bot/Dockerfile: mutagen, pycryptodomex,
         # brotli, websockets, yt-dlp-ejs. Без них тесты проверяли бы не то,
         # что реально работает в контейнере.
-        python -m pip install -e ".[default]"
+        python -m pip install -e ".[default,curl-cffi]"
         python -m pip install -r bot/requirements-dev.txt
     - name: Lint
       shell: bash
@@ -52,3 +58,20 @@ jobs:
       shell: bash
       working-directory: bot
       run: pytest tests -q
+    - name: Check shell scripts
+      run: shellcheck bot/entrypoint.sh bot/cf-entrypoint.sh bot/deploy.sh bot/nginx/entrypoint.sh bot/nginx/renew-certificate.sh bot/telegram_bot/entrypoint.sh bot/tests/nginx-container-check.sh
+    - name: Build bot and supporting images
+      timeout-minutes: 20
+      run: |
+        docker build --pull -f bot/Dockerfile -t ytdlp-bot:test .
+        docker build --pull -f bot/Dockerfile.cloudflared -t ytdlp-cloudflared:test .
+        docker build --pull -f bot/Dockerfile.nginx -t ytdlp-nginx:test .
+    - name: Validate real media tools under isolation
+      run: |
+        docker run --rm --network none --user 1000:1000 --read-only \
+          --tmpfs /tmp:rw,nosuid,size=256m --entrypoint python \
+          -v "$PWD/bot/tests/container_media_check.py:/check.py:ro" \
+          ytdlp-bot:test /check.py
+    - name: Validate Nginx template
+      run: |
+        bash bot/tests/nginx-container-check.sh

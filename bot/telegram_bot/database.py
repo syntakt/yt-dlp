@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import sqlite3
 import logging
@@ -9,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from config import DB_PATH, MAX_HISTORY_PER_USER
+from safe_urls import canonical_url
 
 logger = logging.getLogger(__name__)
 
@@ -208,6 +210,43 @@ def init_db() -> None:
         if "user_id" not in cols:
             conn.execute("ALTER TABLE sessions ADD COLUMN user_id INTEGER NOT NULL DEFAULT 0")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS deliveries (
+                token_key TEXT PRIMARY KEY,
+                path TEXT NOT NULL,
+                expires_at REAL NOT NULL,
+                download_id INTEGER,
+                context TEXT NOT NULL DEFAULT '{}',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                bytes_sent INTEGER NOT NULL DEFAULT 0,
+                completed INTEGER NOT NULL DEFAULT 0
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_deliveries_download ON deliveries(download_id)")
+        if 'ranges' not in {row[1] for row in conn.execute('PRAGMA table_info(deliveries)')}:
+            conn.execute("ALTER TABLE deliveries ADD COLUMN ranges TEXT NOT NULL DEFAULT '[]'")
+        from feature_store import init as init_features
+        init_features(conn)
+        if not conn.execute("SELECT 1 FROM stats WHERE key='public_urls_v2'").fetchone():
+            for row in conn.execute('SELECT id,url FROM download_history').fetchall():
+                conn.execute('UPDATE download_history SET url=? WHERE id=?',
+                             (canonical_url(row['url']) or '<private-source>', row['id']))
+            for row in conn.execute('SELECT chat_id,message_id,url,video_info_json FROM sessions').fetchall():
+                public_url = canonical_url(row['url'])
+                try:
+                    value = json.loads(row['video_info_json'])
+                    for key in ('url', 'webpage_url', 'thumbnail'):
+                        value[key] = canonical_url(value.get(key, '')) or ''
+                    for entry in value.get('playlist_entries', []):
+                        entry['url'] = canonical_url(entry.get('url', '')) or ''
+                except (ValueError, TypeError, AttributeError):
+                    public_url = None
+                if public_url:
+                    conn.execute('UPDATE sessions SET url=?,video_info_json=? WHERE chat_id=? AND message_id=?',
+                                 (public_url, json.dumps(value), row['chat_id'], row['message_id']))
+                else:
+                    conn.execute('DELETE FROM sessions WHERE chat_id=? AND message_id=?', (row['chat_id'], row['message_id']))
+            conn.execute("INSERT INTO stats VALUES ('public_urls_v2','1')")
         # Миграция: request_notified_at — троттлинг уведомлений админам о заявке
         user_cols = [r[1] for r in conn.execute("PRAGMA table_info(users)").fetchall()]
         if "request_notified_at" not in user_cols:
@@ -338,6 +377,8 @@ def add_download(user_id: int, url: str) -> int:
             conn.execute("""
                 DELETE FROM download_history
                  WHERE user_id = ?
+                   AND status IN ('done', 'error', 'cancelled', 'partial')
+                   AND id NOT IN (SELECT download_id FROM deliveries WHERE download_id IS NOT NULL)
                    AND id NOT IN (
                        SELECT id FROM download_history
                         WHERE user_id = ?
@@ -369,6 +410,8 @@ def update_download(
     if status in ("done", "error", "cancelled", "partial"):
         fields.append("finished_at = ?")
         values.append(datetime.now(timezone.utc).isoformat())
+    elif status:
+        fields.append("finished_at = NULL")
     if not fields:
         return
     values.append(download_id)
@@ -387,6 +430,46 @@ def get_user_history(user_id: int, limit: int = 10) -> list:
              ORDER BY created_at DESC
              LIMIT ?
         """, (user_id, limit)).fetchall()
+
+
+def save_delivery(token_key, path, expires_at, download_id, *, attempts=0, bytes_sent=0, completed=False, ranges=()):
+    with get_connection() as conn:
+        conn.execute("""INSERT INTO deliveries
+            (token_key, path, expires_at, download_id, attempts, bytes_sent, completed, ranges)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(token_key) DO UPDATE SET attempts=excluded.attempts,
+                bytes_sent=excluded.bytes_sent, completed=excluded.completed, ranges=excluded.ranges""",
+                     (token_key, str(path), expires_at, download_id, attempts, bytes_sent, int(completed), json.dumps(ranges)))
+
+
+def set_delivery_context(token_key, context):
+    with get_connection() as conn:
+        conn.execute('UPDATE deliveries SET context=? WHERE token_key=?', (context, token_key))
+
+
+def list_deliveries():
+    with get_connection() as conn:
+        return {row['token_key']: dict(row) for row in conn.execute('SELECT * FROM deliveries')}
+
+
+def get_delivery(download_id, user_id):
+    with get_connection() as conn:
+        row = conn.execute('''SELECT d.*, h.title FROM deliveries d
+            JOIN download_history h ON h.id=d.download_id
+            WHERE d.download_id=? AND h.user_id=? ORDER BY d.completed, d.token_key LIMIT 1''',
+                           (download_id, user_id)).fetchone()
+        return dict(row) if row else None
+
+
+def delete_delivery(token_key):
+    with get_connection() as conn:
+        conn.execute('DELETE FROM deliveries WHERE token_key=?', (token_key,))
+
+
+def all_delivered(download_id):
+    with get_connection() as conn:
+        return conn.execute('SELECT count(*) FROM deliveries WHERE download_id=? AND completed=0',
+                            (download_id,)).fetchone()[0] == 0
 
 
 # ── Sessions (persistent quality-selection state) ──────────────────────────────
@@ -434,7 +517,7 @@ def cleanup_stale_downloads() -> int:
                SET status = 'error',
                    error = 'Прервано при перезапуске бота',
                    finished_at = ?
-             WHERE status IN ('pending', 'downloading')
+             WHERE status IN ('pending', 'queued', 'downloading', 'processing')
         """, (datetime.now(timezone.utc).isoformat(),))
         return cur.rowcount
 
@@ -449,13 +532,17 @@ def cleanup_old_sessions(max_age_hours: int = 24) -> int:
 def cleanup_old_history(max_age_days: int = 30) -> int:
     cutoff = (datetime.now(timezone.utc) - timedelta(days=max_age_days)).isoformat()
     with get_connection() as conn:
-        cur = conn.execute("DELETE FROM download_history WHERE created_at < ?", (cutoff,))
+        cur = conn.execute("DELETE FROM download_history WHERE created_at < ? "
+                           "AND status IN ('done','error','cancelled','partial') "
+                           "AND id NOT IN (SELECT download_id FROM deliveries WHERE download_id IS NOT NULL)", (cutoff,))
         return cur.rowcount
 
 
 def clear_user_history(user_id: int) -> int:
     with get_connection() as conn:
-        cur = conn.execute("DELETE FROM download_history WHERE user_id = ?", (user_id,))
+        cur = conn.execute("DELETE FROM download_history WHERE user_id = ? "
+                           "AND status IN ('done','error','cancelled','partial') "
+                           "AND id NOT IN (SELECT download_id FROM deliveries WHERE download_id IS NOT NULL)", (user_id,))
         return cur.rowcount
 
 

@@ -38,4 +38,14 @@ def main(program):
     executable = shutil.which(program, path=search_path)
     if not executable or Path(executable).resolve().parent == wrapper_dir:
         sys.exit(f"System {program} executable not found")
-    os.execv(executable, [executable, *restricted_args(program, sys.argv[1:])])
+    args = sys.argv[1:]
+    if os.environ.get('YTDLP_WORKER_SANDBOX') == '1':
+        sys.path.insert(0, str(wrapper_dir.parent))
+        from landlock import restrict, system_paths
+        temp = Path(os.environ['YTDLP_FFMPEG_TMP'])
+        output = os.environ.get('YTDLP_MEDIA_ROOT')
+        restrict(system_paths(), [temp, *([Path(output)] if output else [])])
+        os.environ['TMPDIR'] = str(temp)
+    if os.environ.get('YTDLP_FFMPEG_NETWORK') != '1':
+        args = restricted_args(program, args)
+    os.execv(executable, [executable, *args])

@@ -11,14 +11,14 @@
 #
 # Переменные окружения:
 #   SSLIP_DOMAIN   — обязательно (например: 150-241-90-145.sslip.io)
-#   HTTPS_PORT     — порт HTTPS (по умолчанию 7443)
+#   HTTPS_PORT     — порт HTTPS (по умолчанию 1443)
 #   CERTBOT_EMAIL  — email для Let's Encrypt (пусто → без email, --register-unsafely-without-email)
 #   ENABLE_CERTBOT — "true" для включения certbot (по умолчанию true)
 # ══════════════════════════════════════════════════════════════════════════════
 set -e
 
 DOMAIN="${SSLIP_DOMAIN}"
-HTTPS_PORT="${HTTPS_PORT:-7443}"
+HTTPS_PORT="${HTTPS_PORT:-1443}"
 HTTP_PORT="${HTTP_PORT:-8080}"
 export HTTP_PORT HTTPS_PORT
 CERT_DIR="/etc/nginx/ssl"
@@ -131,7 +131,6 @@ if [ "$ENABLE_CERTBOT" = "true" ]; then
 
             # Формируем команду certbot без word splitting
             if [ -n "$CERTBOT_EMAIL" ]; then
-                echo "[nginx-ssl] Email: ${CERTBOT_EMAIL}"
                 CERTBOT_RESULT=0
                 certbot certonly --webroot -w "$WEBROOT" \
                     -d "$DOMAIN" \
@@ -165,22 +164,8 @@ if [ "$ENABLE_CERTBOT" = "true" ]; then
             fi
         fi
 
-        # Renewal loop: каждые 12 часов проверяем необходимость обновления.
-        # certbot renew обновляет cert только если осталось < 30 дней.
-        # deploy-hook вызывается ТОЛЬКО при фактическом обновлении.
-        while true; do
-            sleep 43200
-            if ! certbot renew --quiet \
-                --deploy-hook "cp -f ${LE_DIR}/fullchain.pem ${CERT_DIR}/fullchain.pem && \
-                               cp -f ${LE_DIR}/privkey.pem   ${CERT_DIR}/privkey.pem && \
-                               chmod 600 ${CERT_DIR}/privkey.pem && \
-                               nginx -s reload && \
-                               echo '[nginx-ssl] Сертификат обновлён'"; then
-                echo "[nginx-ssl] WARN: certbot renew завершился с ошибкой"
-            fi
-        done
     ) &
-    echo "[nginx-ssl] Certbot запущен в фоне (renewal каждые 12ч)"
+    echo "[nginx-ssl] Первичный запрос Certbot запущен; продление только вручную: /renew-certificate.sh"
 else
     echo "[nginx-ssl] ENABLE_CERTBOT=false — Let's Encrypt отключён"
     echo "[nginx-ssl] HTTPS работает с self-signed сертификатом"
